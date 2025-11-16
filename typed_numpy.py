@@ -208,6 +208,9 @@ class Typed:
     def __div__(self, other : "Typed") -> "Typed":
         return self.binary_op(other, "/")
 
+    def __matmul__(self, other : "Typed") -> "Typed":
+        return einsum(self, other, "M N, N K -> M K")
+
     def set(self, other : "Typed"):
         if self.dim_type != other.dim_type:
             raise ValueError("Only assignment between tiles of the same dim type is allowed")
@@ -281,51 +284,65 @@ def einsum(a : Typed, b : Typed, einstr : str) -> Typed:
         c = c.reduce(d)
 
     return c
- 
-    result_dim_type = []
-    for d in rhs_dims:
-        assert d in a_dims_by_name or d in b_dims_by_name
-        if d in a_dims_by_name and d in b_dims_by_name:
-            if a_dims_by_name[d] != b_dims_by_name[d]:
-                raise ValueError(f"Batch dimension of einsum is operating on mismatching slices! A={a_dims_by_name[d]}, B={b_dims_by_name[d]}")
-            result_dim_type.append(a_dims_by_name[d])
-        elif d in a_dims_by_name:
-            result_dim_type.append(a_dims_by_name[d])
-        elif d in b_dims_by_name:
-            result_dim_type.append(b_dims_by_name[d])
 
-    result = einops.einsum(a.arr, b.arr, einstr)
 
+class TypedResult:
+    def __init__(self, *dims, spec : str):
+        pass
+
+# Declaring dimensions. You shouldn't create duplicate dimensions.
 M, N, K = FullDim('M', 10), FullDim('N', 10), FullDim('K', 10)
 
+# Wrap your numpy arrays inside of the Typed class, and specify their dimensions.
+# This is the type system's entry point into its knowledge about your program.
 a = Typed(a, M, N)
 b = Typed(b, N, K)
 
+# Slice things! a_slice and b_slice are sliced as if we did a[0:5, 0:5] and b[0:5, 0:5]
 a_sliced = a.slice(M, 0, 5).slice(N, 0, 5)
 b_sliced = b.slice(N, 0, 5).slice(K, 0, 5)
 
+# The Typed object has a shape and a type. The type displayed by the `type` accessor is
+# the _DimType_. There is also an _ExprType_, which we will return to later. 
 print("Shape:", a_sliced.shape)
 print("Type: ", a_sliced.type)
 
+# Notice now that we can only perform operations on things with the same type:
+try:
+    a_sliced * b_sliced
+except ValueError as e:
+    pass
+
+# We can actually mix dimensions using einsum! Internally this
+# `repeat`s the dimensions (which is how you introduce new dimensions)
+# and `reduce`s along the reduction dimensions of the einsum.
+# Notice that the returned tile retains the slicing information from the input tensors.
 c_tile0 = einsum(a_sliced, b_sliced, "M N, N K -> M K")
 
 print("Shape:    ", c_tile0.shape)
 print("DimType:  ", c_tile0.type)
 print("ExprType: ", c_tile0.expr_type)
 
+# c = TypedResult(M, K, spec="M N, N K -> M K")
 c = np.zeros((10, 10))
 c = Typed(c, M, K)
 
 tile_size = 5
 for im in range(0, 10, tile_size):
     for ik in range(0, 10, tile_size):
-        c_sliced = c.slice(M, im, im + tile_size).slice(K, ik, ik + tile_size)
         c_accum = None
         for in_ in range(0, 10, tile_size):
             tile_a = a.slice(M, im, im + tile_size).slice(N, in_, in_ + tile_size)
             tile_b = b.slice(N, in_, in_ + tile_size).slice(K, ik, ik + tile_size)
             tile_c = einsum(tile_a, tile_b, "M N, N K -> M K")
             c_accum = c_accum + tile_c if c_accum is not None else tile_c
-        c_sliced.set(c_accum)
-        print(f"{im=}, {ik=}, {c_sliced.expr_type}")
-        
+        c.arr[im:(im+tile_size), ik:(ik+tile_size)] = c_accum.arr
+        print(f"{im=}, {ik=}, {c_accum.expr_type}")
+
+expected = a.arr @ b.arr
+actual = c.arr
+np.testing.assert_allclose(
+    expected,
+    actual,
+)
+print("Passed!")
