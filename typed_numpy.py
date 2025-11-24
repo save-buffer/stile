@@ -4,118 +4,8 @@ from typing import Literal
 import numpy as np
 import einops
 
-g_dim_registry : dict[str, "FullDim"] = {}
-
-@dataclass
-class FullDim:
-    name : str
-    size : int
-
-    def __post_init__(self):
-        if self.name in g_dim_registry:
-            if g_dim_registry[self.name] != self:
-                raise ValueError(f"Attempted to redefine a dimension with a different size (old={g_dim_registry[self.name].size}, new={self.size})!")
-        else:
-            g_dim_registry[self.name] = self
-
-@dataclass
-class Sliced:
-    dim : "Dim"
-    start : int
-    end : int
-
-Dim = FullDim | Sliced
-
-def dim_start(dim : Dim):
-    match dim: 
-        case FullDim(_, _):
-            return 0
-        case Sliced(d, st, _):
-            return dim_start(d) + st
-
-def dim_end(dim : Dim):
-    match dim:
-        case FullDim(_, s):
-            return s
-        case Sliced(d, _, en):
-            return dim_start(d) + en
-
-def dim_name(dim : Dim):
-    match dim:
-        case FullDim(n, _):
-            return n
-        case Sliced(d, _, _):
-            return dim_name(d)
-
-def dim_contains(dim : Dim, target : FullDim):
-    match dim:
-        case FullDim(n, s):
-            return n == target.name and s == target.size
-        case Sliced(d, _, _):
-            return dim_contains(d, target)
-
-def dim_size(dim : Dim) -> int:
-    match dim:
-        case FullDim(_, s):
-            return s
-        case Sliced(d, s, e):
-            return e - s
-
-def dim_full_dim(dim : Dim) -> FullDim:
-    match dim:
-        case FullDim(_, _):
-            return dim
-        case Sliced(d, _, _):
-            return dim_full_dim(d)
-
-def simplify_dim(dim : Dim) -> Dim:
-    match dim:
-        case FullDim(n, sz):
-            return dim
-        case Sliced(d, st, en):
-            child = simplify_dim(d)
-            match child:
-                case FullDim(n, sz):
-                    if st == 0 and en == sz:
-                        return child
-                    return Sliced(child, st, en)
-                case Sliced(full, child_st, child_en):
-                    length = en - st
-                    slice_start = child_st + st
-                    slice_end = child_st + st + length
-                    if slice_start > child_en or slice_end > child_en:
-                        raise ValueError("Invalid slice")
-                    if child_st + st == 0 and child_st + st + length == full.size:
-                        return full
-                    return Sliced(full, child_st + st, child_st + st + length)
-
-@dataclass
-class Constant:
-    value: float
-
-@dataclass
-class Tensor:
-    dims : tuple[FullDim, ...]
-
-BinaryOpType = Literal["+", "-", "*", "/"]
-
-@dataclass
-class BinaryOp:
-    op : BinaryOpType
-    lhs : "ExprType"
-    rhs : "ExprType"
-
-@dataclass
-class Repeat:
-    dim : Dim
-    child : "ExprType"
-
-@dataclass
-class Reduce:
-    dim : Dim
-    child : "ExprType"
-
-ExprType = Tensor | BinaryOp | Repeat | Reduce
+from type_nodes import *
+from egraph import EGraph, EClassID
 
 class Typed:
     def __init__(self, arr : np.ndarray, *dim_type : Dim, expr_type : ExprType | None = None):
@@ -372,8 +262,10 @@ class LexState:
             raise ValueError(f"{s} expected")
         self.spec = self.spec[len(s):]
 
-def infer_dims_from_expr(expr : ExprType) -> tuple[FullDim, ...]:
+def infer_dims_from_expr(expr : ExprType) -> tuple[FullDim, ...] | None:
     match expr:
+        case Constant(x):
+            return None
         case Tensor(dims):
             return dims
         case BinaryOp(_, lhs, rhs):
@@ -388,9 +280,11 @@ def infer_dims_from_expr(expr : ExprType) -> tuple[FullDim, ...]:
             return lhs_dims
         case Repeat(along, child):
             dims = infer_dims_from_expr(child)
+            assert dims is not None
             return (dim_full_dim(along), *dims)
         case Reduce(along, child):
             dims = infer_dims_from_expr(child)
+            assert dims is not None
             along_full = dim_full_dim(along)
             return tuple(d for d in dims if d != along_full)
 
@@ -399,6 +293,9 @@ def _construct_expr_from_einsum(a : ExprType, b : ExprType, rhs : Tensor) -> Exp
     dims_a = infer_dims_from_expr(a)
     dims_b = infer_dims_from_expr(b)
     dims_rhs = rhs.dims
+
+    assert dims_a is not None
+    assert dims_b is not None
 
     a_dims_by_name = { dim_name(d) : d for d in dims_a }
     b_dims_by_name = { dim_name(d) : d for d in dims_b }
@@ -477,7 +374,10 @@ def _parse_factor(lex : LexState) -> ExprType:
             case bad:
                 raise ValueError(f"Invalid character {bad}. Expected einsum string or closing paren")
     else:
-        if lex.peek().isdigit():
+        nxt = lex.peek()
+        if nxt is None:
+            raise ValueError("End of input while parsing expression")
+        if nxt.isdigit():
             return _parse_number(lex)
         return _parse_tensor(lex)
 
@@ -577,7 +477,8 @@ def simplify_expression(expr : ExprType) -> ExprType:
                 combined_dim = simplify_dim(
                     Sliced(
                         dim_full_dim(expr.lhs.dim),
-                        dim_start(expr.lhs.dim), dim_end(expr.rhs.dim)
+                        dim_start(expr.lhs.dim),
+                        dim_end(expr.rhs.dim)
                     )
                 )
                 remap_dims_by_name({ dim_name(combined_dim) : combined_dim }, expr.lhs.child)
@@ -585,15 +486,22 @@ def simplify_expression(expr : ExprType) -> ExprType:
     return expr
 
 def expr_types_are_equivalent(dim_type : tuple[Dim, ...], expected : ExprType, actual : ExprType) -> bool:
-    exp_mapped = map_expr_to_dim_type(dim_type, expected)
-    act_simp = simplify_expression(actual)
-    return exp_mapped == act_simp
+    expected = map_expr_to_dim_type(dim_type, expected)
+
+    egraph = EGraph()
+    expected_id = egraph.insert_expression(expected)
+    actual_id = egraph.insert_expression(actual)
+
+    egraph.apply_rewrites()
+
+    return egraph.equivalent(expected_id, actual_id)
 
 class TypedResult:
     def __init__(self, spec : str):
         self.expected_expr_type = parse_spec_into_expr_type(spec)
+
         self.expected_dim_type = infer_dims_from_expr(self.expected_expr_type)
-        self.shape = tuple(dim_size(d) for d in self.expected_dim_type)
+        self.shape = tuple(dim_size(d) for d in self.expected_dim_type) if self.expected_dim_type is not None else tuple()
         self.arr = np.zeros(self.shape)
         
     def assign(self, result : Typed):
