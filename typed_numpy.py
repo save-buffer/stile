@@ -5,7 +5,7 @@ import numpy as np
 import einops
 
 from type_nodes import *
-from egraph import EGraph, EClassID
+from egraph import Egraph, EclassID
 
 class Typed:
     def __init__(self, arr : np.ndarray, *dim_type : Dim, expr_type : ExprType | None = None):
@@ -168,15 +168,16 @@ def _binary_op_helper(slf, other, op):
                 case "-":
                     new_arr = slf.arr - x
                 case "*":
-                    new_arr = slf.arr + x
+                    new_arr = slf.arr * x
                 case "/":
-                    new_arr = slf.arr - x
-                    new_dim_type = slf.dim_type
-                    new_expr_type = BinaryOp(
-                        op=op,
-                        lhs=slf.expr_type,
-                        rhs=Constant(x),
-                    )
+                    new_arr = slf.arr / x
+
+            new_dim_type = slf.dim_type
+            new_expr_type = BinaryOp(
+                op=op,
+                lhs=slf.expr_type,
+                rhs=Constant(x),
+            )
             return Typed(new_arr, *new_dim_type, expr_type=new_expr_type)
 
 def einsum(a : Typed, b : Typed, einstr : str) -> Typed:
@@ -488,12 +489,11 @@ def simplify_expression(expr : ExprType) -> ExprType:
 def expr_types_are_equivalent(dim_type : tuple[Dim, ...], expected : ExprType, actual : ExprType) -> bool:
     expected = map_expr_to_dim_type(dim_type, expected)
 
-    egraph = EGraph()
+    egraph = Egraph()
     expected_id = egraph.insert_expression(expected)
     actual_id = egraph.insert_expression(actual)
 
     egraph.apply_rewrites()
-
     return egraph.equivalent(expected_id, actual_id)
 
 class TypedResult:

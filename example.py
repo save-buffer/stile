@@ -55,8 +55,8 @@ TypedResult(spec="(M N, N K -> M K) * 2")
 TypedResult(spec="(2 * M N, 2 * N K -> M K)")
 
 # Below we'll demonstrate a verified tiled matmul! Please note that einsums MUST be surrounded by parens (for now)
-# Here we create a TypedResult c. Note that c infers its shape from the global dimension registry. 
-c = TypedResult("(M N, N K -> M K)")
+# Here we create a TypedResult c. Note that c infers its shape from the global dimension registry.
+c = TypedResult("6 * (M N, N K -> M K)")
 
 tile_size = 5
 # We do our classic triple for loop
@@ -65,11 +65,16 @@ for im in range(0, 10, tile_size):
         # We start with our accumulator as None. 
         c_accum = None
         for in_ in range(0, 10, tile_size):
-            # Slice the inputs
+            # Slice the inputs and multiply by a constant.
             tile_a = a.slice(M, im, im + tile_size).slice(N, in_, in_ + tile_size)
             tile_b = b.slice(N, in_, in_ + tile_size).slice(K, ik, ik + tile_size)
+            # Multiply the tiles by constants BEFORE the einsum. Notice that the type checker
+            # will fold the constants, and guarantee that the result is what we expected, 
+            # the matmul multiplied by 6!
+            tile_a_scaled = tile_a * 3
+            tile_b_scaled = tile_b * 2
             # Perform our tile-sized matmul
-            tile_c = einsum(tile_a, tile_b, "M N, N K -> M K")
+            tile_c = einsum(tile_a_scaled, tile_b_scaled, "M N, N K -> M K")
             # Accumulate the result
             c_accum = c_accum + tile_c if c_accum is not None else tile_c
         # Write it out to the result tensor! Notice that if we'd done something NOT according
@@ -80,7 +85,7 @@ for im in range(0, 10, tile_size):
 
 # Now we can get our result from c.arr
 actual = c.arr
-expected = a.arr @ b.arr
+expected = 6 * (a.arr @ b.arr)
 np.testing.assert_allclose(
     expected,
     actual,
