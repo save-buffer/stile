@@ -33,7 +33,7 @@ function. A real implementation would use E-graphs and would probably come next.
 M, N, K = FullDim('M', 10), FullDim('N', 10), FullDim('K', 10)
 a = Typed(np.random.randn(10, 10), M, N)
 b = Typed(np.random.randn(10, 10), N, K)
-c = TypedResult("(M N, N K -> M K)")
+c = TypedResult("6 * (M N, N K -> M K)")
 
 for im in range(0, 10, tile_size):
     for ik in range(0, 10, tile_size):
@@ -42,8 +42,13 @@ for im in range(0, 10, tile_size):
             # Slice the inputs
             tile_a = a.slice(M, im, im + tile_size).slice(N, in_, in_ + tile_size)
             tile_b = b.slice(N, in_, in_ + tile_size).slice(K, ik, ik + tile_size)
+            # Multiply the tiles by constants BEFORE the einsum. Notice that the type checker
+            # will fold the constants, and guarantee that the result is what we expected, 
+            # the matmul multiplied by 6!
+            tile_a_scaled = tile_a * 3
+            tile_b_scaled = tile_b * 2
             # Perform a single tile's worth of matmul
-            tile_c = einsum(tile_a, tile_b, "M N, N K -> M K")
+            tile_c = einsum(tile_a_scaled, tile_b_scaled, "M N, N K -> M K")
             # Accumulate the result
             c_accum = c_accum + tile_c if c_accum is not None else tile_c
         # Write it out to the result tensor! Notice that if we'd done something NOT according
@@ -52,3 +57,7 @@ for im in range(0, 10, tile_size):
         # by 2. 
         c.assign(c_accum)
 ```
+
+While writing the demo above, I originally had the spec be `2 * (M N, N K -> M K)`, and had foolishly
+multiplied both `tile_a` AND `tile_b` by `2`. Obviously this is incorrect, and the type system caught
+the mistake!
