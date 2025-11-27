@@ -12,7 +12,7 @@ class Typed:
         self.arr = arr
         if len(dim_type) != len(self.arr.shape):
             raise ValueError("Number of attributes must match physical dimension")
-        self.dim_type : tuple[Dim, ...] = dim_type
+        self.dim_type : DimType = dim_type
         self.expr_type : ExprType = (
             expr_type
             if expr_type is not None
@@ -257,6 +257,7 @@ def einsum(a : Typed, b : Typed, einstr : str) -> Typed:
 
     return c
 
+
 def exp(x : Typed) -> Typed:
     new_dim_type = x.dim_type
     new_expr_type = UnaryOp(
@@ -320,6 +321,8 @@ def infer_dims_from_expr(expr : ExprType) -> tuple[FullDim, ...] | None:
             return None
         case Tensor(dims):
             return dims
+        case UnaryOp(_, child):
+            return infer_dims_from_expr(child)
         case BinaryOp(_, lhs, rhs):
             lhs_dims = infer_dims_from_expr(lhs)
             rhs_dims = infer_dims_from_expr(rhs)
@@ -385,6 +388,7 @@ def _parse_dim(lex : LexState) -> FullDim:
     dim_name = lex.spec[:i]
     lex.spec = lex.spec[i:]
     if dim_name not in g_dim_registry:
+        breakpoint()
         raise ValueError(f"Parsed dim {dim_name} is not a known dimension!")
     return g_dim_registry[dim_name]
 
@@ -407,22 +411,31 @@ def _parse_number(lex : LexState) -> Constant:
     lex.spec = lex.spec[i:]
     return Constant(constant)
 
-def _parse_factor(lex : LexState) -> ExprType:
+def _normalize_dts_for_binary_op(lhs : DimType, rhs : DimType) -> DimType:
+    if lhs == tuple():
+        return rhs
+    if rhs == tuple():
+        return lhs
+    if lhs != rhs:
+        raise ValueError("Invalid spec: mismatching DimTypes for binary operation")
+    return lhs
+
+def _parse_factor(lex : LexState) -> tuple[DimType, ExprType]:
     lex.consume_whitespace()
     if lex.peek() == "(":
         lex.consume()
-        child = _parse_spec(lex)
+        child_dt, child_et = _parse_spec(lex)
         match lex.peek():
             case ",":
                 lex.consume()
-                einsum_second = _parse_spec(lex)
+                _, einsum_second = _parse_spec(lex)
                 lex.expect("->")
                 tensor = _parse_tensor(lex)
                 lex.expect(")")
-                return _construct_expr_from_einsum(child, einsum_second, tensor)
+                return tensor.dims, _construct_expr_from_einsum(child_et, einsum_second, tensor)
             case ")":
                 lex.consume()
-                return child
+                return child_dt, child_et
             case bad:
                 raise ValueError(f"Invalid character {bad}. Expected einsum string or closing paren")
     else:
@@ -430,55 +443,60 @@ def _parse_factor(lex : LexState) -> ExprType:
         if nxt is None:
             raise ValueError("End of input while parsing expression")
         if nxt.isdigit():
-            return _parse_number(lex)
-        return _parse_tensor(lex)
+            return tuple(), _parse_number(lex)
+        tensor = _parse_tensor(lex)
+        return tensor.dims, tensor
 
-def _parse_term(lex : LexState) -> ExprType:
-    child = _parse_factor(lex)
+def _parse_term(lex : LexState) -> tuple[DimType, ExprType]:
+    child_dt, child_et = _parse_factor(lex)
     lex.consume_whitespace()
-    match lex.peek():
-        case "*":
+    match nxt := lex.peek():
+        case "*"  | "/":
             lex.consume()
-            return BinaryOp(
-                op="*",
-                lhs=child,
-                rhs=_parse_term(lex),
-            )
-        case "/":
-            lex.consume()
-            return BinaryOp(
-                op="/",
-                lhs=child,
-                rhs=_parse_term(lex),
+            rhs_dt, rhs_et = _parse_term(lex)
+
+            dimtype = _normalize_dts_for_binary_op(child_dt, rhs_dt)
+
+            return dimtype, BinaryOp(
+                op=nxt,
+                lhs=child_et,
+                rhs=rhs_et,
             )
         case _:
-            return child
+            return child_dt, child_et
 
-def _parse_spec(lex : LexState) -> ExprType:
-    child = _parse_term(lex)
+def _parse_spec(lex : LexState) -> tuple[DimType, ExprType]:
+    child_dt, child_et = _parse_term(lex)
     lex.consume_whitespace()
     match lex.peek():
         case "+":
             lex.consume()
-            return BinaryOp(
+            rhs_dt, rhs_et = _parse_spec(lex)
+            dimtype = _normalize_dts_for_binary_op(child_dt, rhs_dt)
+
+            return dimtype, BinaryOp(
                 op="+",
-                lhs=child,
-                rhs=_parse_spec(lex),
+                lhs=child_et,
+                rhs=rhs_et,
             )
         case "-":
             if lex.spec.startswith("->"):
-                return child
+                return child_dt, child_et
 
             lex.consume()
-            return BinaryOp(
+
+            rhs_dt, rhs_et = _parse_spec(lex)
+            dimtype = _normalize_dts_for_binary_op(child_dt, rhs_dt)
+
+            return dimtype, BinaryOp(
                 op="-",
-                lhs=child,
-                rhs=_parse_spec(lex),
+                lhs=child_et,
+                rhs=rhs_et,
             )
         case _:
-            return child
+            return child_dt, child_et
 
-def parse_spec_into_expr_type(spec : str) -> ExprType:
+def parse_spec_into_type(spec : str) -> tuple[DimType, ExprType]:
     """
     Grammar:
     Spec -> Term + Spec | Term - Spec | Term
@@ -536,9 +554,7 @@ def expr_types_are_equivalent(dim_type : tuple[Dim, ...], expected : ExprType, a
 
 class TypedResult:
     def __init__(self, spec : str):
-        self.expected_expr_type = parse_spec_into_expr_type(spec)
-
-        self.expected_dim_type = infer_dims_from_expr(self.expected_expr_type)
+        self.expected_dim_type, self.expected_expr_type = parse_spec_into_type(spec)
         self.shape = tuple(dim_size(d) for d in self.expected_dim_type) if self.expected_dim_type is not None else tuple()
         self.arr = np.zeros(self.shape)
         
@@ -555,3 +571,6 @@ class TypedResult:
             ds, de = dim_start(d), dim_end(d)
             slice_expr.append(slice(ds, de))
         self.arr[*slice_expr] = result.arr
+
+def reset_typed_numpy():
+    g_dim_registry.clear()

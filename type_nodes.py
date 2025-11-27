@@ -23,6 +23,7 @@ class Sliced:
     end : int
 
 Dim = FullDim | Sliced
+DimType = tuple[Dim, ...]
 
 def dim_start(dim : Dim):
     match dim: 
