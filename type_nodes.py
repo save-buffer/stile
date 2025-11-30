@@ -16,6 +16,13 @@ class FullDim:
         else:
             g_dim_registry[self.name] = self
 
+    def __getitem__(self, i : slice) -> "Sliced":
+        return Sliced(
+            self,
+            i.start,
+            i.stop,
+        )
+
 @dataclass(frozen=True)
 class Sliced:
     dim : "Dim"

@@ -98,16 +98,25 @@ class Egraph:
             self._associativity,
             self._distributivity,
             self._inverse_distributivity,
+            self._div_distributivity,
+            self._repeat_over_unary_ops,
+            self._repeat_over_binary_ops,
             self._combine_reductions,
+            self._reorder_reductions,
+            self._factor_out_of_sum,
             self._mul_or_div_into_reduction_or_repeat,
             self._mul_or_div_out_of_reduction_or_repeat,
             self._mul_by_zero,
             self._div_by_one,
+            self._div_of_quotients_to_mul_of_reciprocal,
+            self._multiply_fractions,
+            self._decompose_fractions,
             self._sub_or_div_by_self,
             self._identity,
             self._constant_folding_unary,
             self._constant_folding_binary,
             self._decompose_exp,
+            self._log_sum_exp_stability,
         ]
 
     def _commutativity(self, id : EclassID, enode : Enode) -> bool:
@@ -198,7 +207,7 @@ class Egraph:
                 if ac_enode.op != EnodeType.Mul:
                     continue
                 la, b = ab_enode.args
-                ra, c = ab_enode.args
+                ra, c = ac_enode.args
                 if not self.equivalent(la, ra):
                     continue
                 bc = self.add(
@@ -215,6 +224,143 @@ class Egraph:
                 )
                 if not self.equivalent(id, abc):
                     self.merge(id, abc)
+                    return True
+        return False
+
+    def _div_distributivity(self, id : EclassID, enode : Enode) -> bool:
+        # (a + b) / c = a/c + b/c
+        if enode.op != EnodeType.Div:
+            return False
+        num, den = enode.args
+        num_enodes = self.get_enodes(num)
+        for num_enode in num_enodes:
+            if num_enode.op in (EnodeType.Add, EnodeType.Sub):
+                a, b = num_enode.args
+                ac = self.add(
+                    Enode(
+                        op=EnodeType.Div,
+                        args=(a, den),
+                    )
+                )
+                bc = self.add(
+                    Enode(
+                        op=EnodeType.Div,
+                        args=(b, den)
+                    )
+                )
+                acbc = self.add(
+                    Enode(
+                        op=num_enode.op,
+                        args=(ac, bc),
+                    )
+                )
+                if not self.equivalent(id, acbc):
+                    self.merge(id, acbc)
+                    return True
+        return False
+
+    def _repeat_into_unary_op(self, id : EclassID, enode : Enode) -> bool:
+        # f(repeat[D](x)) = repeat[D](f(x))
+        if enode.op not in (EnodeType.Exp, EnodeType.Sin, EnodeType.Cos, EnodeType.Sqrt):
+            return False
+
+        child, = enode.args
+        child_enodes = self.get_enodes(child)
+        for child_enode in child_enodes:
+            if child_enode.op != EnodeType.Repeat:
+                continue
+            dim, x = child_enode.args
+            f_x = self.add(
+                Enode(
+                    op=enode.op,
+                    args=(x,)
+                )
+            )
+            f_x_repeated = self.add(
+                Enode(
+                    op=EnodeType.Repeat,
+                    args=(dim, f_x),
+                )
+            )
+            if not self.equivalent(id, f_x_repeated):
+                self.merged(id, f_x_repeated)
+                return True
+        return False
+
+    def _repeat_over_unary_ops(self, id : EclassID, enode : Enode) -> bool:
+        # repeat[D](f(x)) = f(repeat[D](x))
+        if enode.op != EnodeType.Repeat:
+            return False
+
+        dim, child = enode.args
+        child_enodes = self.get_enodes(child)
+        for child_enode in child_enodes:
+            if child_enode.op in (EnodeType.Exp, EnodeType.Sin, EnodeType.Cos, EnodeType.Sqrt):
+                inner, = child_enode.args
+                inner_repeated = self.add(
+                    Enode(
+                        op=EnodeType.Repeat,
+                        args=(dim, inner),
+                    )
+                )
+                f_of_repeated = self.add(
+                    Enode(
+                        op=child_enode.op,
+                        args=(inner_repeated,)
+                    )
+                )
+                if not self.equivalent(id, f_of_repeated):
+                    self.merge(id, f_of_repeated)
+                    return True
+            elif child_enode.op in (EnodeType.Sum, EnodeType.Max):
+                inner_dim, inner = child_enode.args
+                inner_repeated = self.add(
+                    Enode(
+                        op=EnodeType.Repeat,
+                        args=(dim, inner),
+                    )
+                )
+                f_of_repeated = self.add(
+                    Enode(
+                        op=child_enode.op,
+                        args=(inner_dim, inner_repeated),
+                    )
+                )
+                if not self.equivalent(id, f_of_repeated):
+                    self.merge(id, f_of_repeated)
+                    return True
+        return False
+
+    def _repeat_over_binary_ops(self, id : EclassID, enode : Enode) -> bool:
+        # repeat[D](a + b) = repeat[D](a) + repeat[D](b)
+        if enode.op != EnodeType.Repeat:
+            return False
+
+        dim, child = enode.args
+        child_enodes = self.get_enodes(child)
+        for child_enode in child_enodes:
+            if child_enode.op in (EnodeType.Add, EnodeType.Sub, EnodeType.Mul, EnodeType.Div, EnodeType.BinaryMax):
+                a, b = child_enode.args
+                repeat_a = self.add(
+                    Enode(
+                        op=EnodeType.Repeat,
+                        args=(dim, a),
+                    )
+                )
+                repeat_b = self.add(
+                    Enode(
+                        op=EnodeType.Repeat,
+                        args=(dim, b),
+                    )
+                )
+                result = self.add(
+                    Enode(
+                        op=child_enode.op,
+                        args=(repeat_a, repeat_b),
+                    )
+                )
+                if not self.equivalent(id, result):
+                    self.merge(id, result)
                     return True
         return False
 
@@ -262,6 +408,73 @@ class Egraph:
                         self.merge(id, combined)
                         return True
         return False
+
+    def _reorder_reductions(self, id : EclassID, enode : Enode) -> bool:
+        # sum[i](sum[j](f)) = sum[j](sum[i](f)) when dimensions are independent
+        if enode.op not in (EnodeType.Sum, EnodeType.Max):
+            return False
+
+        outer_dim, child = enode.args
+        child_enodes = self.get_enodes(child)
+        for child_enode in child_enodes:
+            if child_enode.op == enode.op:
+                inner_dim, inner_child = child_enode.args
+                if dim_full_dim(outer_dim) != dim_full_dim(inner_dim):
+                    new_inner = self.add(
+                        Enode(
+                            op=enode.op,
+                            args=(outer_dim, inner_child),
+                        )
+                    )
+                    new_outer = self.add(
+                        Enode(
+                            op=enode.op,
+                            args=(inner_dim, new_inner),
+                        )
+                    )
+                    if not self.equivalent(id, new_outer):
+                        self.merge(id, new_outer)
+                        return True
+        return False
+
+    def _factor_out_of_sum(self, id : EclassID, enode : Enode) -> bool:
+        # sum[D](x / repeat[D](y)) = sum[D](x) / y
+        if enode.op != EnodeType.Sum:
+            return False
+
+        sum_dim, child = enode.args
+        child_enodes = self.get_enodes(child)
+        for child_enode in child_enodes:
+            if child_enode.op != EnodeType.Div:
+                continue
+
+            lhs, rhs = child_enode.args
+            rhs_enodes = self.get_enodes(rhs)
+            for rhs_enode in rhs_enodes:
+                if rhs_enode.op != EnodeType.Repeat:
+                    continue
+
+                repeat_dim, repeat_rhs = rhs_enode.args
+                if repeat_dim != sum_dim:
+                    continue
+
+                sum_x = self.add(
+                    Enode(
+                        op=EnodeType.Sum,
+                        args=(sum_dim, lhs),
+                    )
+                )
+                sum_x_div_y = self.add(
+                    Enode(
+                        op=EnodeType.Div,
+                        args=(sum_x, repeat_rhs),
+                    )
+                )
+                if not self.equivalent(id, sum_x_div_y):
+                    self.merge(id, sum_x_div_y)
+                    return True
+        return False
+                
 
     def _mul_or_div_into_reduction_or_repeat(self, id : EclassID, enode : Enode) -> bool:
         # sum(x / c) = sum(x) / c, or max(x / c) = max(x) / c if c >= 0
@@ -345,7 +558,7 @@ class Egraph:
         for rhs_enode in rhs_enodes:
             if rhs_enode.op == EnodeType.Constant:
                 break
-        if rhs_enode != EnodeType.Constant:
+        if rhs_enode.op != EnodeType.Constant:
             return False
         val, = rhs_enode.args
         if val != 0:
@@ -364,7 +577,7 @@ class Egraph:
         for rhs_enode in rhs_enodes:
             if rhs_enode.op == EnodeType.Constant:
                 break
-        if rhs_enode != EnodeType.Constant:
+        if rhs_enode.op != EnodeType.Constant:
             return False
         val, = rhs_enode.args
         if val != 1:
@@ -374,13 +587,142 @@ class Egraph:
             return True
         return False
 
+    def _div_of_quotients_to_mul_of_reciprocal(self, id : EclassID, enode : Enode) -> bool:
+        if enode.op != EnodeType.Div:
+            return False
+
+        lhs, rhs = enode.args
+        lhs_enodes = self.get_enodes(lhs)
+        rhs_enodes = self.get_enodes(rhs)
+
+        for lhs_enode in lhs_enodes:
+            if lhs_enode.op == EnodeType.Div:
+                break
+        if lhs_enode.op != EnodeType.Div:
+            return False
+
+        for rhs_enode in rhs_enodes:
+            if rhs_enode.op == EnodeType.Div:
+                break
+        if rhs_enode.op != EnodeType.Div:
+            return False
+
+        rhslhs, rhsrhs = rhs_enode.args
+        
+        reciprocal = self.add(
+            Enode(
+                op=EnodeType.Div,
+                args=(rhsrhs, rhslhs),
+            )
+        )
+        lhs_times_reciprocal = self.add(
+            Enode(
+                op=EnodeType.Mul,
+                args=(lhs, reciprocal),
+            )
+        )
+        if not self.equivalent(id, lhs_times_reciprocal):
+            self.merge(id, lhs_times_reciprocal)
+            return True
+        return False
+    
+    def _multiply_fractions(self, id : EclassID, enode : Enode) -> bool:
+        # (a / c) * (b / d) = (a * b) / (c * d)
+        if enode.op != EnodeType.Mul:
+            return False
+
+        lhs, rhs = enode.args
+        lhs_enodes = self.get_enodes(lhs)
+        rhs_enodes = self.get_enodes(rhs)
+        for lhs_enode in lhs_enodes:
+            if lhs_enode.op == EnodeType.Div:
+                break
+        if lhs_enode.op != EnodeType.Div:
+            return False
+        
+        for rhs_enode in rhs_enodes:
+            if rhs_enode.op == EnodeType.Div:
+                break
+        if rhs_enode.op != EnodeType.Div:
+            return False
+
+        a, c = lhs_enode.args
+        b, d = rhs_enode.args
+
+        ab = self.add(
+            Enode(
+                op=EnodeType.Mul,
+                args=(a, b),
+            )
+        )
+        cd = self.add(
+            Enode(
+                op=EnodeType.Mul,
+                args=(c, d),
+            )
+        )
+        abcd = self.add(
+            Enode(
+                op=EnodeType.Div,
+                args=(ab, cd),
+            )
+        )
+        if not self.equivalent(id, abcd):
+            self.merge(id, abcd)
+            return True
+        return False
+
+    def _decompose_fractions(self, id : EclassID, enode : Enode) -> bool:
+        # (a * b) / (c * d) = (a / c) * (b / d)
+        if enode.op != EnodeType.Div:
+            return False
+
+        lhs, rhs = enode.args
+        lhs_enodes = self.get_enodes(lhs)
+        rhs_enodes = self.get_enodes(rhs)
+        for lhs_enode in lhs_enodes:
+            if lhs_enode.op != EnodeType.Mul:
+                break
+        if lhs_enode.op != EnodeType.Mul:
+            return False
+
+        for rhs_enode in rhs_enodes:
+            if rhs_enode.op != EnodeType.Mul:
+                break
+        if rhs_enode.op != EnodeType.Mul:
+            return False
+
+        a, b = lhs_enode.args
+        c, d = rhs_enode.args
+        ac = self.add(
+            Enode(
+                op=EnodeType.Div,
+                args=(a, c),
+            )
+        )
+        bd = self.add(
+            Enode(
+                op=EnodeType.Div,
+                args=(b, d),
+            )
+        )
+        acbd = self.add(
+            Enode(
+                op=EnodeType.Mul,
+                args=(ac, bd),
+            )
+        )
+        if not self.equivalent(id, acbd):
+            self.merge(id, acbd)
+            return True
+        return False
+
     def _sub_or_div_by_self(self, id : EclassID, enode : Enode) -> bool:
         if enode.op not in (EnodeType.Sub, EnodeType.Div):
             return False
         lhs, rhs = enode.args
         if not self.equivalent(lhs, rhs):
             return False
-
         match enode.op:
             case EnodeType.Sub:
                 new_val = 0.0
@@ -511,6 +853,7 @@ class Egraph:
         return False
 
     def _decompose_exp(self, id : EclassID, enode : Enode) -> bool:
+        # exp(x + y) = exp(x) * exp(y) and exp(x - y) = exp(x) / exp(y)
         if enode.op != EnodeType.Exp:
             return False
         child, = enode.args
@@ -551,6 +894,69 @@ class Egraph:
             return True
         return False
 
+    def _log_sum_exp_stability(self, id : EclassID, enode : Enode) -> bool:
+        # sum(exp(x)) = exp(max(x)) * sum(exp(x - max(x)))
+        if enode.op != EnodeType.Sum:
+            return False
+
+        dim, child = enode.args
+        child_enodes = self.get_enodes(child)
+        for child_enode in child_enodes:
+            if child_enode.op == EnodeType.Exp:
+                x, = child_enode.args
+                # max(x)
+                m = self.add(
+                    Enode(
+                        op=EnodeType.Max,
+                        args=(dim, x)
+                    )
+                )
+                # max(x).repeat()
+                m_repeated = self.add(
+                    Enode(
+                        op=EnodeType.Repeat,
+                        args=(dim, m),
+                    )
+                )
+                # x - max(x).repeat()
+                x_minus_m = self.add(
+                    Enode(
+                        op=EnodeType.Sub,
+                        args=(x, m_repeated),
+                    )
+                )
+                # exp(x - max(x).repeat())
+                exp_x_minus_m = self.add(
+                    Enode(
+                        op=EnodeType.Exp,
+                        args=(x_minus_m,),
+                    )
+                )
+                # sum(exp(x - max(x).repeat()))
+                sum_exp = self.add(
+                    Enode(
+                        op=EnodeType.Sum,
+                        args=(dim, exp_x_minus_m),
+                    )
+                )
+                # exp(max(x))
+                exp_m = self.add(
+                    Enode(
+                        op=EnodeType.Exp,
+                        args=(m,),
+                    )
+                )
+                # exp(max(x)) * sum(exp(x - max(x).repeat()))
+                result = self.add(
+                    Enode(
+                        op=EnodeType.Mul,
+                        args=(exp_m, sum_exp),
+                    )
+                )
+                if not self.equivalent(id, result):
+                    self.merge(id, result)
+                    return True
+        return False
 
     def _canonicalize(self, enode : Enode) -> Enode:
         canonicalized_args = tuple(

@@ -9,6 +9,7 @@ from typed_numpy import (
     max,
     sqrt,
     reset_typed_numpy,
+    expr_simplifies,
 )
 
 
@@ -52,6 +53,102 @@ def test_exp():
         c.arr,
         np.exp(a.arr),
     )
+
+def test_numerically_stable_softmax():
+    N = FullDim('N', 8)
+    x = Typed(np.random.randn(8), N)
+
+    # exp(x) / sum(exp(x))
+    naive = TypedResult("softmax[N](N)")
+    x_max = x.max(N)
+    assert expr_simplifies(x_max, "max[N](N)")
+    
+    x_stable = x - x_max.repeat(N)
+    assert expr_simplifies(x_stable, "N - (max[N](N) -> N)")
+
+    exp_x = exp(x_stable)
+    assert expr_simplifies(exp_x, "exp(N - (max[N](N) -> N))")
+
+    sum_exp_x = exp_x.sum(N).repeat(N)
+    assert expr_simplifies(sum_exp_x, "(sum[N](exp(N - (max[N](N) -> N))) -> N)")
+
+    softmax = exp_x / sum_exp_x
+    # Literally what softmax is
+    assert expr_simplifies(
+        softmax,
+        "(exp(N - (max[N](N) -> N))) / (sum[N](exp(N - (max[N](N) -> N))) -> N)",
+    )
+    # Convert exponent to quotient in numerator
+    assert expr_simplifies(
+        softmax,
+        "(exp(N) / exp(max[N](N) -> N)) / (sum[N](exp(N - (max[N](N) -> N))) -> N)",
+    )
+    # Component exponent to quotient in denominator
+    assert expr_simplifies(
+        softmax,
+        "(exp(N) / exp(max[N](N) -> N)) / (sum[N](exp(N) / exp(max[N](N) -> N)) -> N)",
+    )
+    # Pull repeat outside of the exp in the denominator
+    assert expr_simplifies(
+        softmax,
+        "(exp(N) / exp(max[N](N) -> N)) / (sum[N](exp(N) / (exp(max[N](N)) -> N)) -> N)",
+    )
+    # Pull the denominator outside of the sum
+    assert expr_simplifies(
+        softmax,
+        "(exp(N) / exp(max[N](N) -> N)) / (sum[N](exp(N)) / exp(max[N](N)) -> N)",
+    )
+    # Duplicate repeat in demoniator
+    assert expr_simplifies(
+        softmax,
+        "(exp(N) / exp(max[N](N) -> N)) / ((sum[N](exp(N)) -> N) / (exp(max[N](N)) -> N))",
+    )
+    # Flip the denominator and turn it into a multiplication
+    assert expr_simplifies(
+        softmax,
+        "(exp(N) / exp(max[N](N) -> N)) * ((exp(max[N](N)) -> N) / (sum[N](exp(N)) -> N))",
+    )
+    # Turn it into quotient of products
+    assert expr_simplifies(
+        softmax,
+        "(exp(N) * (exp(max[N](N)) -> N)) / (exp(max[N](N) -> N) * (sum[N](exp(N)) -> N))",
+    )
+    # Associativity of multiplication in denominator
+    assert expr_simplifies(
+        softmax,
+        "(exp(N) * (exp(max[N](N)) -> N)) / ((sum[N](exp(N)) -> N) * exp(max[N](N) -> N))",
+    )
+    # Break back into multiplication of fractions
+    assert expr_simplifies(
+        softmax,
+        "(exp(N) / (sum[N](exp(N)) -> N)) * ((exp(max[N](N)) -> N) / (exp(max[N](N)) -> N))",
+    )
+
+    naive.assign(softmax)
+
+def test_online_softmax():
+    N = FullDim('N', 8)
+    x = Typed(np.random.randn(8), N)
+    online = TypedResult("softmax[N](N)")
+
+    x_block1 = x.slice(N, 0, 4)
+    m1 = x_block1.max(N)
+    exp1 = exp(x_block1 - m1.repeat(N[0:4]))
+    l1 = exp1.sum(N)
+
+    x_block2 = x.slice(N, 4, 8)
+    m2 = x_block2.max(N)
+    exp2 = exp(x_block2 - m2.repeat(N[4:8]))
+    l2 = exp2.sum(N)
+
+    m_global = max(m1, m2)
+    l_global = l1 * exp(m1 - m_global) + l2 * exp(m2 - m_global)
+
+    softmax1 = exp(x_block1 - m_global.repeat(N[0:4])) / l_global.repeat(N[0:4])
+    softmax2 = exp(x_block2 - m_global.repeat(N[4:8])) / l_global.repeat(N[4:8])
+
+    online.assign(softmax1)
+    online.assign(softmax2)
 
 
 def softmax_np(x):
@@ -110,7 +207,9 @@ tests = [
 #    test_simple_expression,
 #    test_basic_matmul,
 #    test_exp,
-    test_flash_attention,
+#    test_numerically_stable_softmax,
+    test_online_softmax,
+#    test_flash_attention,
 ]
 
 if __name__ == '__main__':
