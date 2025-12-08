@@ -135,6 +135,7 @@ class Egraph:
             self._constant_folding_unary,
             self._constant_folding_binary,
             self._decompose_exp,
+            self._recompose_exp,
             self._log_sum_exp_stability,
         ]
 
@@ -808,6 +809,37 @@ class Egraph:
                 op=new_op,
                 args=(exp_lhs, exp_rhs),
             )
+
+    def _recompose_exp(self, id : EclassID, enode : Enode):
+        # exp(x) * exp(y) = exp(x + y) and exp(x) / exp(y) = exp(x - y)
+        if enode.op not in (EnodeType.Mul, EnodeType.Div):
+            return
+
+        lhs, rhs = enode.args
+        lhs_enodes = self.get_enodes(lhs)
+        rhs_enodes = self.get_enodes(rhs)
+        for lhs_enode in lhs_enodes:
+            if lhs_enode.op != EnodeType.Exp:
+                continue
+            x, = lhs_enode.args
+            for rhs_enode in rhs_enodes:
+                if rhs_enode.op != EnodeType.Exp:
+                    continue
+                y, = rhs_enode.args
+                match enode.op:
+                    case EnodeType.Mul:
+                        combined_op = EnodeType.Add
+                    case EnodeType.Div:
+                        combined_op = EnodeType.Sub
+                xy = Enode(
+                    op=combined_op,
+                    args=(x, y),
+                )
+                self.add_match(
+                    id,
+                    op=EnodeType.Exp,
+                    args=(xy,),
+                )
 
     def _log_sum_exp_stability(self, id : EclassID, enode : Enode):
         # sum(exp(x)) = exp(max(x)) * sum(exp(x - max(x)))

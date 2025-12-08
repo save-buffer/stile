@@ -171,12 +171,36 @@ def test_online_softmax():
     assert rewrite_found(l1_corrected, "(sum[N](exp(N[0:4])) / exp(max[N](N[0:4]))) * (exp(max[N](N[0:4])) / exp(max[N](N)))")
     assert rewrite_found(l1_corrected, "(sum[N](exp(N[0:4])) * exp(max[N](N[0:4]))) / (exp(max[N](N[0:4])) * exp(max[N](N)))")
     assert rewrite_found(l1_corrected, "(sum[N](exp(N[0:4])) * exp(max[N](N[0:4]))) / (exp(max[N](N)) * exp(max[N](N[0:4])))")
-
-    # TODO: Below fails
-    assert rewrite_found(l1_corrected, "(sum[N](exp(N[0:4])) / exp(max[N](N))) * (exp(max[N](N[0:4])) / exp(max[N](N[0:4])))")
-    assert rewrite_found(l1_corrected, "(sum[N](exp(N[0:4])) / exp(max[N](N))) * 1")
-    assert rewrite_found(l1_corrected, "sum[N](exp(N[0:4])) / exp(max[N](N))")
-    assert rewrite_found(l1_corrected, "sum[N](exp(N[0:4] - (max[N](N) -> N[0:4])))")
+    assert rewrite_found(
+        l1_corrected,
+        "(sum[N](exp(N[0:4])) / exp(max[N](N))) * (exp(max[N](N[0:4])) / exp(max[N](N[0:4])))",
+        niters=6,
+    )
+    assert rewrite_found(
+        l1_corrected,
+        "(sum[N](exp(N[0:4])) / exp(max[N](N))) * 1",
+        niters=7,
+    )
+    assert rewrite_found(
+        l1_corrected,
+        "sum[N](exp(N[0:4])) / exp(max[N](N))",
+        niters=8,
+    )
+    assert rewrite_found(
+        l1_corrected,
+        "sum[N](exp(N[0:4]) / (exp(max[N](N)) -> N[0:4]))",
+        niters=8,
+    )
+    assert rewrite_found(
+        l1_corrected,
+        "sum[N](exp(N[0:4]) / (exp(max[N](N) -> N[0:4])))",
+        niters=8,
+    )
+    assert rewrite_found(
+        l1_corrected,
+        "sum[N](exp(N[0:4] - (max[N](N) -> N[0:4])))",
+        niters=10,
+    )
 
     softmax1 = exp(x_block1 - m_global.repeat(N[0:4])) / l_global.repeat(N[0:4])
     softmax2 = exp(x_block2 - m_global.repeat(N[4:8])) / l_global.repeat(N[4:8])
