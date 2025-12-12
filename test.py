@@ -247,9 +247,9 @@ def test_flash_attention():
     qctx_tile_size = 32
     nctx_tile_size = 32
     for iqctx in range(0, qctx.size, qctx_tile_size):
-        running_max = Typed(np.full((qctx.size), -np.inf), qctx)
-        running_l = Typed(np.zeros(qctx.size), qctx)
-        o = Typed(np.zeros((qctx.size, dhead.size)), qctx, dhead)
+        running_max = -np.inf
+        running_l = 0
+        o = 0
 
         for ictx in range(0, nctx.size, nctx_tile_size):
             q_tile = Q.slice(qctx, iqctx, iqctx + qctx_tile_size)
@@ -266,13 +266,14 @@ def test_flash_attention():
             v_tile = V.slice(nctx, ictx, ictx + nctx_tile_size)
             v_proj = einsum(logits, v_tile, "nctx qctx, nctx dhead -> qctx dhead")
             
-            rescaled_old_o = (running_l * exp(running_max - new_max)).repeat(o.dim_type[1]).rearrange(qctx, dhead) * o
-            rescaled_v_proj = exp(tile_max - new_max).repeat(v_proj.dim_type[1]).rearrange(qctx, dhead) * v_proj
+            rescaled_old_o = (running_l * exp(running_max - new_max)).repeat(dhead).rearrange(qctx, dhead) * o
+            rescaled_v_proj = exp(tile_max - new_max).repeat(dhead).rearrange(qctx, dhead) * v_proj
 
-            o = (rescaled_old_o + rescaled_v_proj) / new_l.repeat(rescaled_old_o.dim_type[1]).rearrange(qctx, dhead)
+            o = (rescaled_old_o + rescaled_v_proj) / new_l.repeat(dhead).rearrange(qctx, dhead)
             running_l = new_l
             running_max = new_max
         L.assign(o)
+    print("Formally verified Flash Attention passed!")
 
 
 tests = [

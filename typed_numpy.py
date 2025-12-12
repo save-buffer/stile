@@ -136,17 +136,17 @@ class Typed:
     def __truediv__(self, other) -> "Typed":
         return self.binary_op(other, "/")
 
-    def __fadd__(self, other) -> "Typed":
-        return self.binary_op(other, "+")
+    def __radd__(self, other) -> "Typed":
+        return _binary_op_helper(other, self, "+")
 
     def __rsub__(self, other) -> "Typed":
-        return self.binary_op(other, "-")
+        return _binary_op_helper(other, self, "-")
 
     def __rmul__(self, other) -> "Typed":
-        return self.binary_op(other, "*")
+        return _binary_op_helper(other, self, "*")
 
     def __rtruediv__(self, other) -> "Typed":
-        return self.binary_op(other, "/")
+        return _binary_op_helper(other, self, "/")
 
     def __matmul__(self, other) -> "Typed":
         return einsum(self, other, "M N, N K -> M K")
@@ -166,8 +166,8 @@ class Typed:
         return self.arr.shape
 
 def _binary_op_helper(slf, other, op):
-    match other:
-        case Typed():
+    match slf, other:
+        case Typed(), Typed():
             if slf.dim_type != other.dim_type:
                 raise ValueError("Binary operations can only occur between tensors with the same shapes")
             match op:
@@ -189,7 +189,7 @@ def _binary_op_helper(slf, other, op):
                 rhs=other.expr_type,
             )
             return Typed(new_arr, *new_dim_type, expr_type=new_expr_type)
-        case x:
+        case Typed(), x:
             match op:
                 case "+":
                     new_arr = slf.arr + x
@@ -209,6 +209,27 @@ def _binary_op_helper(slf, other, op):
                 rhs=Constant(x),
             )
             return Typed(new_arr, *new_dim_type, expr_type=new_expr_type)
+        case x, Typed():
+            match op:
+                case "+":
+                    new_arr = x + other.arr
+                case "-":
+                    new_arr = x - other.arr
+                case "*":
+                    new_arr = x * other.arr
+                case "/":
+                    new_arr = x / other.arr
+                case "max":
+                    new_arr = np.maximum(x, other.arr)
+
+            new_dim_type = other.dim_type
+            new_expr_type = BinaryOp(
+                op=op,
+                lhs=Constant(x),
+                rhs=other.expr_type,
+            )
+            return Typed(new_arr, *new_dim_type, expr_type=new_expr_type)
+            
 
 def einsum(a : Typed, b : Typed, einstr : str) -> Typed:
     lhs, rhs = einstr.split('->')
@@ -701,13 +722,13 @@ def map_expr_to_dim_type(dim_type : tuple[Dim, ...], expr : ExprType) -> ExprTyp
     dims_by_name = { dim_name(d) : d for d in dim_type }
     return remap_dims_by_name(dims_by_name, expr)
 
-def expr_types_are_equivalent(dim_type : tuple[Dim, ...], expected : ExprType, actual : ExprType, niters : int = 10) -> bool:
-    # expected = map_expr_to_dim_type(dim_type, expected)
+g_egraph = Egraph()
 
-    egraph = Egraph()
-    expected_id = egraph.insert_expression(expected)
-    actual_id = egraph.insert_expression(actual)
-    return egraph.incrementally_check_equivalence(expected_id, actual_id, niters)
+def expr_types_are_equivalent(dim_type : tuple[Dim, ...], expected : ExprType, actual : ExprType, niters : int = 10) -> bool:
+    global g_egraph
+    expected_id = g_egraph.insert_expression(expected)
+    actual_id = g_egraph.insert_expression(actual)
+    return g_egraph.incrementally_check_equivalence(expected_id, actual_id, niters)
 
 def expr_simplifies(expr : Typed, spec : str, niters : int = 15, dump_to_dot : bool = False) -> bool:
     spec_dt, spec_et = parse_spec_into_type(spec)
@@ -751,3 +772,5 @@ class TypedResult:
 
 def reset_typed_numpy():
     g_dim_registry.clear()
+    global g_egraph
+    g_egraph = Egraph()
