@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable
 
-from type_nodes import *
+from .type_nodes import *
 
 enable_breakpoint = False
 

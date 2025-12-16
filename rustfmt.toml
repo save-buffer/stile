@@ -1,0 +1,3 @@
+brace_style = "AlwaysNextLine"
+space_after_colon = true
+space_before_colon = true

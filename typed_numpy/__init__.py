@@ -5,8 +5,8 @@ from typing import Literal
 import numpy as np
 import einops
 
-from type_nodes import *
-from egraph import Egraph, EclassID
+from .type_nodes import *
+from .egraph import Egraph, EclassID
 
 class Typed:
     def __init__(self, arr : np.ndarray, *dim_type : Dim, expr_type : ExprType | None = None):

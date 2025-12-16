@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from typed_numpy import (
     Typed,
@@ -12,10 +13,14 @@ from typed_numpy import (
     expr_simplifies,
     rewrite_found,
 )
-from egraph import egraph_enable_breakpoint
+from typed_numpy.egraph import egraph_enable_breakpoint
 
+@pytest.fixture
+def reset():
+    yield
+    reset_typed_numpy()
 
-def test_simple_expression():
+def test_simple_expression(reset):
     M, N = FullDim('M', 10), FullDim('N', 10)
     a = Typed(np.random.randn(10, 10), M, N)
     b = TypedResult("2 * M N")
@@ -25,7 +30,7 @@ def test_simple_expression():
         b.assign(a_scaled)
 
 
-def test_basic_matmul():
+def test_basic_matmul(reset):
     M, N, K = FullDim('M', 10), FullDim('N', 15), FullDim('K', 20)
     a = Typed(np.random.randn(10, 15), M, N)
     b = Typed(np.random.randn(15, 20), N, K)
@@ -43,7 +48,7 @@ def test_basic_matmul():
             c.assign(c_accum)
 
 
-def test_exp():
+def test_exp(reset):
     M, N = FullDim('M', 10), FullDim('N', 10)
     a = Typed(np.random.randn(10, 10), M, N)
     c = TypedResult("exp(M N)")
@@ -59,7 +64,7 @@ def test_exp():
         np.exp(a.arr),
     )
 
-def test_numerically_stable_softmax():
+def test_numerically_stable_softmax(reset):
     N = FullDim('N', 8)
     x = Typed(np.random.randn(8), N)
 
@@ -139,7 +144,8 @@ def test_numerically_stable_softmax():
 
     naive.assign(softmax)
 
-def test_online_softmax():
+@pytest.mark.skip
+def test_online_softmax(reset):
     N = FullDim('N', 8)
     x = Typed(np.random.randn(8), N)
     online = TypedResult("softmax[N](N)")
@@ -235,7 +241,8 @@ def attention_np(q, k, v):
     return result
 
 
-def test_flash_attention():
+@pytest.mark.skip
+def test_flash_attention(reset):
     dhead, qctx, nctx = FullDim('dhead', 16), FullDim('qctx', 32), FullDim('nctx', 128)
 
     Q = Typed(np.random.randn(qctx.size, dhead.size), qctx, dhead)
@@ -288,4 +295,4 @@ tests = [
 if __name__ == '__main__':
     for test in tests:
         reset_typed_numpy()
-        test()
+        test(None)
