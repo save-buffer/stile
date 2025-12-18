@@ -311,6 +311,7 @@ mod typed_numpy
             verbose : bool,
         ) -> PyResult<bool>
         {
+            let verbose = verbose || std::env::var("EGGLOG_VERBOSE").is_ok();
             for i in 0..10
             {
                 if verbose
