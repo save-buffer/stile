@@ -176,10 +176,11 @@ mod typed_numpy
             )
         );
 
-        add_primitive!(&mut eg, "exp" = |a: F| -> F { F::from(OrderedFloat((**a).exp())) });
-        add_primitive!(&mut eg, "sin" = |a: F| -> F { F::from(OrderedFloat((**a).sin())) });
-        add_primitive!(&mut eg, "cos" = |a: F| -> F { F::from(OrderedFloat((**a).cos())) });
-        add_primitive!(&mut eg, "sqrt" = |a: F| -> F { F::from(OrderedFloat((**a).sqrt())) });
+        add_primitive!(&mut eg, "exp" = |a : F| -> F { F::from(OrderedFloat((**a).exp())) });
+        add_primitive!(&mut eg, "sin" = |a : F| -> F { F::from(OrderedFloat((**a).sin())) });
+        add_primitive!(&mut eg, "cos" = |a : F| -> F { F::from(OrderedFloat((**a).cos())) });
+        add_primitive!(&mut eg, "sqrt" = |a : F| -> F { F::from(OrderedFloat((**a).sqrt())) });
+        add_primitive!(&mut eg, "binarymax" = |a : F, b : F| -> F { F::from(OrderedFloat((**a).max(F::from(OrderedFloat(**b))))) });
 
         add_ruleset(&mut eg, Ruleset)?;
 
@@ -187,7 +188,7 @@ mod typed_numpy
         {
             ($lhs:tt => $rhs:tt) =>
             {
-                rule(&mut eg, Ruleset, facts![(= x $lhs)], actions![(union x $rhs)])?;
+                rule(&mut eg, Ruleset, facts![(= _lhs $lhs)], actions![(union _lhs $rhs)])?;
             };
             ($lhs:tt <=> $rhs:tt) =>
             {
@@ -220,6 +221,18 @@ mod typed_numpy
         add_rule!((Add (Sum D s m x) (Sum D m e x)) => (Sum D s e x));
         add_rule!((BinaryMax (Max D s m x) (Max D m e x)) => (Max D s e x));
 
+        // mul_or_div_in_repeats
+        add_rule!((Repeat D (Mul x y)) <=> (Mul (Repeat D x) (Repeat D y)));
+        add_rule!((Repeat D (Div x y)) <=> (Div (Repeat D x) (Repeat D y)));
+
+        // constant_across_repeats
+        add_rule!((Repeat D (Mul x (Constant y))) <=> (Mul (Repeat D x) (Constant y)));
+        add_rule!((Repeat D (Div x (Constant y))) <=> (Div (Repeat D x) (Constant y)));
+
+        // constant_across_sum
+        add_rule!((Sum D s e (Mul x (Constant y))) <=> (Mul (Sum D s e x) (Constant y)));
+        add_rule!((Sum D s e (Div x (Constant y))) <=> (Div (Sum D s e x) (Constant y)));
+
         add_rule!((Repeat D (Repeat E x)) => (Repeat E (Repeat D x))); // reorder_repeats
         add_rule!((Sum D s e (Div a (Repeat D b))) <=> (Div (Sum D s e a) b)); // factor_out_of_sum
         add_rule!((Mul x (Constant (unquote exprs::float(0.0)))) => (Constant (unquote exprs::float(0.0)))); // mul_by_zero
@@ -242,6 +255,7 @@ mod typed_numpy
         add_rule!((Sub (Constant a) (Constant b)) => (Constant (- a b))); // constant_folding_sub
         add_rule!((Mul (Constant a) (Constant b)) => (Constant (* a b))); // constant_folding_mul
         add_rule!((Div (Constant a) (Constant b)) => (Constant (/ a b))); // constant_folding_div
+        add_rule!((BinaryMax (Constant a) (Constant b)) => (Constant (binarymax a b))); // constant_folding_binary_max
         add_rule!((Exp (Add x y)) <=> (Mul (Exp x) (Exp y))); // product_of_exp
         add_rule!((Exp (Sub x y)) <=> (Div (Exp x) (Exp y))); // quotient_of_exp
 

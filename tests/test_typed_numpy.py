@@ -144,7 +144,6 @@ def test_numerically_stable_softmax(reset):
 
     naive.assign(softmax)
 
-@pytest.mark.skip
 def test_online_softmax(reset):
     N = FullDim('N', 8)
     x = Typed(np.random.randn(8), N)
@@ -241,7 +240,6 @@ def attention_np(q, k, v):
     return result
 
 
-@pytest.mark.skip
 def test_flash_attention(reset):
     dhead, qctx, nctx = FullDim('dhead', 16), FullDim('qctx', 32), FullDim('nctx', 128)
 
