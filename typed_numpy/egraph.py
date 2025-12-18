@@ -6,9 +6,64 @@ from enum import Enum
 from typing import Any, Callable
 
 from .type_nodes import *
-from .typed_numpy import RustEgraph
+from .typed_numpy import RustEgraph, RustExpr
 
-egg = RustEgraph()
+def expr_type_to_rust_expr(self, expr : ExprType) -> RustExpr:
+    match expr:
+        case Constant(v):
+            return RustExpr.Constant(v)
+        case Tensor(dims):
+            return RustExpr.Tensor([dim_name(d) for d in dims])
+        case UnaryOp(op, child):
+            rust_child = expr_type_to_rust_expr(child)
+            match op:
+                case "exp":
+                    return RustExpr.Exp(rust_child)
+                case "sin":
+                    return RustExpr.Sin(rust_child)
+                case "cos":
+                    return RustExpr.Cos(rust_child)
+                case "sqrt":
+                    return RustExpr.Sqrt(rust_child)
+            raise ValueError(f"Unknown unary op {op}")
+        case BinaryOp(op, lhs, rhs):
+            rust_lhs = expr_type_to_rust_expr(lhs)
+            rust_rhs = expr_type_to_rust_expr(rhs)
+            match op:
+                case "+":
+                    return RustExpr.Add(rust_lhs, rust_rhs)
+                case "-":
+                    return RustExpr.Sub(rust_lhs, rust_rhs)
+                case "*":
+                    return RustExpr.Mul(rust_lhs, rust_rhs)
+                case "/":
+                    return RustExpr.Div(rust_lhs, rust_rhs)
+                case "max":
+                    return RustExpr.BinaryMax(rust_lhs, rust_rhs)
+            raise ValueError(f"Unknown binary op {op}")
+        case Repeat(dim, child):
+            d = dim_name(dim)
+            rust_child = expr_type_to_rust_expr(child)
+            return RustExpr.Repeat(d, rust_child)
+        case Reduce(op, dim, child):
+            d = dim_name(d)
+            start, end = dim_start(dim), dim_end(dim)
+            rust_child = expr_type_to_rust_expr(child)
+            match op:
+                case "sum":
+                    return RustExpr.Sum(d, start, end, rust_child)
+                case "max":
+                    return RustExpr.Max(d, start, end, rust_child)
+            raise ValueError(f"Unknown reduction op {op}")
+
+
+def check_if_exprs_equal_rust(x : ExprType, y : ExprType) -> bool:
+    egg = RustEgraph()
+    x_rust = expr_type_to_rust_expr(x)
+    y_rust = expr_type_to_rust_expr(y)
+    x_id = egg.insert_expression(x_rust)
+    y_id = egg.insert_expression(y_rust)
+    
 
 enable_breakpoint = False
 

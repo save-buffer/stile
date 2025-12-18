@@ -4,11 +4,112 @@ use pyo3::prelude::*;
 #[pymodule]
 mod typed_numpy
 {
-    use egglog::ast::Schema;
+    use egglog::ast::{Schema, Expr};
     use egglog::prelude::*;
     use egglog::add_primitive;
     use egglog::sort::{F, OrderedFloat};
     use pyo3::prelude::*;
+
+    #[pyclass]
+    enum RustExpr
+    {
+        Constant { value : f64 },
+        Tensor { dims : Vec<String> },
+        Exp { x : Py<RustExpr> },
+        Sin { x : Py<RustExpr> },
+        Cos { x : Py<RustExpr> },
+        Sqrt { x : Py<RustExpr> },
+        Add { x : Py<RustExpr>, y : Py<RustExpr> },
+        Sub { x : Py<RustExpr>, y : Py<RustExpr> },
+        Mul { x : Py<RustExpr>, y : Py<RustExpr> },
+        Div { x : Py<RustExpr>, y : Py<RustExpr> },
+        BinaryMax { x : Py<RustExpr>, y : Py<RustExpr> },
+        Repeat { dim : String, x : Py<RustExpr> },
+        Sum { dim : String, start : i64, end : i64, x : Py<RustExpr> },
+        Max { dim : String, start : i64, end : i64, x : Py<RustExpr> },
+    }
+
+    fn RustExprToEgglogExpr(x : &Py<RustExpr>) -> Expr
+    {
+        match &x.get()
+        {
+            RustExpr::Constant { value } =>
+            {
+                return exprs::call("Constant", vec![exprs::float(*value)]);
+            }
+            RustExpr::Tensor { dims } =>
+            {
+                let dim_exprs : Vec<Expr> = dims.iter().map(|d| exprs::string(d)).collect();
+                let dims_set = exprs::call("set-of", dim_exprs);
+                return exprs::call("Tensor", vec![dims_set]);
+            }
+            RustExpr::Exp { x } =>
+            {
+                let child = RustExprToEgglogExpr(&x);
+                return exprs::call("Exp", vec![child]);
+            }
+            RustExpr::Sin { x } =>
+            {
+                let child = RustExprToEgglogExpr(&x);
+                return exprs::call("Sin", vec![child]);
+            }
+            RustExpr::Cos { x } =>
+            {
+                let child = RustExprToEgglogExpr(&x);
+                return exprs::call("Cos", vec![child]);
+            }
+            RustExpr::Sqrt { x } =>
+            {
+                let child = RustExprToEgglogExpr(&x);
+                return exprs::call("Sqrt", vec![child]);
+            }
+            RustExpr::Add { x, y } =>
+            {
+                let lhs = RustExprToEgglogExpr(&x);
+                let rhs = RustExprToEgglogExpr(&y);
+                return exprs::call("Add", vec![lhs, rhs]);
+            }
+            RustExpr::Sub { x, y } =>
+            {
+                let lhs = RustExprToEgglogExpr(&x);
+                let rhs = RustExprToEgglogExpr(&y);
+                return exprs::call("Sub", vec![lhs, rhs]);
+            }
+            RustExpr::Mul { x, y } =>
+            {
+                let lhs = RustExprToEgglogExpr(&x);
+                let rhs = RustExprToEgglogExpr(&y);
+                return exprs::call("Mul", vec![lhs, rhs]);
+            }
+            RustExpr::Div { x, y } =>
+            {
+                let lhs = RustExprToEgglogExpr(&x);
+                let rhs = RustExprToEgglogExpr(&y);
+                return exprs::call("Div", vec![lhs, rhs]);
+            }
+            RustExpr::BinaryMax { x, y } =>
+            {
+                let lhs = RustExprToEgglogExpr(&x);
+                let rhs = RustExprToEgglogExpr(&y);
+                return exprs::call("BinaryMax", vec![lhs, rhs]);
+            }
+            RustExpr::Repeat { dim, x } =>
+            {
+                let child = RustExprToEgglogExpr(&x);
+                return exprs::call("Repeat", vec![exprs::string(dim), child]);
+            }
+            RustExpr::Sum { dim, start, end, x } =>
+            {
+                let child = RustExprToEgglogExpr(&x);
+                return exprs::call("Sum", vec![exprs::string(dim), exprs::int(*start), exprs::int(*end), child]);
+            }
+            RustExpr::Max { dim, start, end, x } =>
+            {
+                let child = RustExprToEgglogExpr(&x);
+                return exprs::call("Max", vec![exprs::string(dim), exprs::int(*start), exprs::int(*end), child]);
+            }
+        };
+    }
 
     #[derive(Debug, Clone)]
     struct TypedNumpyError
@@ -39,15 +140,27 @@ mod typed_numpy
     struct RustEgraph
     {
         eg : egglog::EGraph,
+        current_id : i64,
     }
+
+    static Ruleset : &str = "rewrites";
 
     fn NewRustEgraph() -> Result<egglog::EGraph, egglog::Error>
     {
         let mut eg = egglog::EGraph::default();
+        eg.declare_sort(
+            "StringSet".to_string(),
+            &Some(
+                ("Set".to_string(),
+                vec![Expr::Var(span!(), "String".to_string())]),
+            ),
+            span!(),
+        )?;
+            
         datatype!(&mut eg,
             (datatype Expr
                 (Constant f64)
-                (Tensor)
+                (Tensor StringSet)
                 (Exp Expr)
                 (Sin Expr)
                 (Cos Expr)
@@ -68,14 +181,13 @@ mod typed_numpy
         add_primitive!(&mut eg, "cos" = |a: F| -> F { F::from(OrderedFloat((**a).cos())) });
         add_primitive!(&mut eg, "sqrt" = |a: F| -> F { F::from(OrderedFloat((**a).sqrt())) });
 
-        let ruleset = "rewrites";
-        add_ruleset(&mut eg, ruleset)?;
+        add_ruleset(&mut eg, Ruleset)?;
 
         macro_rules! add_rule
         {
             ($lhs:tt => $rhs:tt) =>
             {
-                rule(&mut eg, ruleset, facts![(= x $lhs)], actions![(union x $rhs)])?;
+                rule(&mut eg, Ruleset, facts![(= x $lhs)], actions![(union x $rhs)])?;
             };
             ($lhs:tt <=> $rhs:tt) =>
             {
@@ -83,7 +195,6 @@ mod typed_numpy
                 add_rule!($rhs => $lhs);
             };
         }
-
 
         add_rule!((Add a b) => (Add b a)); // commutativity
         add_rule!((Add (Add a b) c) <=> (Add a (Add b c))); // associativity
@@ -103,6 +214,9 @@ mod typed_numpy
         // reorder_reductions
         add_rule!((Sum D s e (Sum E m n a)) => (Sum E m n (Sum D s e a)));
         add_rule!((Max D s e (Max E m n a)) => (Max E m n (Max D s e a)));
+        // combine_reductions
+        add_rule!((Add (Sum D s m x) (Sum D m e x)) => (Sum D s e x));
+        add_rule!((BinaryMax (Max D s m x) (Max D m e x)) => (Max D s e x));
 
         add_rule!((Repeat D (Repeat E x)) => (Repeat E (Repeat D x))); // reorder_repeats
         add_rule!((Sum D s e (Div a (Repeat D b))) <=> (Div (Sum D s e a) b)); // factor_out_of_sum
@@ -147,20 +261,66 @@ mod typed_numpy
         return Ok(eg);
     }
 
+    impl RustEgraph
+    {
+        fn next_id(&mut self) -> i64
+        {
+            let result = self.current_id;
+            self.current_id += 1;
+            return result;
+        }
+    }
+
     #[pymethods]
     impl RustEgraph
     {
         #[new]
         fn py_new() -> PyResult<Self>
         {
-            println!("Making new egraph!");
             let eg = NewRustEgraph().map_err(TypedNumpyError::from)?;
             return Ok(
                 RustEgraph
                 {
-                    eg : eg
+                    eg : eg,
+                    current_id : 0,
                 }
             );
+        }
+
+        fn insert_expression(&mut self, expr : Py<RustExpr>) -> PyResult<String>
+        {
+            let egglog_expr = RustExprToEgglogExpr(&expr);
+            let expr_id = format!("expr_{}", self.next_id());
+            rule(
+                &mut self.eg,
+                Ruleset,
+                facts![],
+                GenericActions(
+                    vec![Action::Let(span!(), expr_id.clone(), egglog_expr)],
+                ),
+            ).map_err(TypedNumpyError::from)?;
+            return Ok(expr_id);
+        }
+
+        fn incrementally_check_equivalence(
+            &mut self,
+            a_id : Py<String>,
+            b_id : Py<String>,
+        ) -> PyResult<bool>
+        {
+            for _ in 0..10
+            {
+                let result = query(
+                    &mut self.eg,
+                    vars![],
+                    facts![(= (unquote a_id.get()) (unquote b_id.get()))],
+                )?;
+                if !result.iter().next().is_none()
+                {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
         }
     }
 }
