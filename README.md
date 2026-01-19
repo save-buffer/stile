@@ -25,8 +25,8 @@ You can then specify your expected result using a lightweight specification lang
 if you want to compute `2 * A @ B` (in Numpy parlance), you would specify the string `2 * (M N, N K -> M K)`.
 Then, after you write your tiled kernel, when you output the result, type checking will fail if the 
 type system is unable to prove that your expression that you've built up is equivalent to the specification.
-The current expression simplifier is EXTREMELY barebones and basically only exists to make this example
-function. A real implementation would use E-graphs and would probably come next.
+The expression simplifier is implemented as an Egraph using the wonderful Egglog library, and is powerful
+enough to prove a tiled Flash Attention kernel!
 
 ## Example
 ```python
