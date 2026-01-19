@@ -3,7 +3,7 @@ import sys
 import numpy as np
 import pytest
 
-from typed_numpy import (
+from stile import (
     Typed,
     TypedResult,
     FullDim,
@@ -11,16 +11,16 @@ from typed_numpy import (
     exp,
     max,
     sqrt,
-    reset_typed_numpy,
+    reset_stile,
     expr_simplifies,
     rewrite_found,
 )
-from typed_numpy.egraph import egraph_enable_breakpoint
+from stile.egraph import egraph_enable_breakpoint
 
 @pytest.fixture
 def reset():
     yield
-    reset_typed_numpy()
+    reset_stile()
 
 def test_simple_expression(reset):
     M, N = FullDim('M', 10), FullDim('N', 10)
@@ -297,5 +297,5 @@ if __name__ == '__main__':
     for test in tests:
         print("Running", test)
         sys.stdout.flush()
-        reset_typed_numpy()
+        reset_stile()
         test(None)

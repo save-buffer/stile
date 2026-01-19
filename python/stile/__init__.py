@@ -799,7 +799,7 @@ class TypedResult:
             slice_expr.append(slice(ds, de))
         self.arr[*slice_expr] = result.arr
 
-def reset_typed_numpy():
+def reset_stile():
     g_dim_registry.clear()
     global g_egraph
     g_egraph = Egraph()

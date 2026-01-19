@@ -1,4 +1,4 @@
-# Typed Numpy
+# Stile
 
 This is an experiment at adding a type system to Numpy for the purposes of writing tiled kernels. 
 Tiled kernels are notoriously difficult to write, in no small part due to the fact that the inputs
@@ -64,7 +64,7 @@ the mistake!
 
 ## Performance
 The most complicated thing that this system has been tested on is a simple Flash Attention, which
-it can successfully validate (see `tests/test_typed_numpy.py::test_flash_attention`). The size of 
+it can successfully validate (see `tests/test_stile.py::test_flash_attention`). The size of 
 the expression that we prove grows with the number of _tiles_, meaning a context length of 512 with
 tiles of size 32 will take the same amount of time to prove as a context length of 16,384 with a
 tile size of 1024. In release mode on my Apple M3 Pro 18GB, the time to prove Flash Attention is given

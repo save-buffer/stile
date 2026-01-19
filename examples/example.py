@@ -1,6 +1,6 @@
 import numpy as np
 
-from typed_numpy import (
+from stile import (
     Typed,
     TypedResult,
     FullDim,
