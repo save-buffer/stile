@@ -1,11 +1,4 @@
-import math
-
-from collections import defaultdict
-from dataclasses import dataclass
-from enum import Enum
-from typing import Any, Callable
-
-from .type_nodes import *
+from .type import *
 from ._rust import RustEgraph, RustExpr # ty: ignore
 
 def expr_type_to_rust_expr(expr : ExprType) -> RustExpr:
@@ -56,10 +49,26 @@ def expr_type_to_rust_expr(expr : ExprType) -> RustExpr:
                     return RustExpr.Max(d, start, end, rust_child)
             raise ValueError(f"Unknown reduction op {op}")
 
-def verify_exprs_equal(x : ExprType, y : ExprType) -> bool:
+def verify_exprs_equivalent(x : ExprType, y : ExprType) -> bool:
     egg = RustEgraph()
     x_rust = expr_type_to_rust_expr(x)
     y_rust = expr_type_to_rust_expr(y)
     x_id = egg.insert_expression(x_rust)
     y_id = egg.insert_expression(y_rust)
     return egg.incrementally_check_equivalence(x_id, y_id)
+
+def verify_dims_equivalent(x : DimType, y : DimType) -> bool:
+    if len(x) != len(y):
+        return False
+    for x, y in zip(x, y, strict=True):
+        if dim_full_dim(x) != dim_full_dim(y):
+            return False
+    return True
+
+def verify_types_equivalent(x : Type, y : Type) -> bool:
+    dim_types_match = verify_dims_equivalent(x.dt, y.dt)
+    if not dim_types_match:
+        return False
+
+    expr_types_match = verify_exprs_equivalent(x.et, y.et)
+    return expr_types_match

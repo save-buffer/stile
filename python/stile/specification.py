@@ -1,4 +1,4 @@
-from .type_nodes import *
+from .type import *
 
 @dataclass
 class LexState:
@@ -291,12 +291,12 @@ def _parse_expr(lex : LexState) -> tuple[DimType, ExprType]:
             rhs=rhs_et,
         )
     
-    return result_dt, result_et    
+    return result_dt, result_et
 
 def _parse_spec(lex : LexState) -> tuple[DimType, ExprType]:
     return _parse_expr(lex)
 
-def parse_spec_into_type(spec : str) -> tuple[DimType, ExprType]:
+def parse_spec_into_type(spec : str) -> Type:
     """
     Grammar:
     Spec      -> Expr
@@ -326,4 +326,5 @@ def parse_spec_into_type(spec : str) -> tuple[DimType, ExprType]:
     REDUCE_OP -> 'sum' | 'max'
     """
     lex = LexState(spec)
-    return _parse_spec(lex)
+    dt, et = _parse_spec(lex)
+    return Type(dt, et)
