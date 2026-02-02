@@ -1,10 +1,11 @@
 import stile.type as t
-from .type import *
-from .specification import parse_spec_into_type
-from .verification import verify_types_equivalent, verify_exprs_equivalent
+from ..type import *
+from ..specification import parse_spec_into_type
+from ..verification import verify_types_equivalent, verify_exprs_equivalent
 
 import numpy as np
 import einops
+
 
 class TypedNumpyArray:
     def __init__(self, arr : np.ndarray, type : Type):
@@ -18,7 +19,7 @@ class TypedNumpyArray:
                 slice_expr.append(slice(start, end))
             else:
                 slice_expr.append(slice(None))
-        
+
         new_type = self.type.slice(dim, start, end)
         return TypedNumpyArray(self.arr[*slice_expr], new_type)
 
@@ -130,43 +131,50 @@ def _binary_op_helper(
             new_arr = np.maximum(lhs, rhs)
         case _:
             raise ValueError(f"Unknown op {op}")
-        
+
     return TypedNumpyArray(new_arr, new_type)
+
 
 def exp(x : TypedNumpyArray) -> TypedNumpyArray:
     new_type = t.exp(x.type)
     new_arr = np.exp(x.arr)
     return TypedNumpyArray(new_arr, new_type)
 
+
 def sin(x : TypedNumpyArray) -> TypedNumpyArray:
     new_type = t.sin(x.type)
     new_arr = np.sin(x.arr)
     return TypedNumpyArray(new_arr, new_type)
+
 
 def cos(x : TypedNumpyArray) -> TypedNumpyArray:
     new_type = t.cos(x.type)
     new_arr = np.cos(x.arr)
     return TypedNumpyArray(new_arr, new_type)
 
+
 def sqrt(x : TypedNumpyArray) -> TypedNumpyArray:
     new_type = t.sqrt(x.type)
     new_arr = np.sqrt(x.arr)
     return TypedNumpyArray(new_arr, new_type)
 
+
 def maximum(x : TypedNumpyArray, y : TypedNumpyArray) -> TypedNumpyArray:
     return _binary_op_helper(x, y, "max")
+
 
 def einsum(x : TypedNumpyArray, y : TypedNumpyArray, einstr : str) -> TypedNumpyArray:
     new_arr = einops.einsum(x.arr, y.arr, einstr)
     new_type = t.einsum(x.type, y.type, einstr)
     return TypedNumpyArray(new_arr, new_type)
 
+
 class TypedResult:
     def __init__(self, spec : str):
         self.expected_type = parse_spec_into_type(spec)
         self.shape = tuple(dim_size(d) for d in self.expected_type.dt) if self.expected_type.dt is not None else tuple()
         self.arr = np.zeros(self.shape)
-        
+
     def assign(self, result : TypedNumpyArray):
         if not verify_types_equivalent(
                 self.expected_type,
@@ -180,20 +188,12 @@ class TypedResult:
             slice_expr.append(slice(ds, de))
         self.arr[*slice_expr] = result.arr
 
+
 def zeros(shape : tuple[FullDim, ...]) -> TypedNumpyArray:
     np_shape = tuple(dim_size(d) for d in shape)
     arr = np.zeros(np_shape)
     type = Type(
         dt=shape,
         et=0.0,
-    )
-    return TypedNumpyArray(arr, type)
-
-def randn(*shape : FullDim):
-    np_shape = tuple(dim_size(d) for d in shape)
-    arr = np.random.randn(*np_shape)
-    type = Type(
-        dt=shape,
-        et=Tensor(shape),
     )
     return TypedNumpyArray(arr, type)

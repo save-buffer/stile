@@ -16,6 +16,11 @@ dependencies = [
     "numpy>=1.24.4",
 ]
 
+[project.optional-dependencies]
+jax = ["jax>=0.4.0"]
+triton = ["triton>=2.0.0"]
+all = ["jax>=0.4.0", "triton>=2.0.0"]
+
 [tool.maturin]
 python-source = "python"
 module-name = "stile._rust"
