@@ -1,3 +1,9 @@
+"""
+Triton integration tests.
+
+These tests require Linux (Triton only has Linux wheels).
+Run with: TRITON_INTERPRET=1 python tests/test_typed_triton.py
+"""
 import os
 import sys
 import platform
@@ -9,11 +15,13 @@ import torch
 import triton
 import triton.language as tl
 
-import stile.triton as st
+import stile.torch as ttorch
+import stile.triton as ttl
 
 import pytest
 from stile import dim, reset_stile
 from stile.type import Type, Tensor, FullDim
+
 
 @pytest.fixture
 def reset():
@@ -21,26 +29,23 @@ def reset():
     reset_stile()
 
 
-@triton.jit
-def add_kernel_typed(
-    x_ptr, x_type_dt, x_type_et,
-    y_ptr, y_type_dt, y_type_et,
-    output_ptr, output_type_dt, output_type_et,
+@ttl.typed_jit
+def add_kernel(
+    x_ptr,
+    y_ptr,
+    output_ptr,
     n_elements,
     BLOCK_SIZE : tl.constexpr,
 ):
-    """A typed vector addition kernel."""
+    """Vector addition kernel."""
     pid = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    # Load with type tracking
     x = tl.load(x_ptr + offsets, mask=mask)
     y = tl.load(y_ptr + offsets, mask=mask)
-
     output = x + y
-
     tl.store(output_ptr + offsets, output, mask=mask)
 
 
@@ -48,30 +53,24 @@ def test_simple_add(reset):
     """Test basic typed vector addition."""
     N = dim('N', 1024)
 
-    # Create tensors
-    x = torch.randn(N.size)
-    y = torch.randn(N.size)
-    output = torch.empty_like(x)
+    # Create typed tensors - inputs are TypedTorchTensor, outputs are TypedResult
+    x = tpt.random.randn(N)
+    y = tpt.random.randn(N)
+    output = tpt.TypedResult("N")
 
-    # Create types
-    x_type = Type(dt=(N,), et=Tensor((N,)))
-    y_type = Type(dt=(N,), et=Tensor((N,)))
-
-    # Launch kernel
-    n_elements = x.numel()
+    # Launch kernel with typed tensors using st.launch
+    n_elements = N.size
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
 
-    add_kernel_typed[grid](
-        x, None, None,
-        y, None, None,
-        output, None, None,
+    st.launch(add_kernel, grid)(
+        x, y, output,
         n_elements,
         BLOCK_SIZE=256,
     )
 
     # Verify numerical correctness
-    expected = x + y
-    assert torch.allclose(output, expected)
+    expected = x.tensor + y.tensor
+    assert torch.allclose(output.tensor, expected)
 
 
 @triton.jit
@@ -93,24 +92,24 @@ def exp_kernel(
 
 
 def test_exp(reset):
-    """Test exponential operation."""
+    """Test exponential operation with typed tensors."""
     N = dim('N', 512)
 
-    x = torch.randn(N.size)
-    output = torch.empty_like(x)
+    x = tpt.random.randn(N)
+    output = tpt.TypedResult("exp(N)")
 
-    n_elements = x.numel()
+    n_elements = N.size
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
 
-    exp_kernel[grid](
+    st.launch(exp_kernel, grid)(
         x,
         output,
         n_elements,
         BLOCK_SIZE=128,
     )
 
-    expected = torch.exp(x)
-    assert torch.allclose(output, expected)
+    expected = torch.exp(x.tensor)
+    assert torch.allclose(output.tensor, expected)
 
 
 @triton.jit
@@ -122,16 +121,12 @@ def softmax_kernel(
 ):
     """
     Simple softmax kernel (processes entire vector in one block).
-    This is a simplified version for testing.
     """
-    pid = tl.program_id(axis=0)
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    # Load the entire vector
     x = tl.load(x_ptr + offsets, mask=mask, other=-float('inf'))
 
-    # Compute softmax with numerical stability
     x_max = tl.max(x, axis=0)
     x_stable = x - x_max
     exp_x = tl.exp(x_stable)
@@ -142,23 +137,22 @@ def softmax_kernel(
 
 
 def test_softmax(reset):
-    """Test softmax kernel."""
+    """Test softmax kernel with typed tensors."""
     N = dim('N', 64)
 
-    x = torch.randn(N.size)
-    output = torch.empty_like(x)
+    x = tpt.random.randn(N)
+    output = tpt.TypedResult("softmax[N](N)")
 
-    # For simplicity, process entire vector in one block
+    # Use st.unwrap for direct kernel call
     softmax_kernel[(1,)](
-        x,
-        output,
+        st.unwrap(x),
+        st.unwrap(output),
         N.size,
         BLOCK_SIZE=64,
     )
 
-    # Compare with PyTorch softmax
-    expected = torch.softmax(x, dim=0)
-    assert torch.allclose(output, expected, atol=1e-5)
+    expected = torch.softmax(x.tensor, dim=0)
+    assert torch.allclose(output.tensor, expected, atol=1e-5)
 
 
 tests = [
@@ -173,7 +167,7 @@ if __name__ == '__main__':
         sys.exit(0)
 
     for test in tests:
-        print("Running", test)
+        print("Running", test.__name__)
         sys.stdout.flush()
         reset_stile()
         test(None)
