@@ -8,12 +8,8 @@ import os
 import sys
 import platform
 
-# Enable interpreter mode for testing without GPU
-os.environ["TRITON_INTERPRET"] = "1"
-
 import torch
 import triton
-import triton.language as tl
 
 import stile.torch as ttorch
 import stile.triton as ttl
@@ -31,10 +27,10 @@ def reset():
 
 @ttl.typed_jit
 def add_kernel(
-    x_ptr,
-    y_ptr,
-    output_ptr,
-    n_elements,
+    out : ttl.TypedOutputPointer,
+    x : ttl.TypedPointer,
+    y : ttl.TypedPointer,
+    nelts : int,
     BLOCK_SIZE : tl.constexpr,
 ):
     """Vector addition kernel."""
@@ -53,22 +49,21 @@ def test_simple_add(reset):
     """Test basic typed vector addition."""
     N = dim('N', 1024)
 
-    # Create typed tensors - inputs are TypedTorchTensor, outputs are TypedResult
     x = tpt.random.randn(N)
     y = tpt.random.randn(N)
-    output = tpt.TypedResult("N")
+    output = tpt.TypedResult("N + N")
 
-    # Launch kernel with typed tensors using st.launch
     n_elements = N.size
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
 
     st.launch(add_kernel, grid)(
-        x, y, output,
+        x,
+        y,
+        output,
         n_elements,
         BLOCK_SIZE=256,
     )
 
-    # Verify numerical correctness
     expected = x.tensor + y.tensor
     assert torch.allclose(output.tensor, expected)
 

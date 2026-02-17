@@ -19,8 +19,7 @@ class TypedTorchTensor:
         self.type = type
 
     @property
-    def data_ptr(self):
-        """Get the data pointer for passing to Triton kernels."""
+    def data_ptr(self) -> int:
         return self.tensor.data_ptr()
 
     def slice(self, dim : FullDim, start : int, end : int) -> "TypedTorchTensor":

@@ -3,7 +3,7 @@ import sys
 import torch
 import pytest
 
-import stile.torch as tpt
+import stile.torch as ttorch
 
 from stile import expr_simplifies, reset_stile, dim
 
@@ -16,8 +16,8 @@ def reset():
 
 def test_simple_expression(reset):
     M, N = dim('M', 10), dim('N', 10)
-    a = tpt.random.randn(M, N)
-    b = tpt.TypedResult("2 * M N")
+    a = ttorch.random.randn(M, N)
+    b = ttorch.TypedResult("2 * M N")
     for i in range(0, 10, 5):
         a_tile = a.slice(M, i, i + 5)
         a_scaled = a_tile * 2
@@ -26,9 +26,9 @@ def test_simple_expression(reset):
 
 def test_basic_matmul(reset):
     M, N, K = dim('M', 10), dim('N', 15), dim('K', 20)
-    a = tpt.random.randn(M, N)
-    b = tpt.random.randn(N, K)
-    c = tpt.TypedResult("(M N, N K -> M K)")
+    a = ttorch.random.randn(M, N)
+    b = ttorch.random.randn(N, K)
+    c = ttorch.TypedResult("(M N, N K -> M K)")
 
     for im in range(0, 10, 5):
         for ik in range(0, 20, 5):
@@ -36,18 +36,18 @@ def test_basic_matmul(reset):
             for in_ in range(0, 15, 5):
                 tile_a = a.slice(M, im, im + 5).slice(N, in_, in_ + 5)
                 tile_b = b.slice(N, in_, in_ + 5).slice(K, ik, ik + 5)
-                tile_c = tpt.einsum(tile_a, tile_b, "M N, N K -> M K")
+                tile_c = ttorch.einsum(tile_a, tile_b, "M N, N K -> M K")
                 c_accum = c_accum + tile_c
-            assert isinstance(c_accum, tpt.TypedTorchTensor)
+            assert isinstance(c_accum, ttorch.TypedTorchTensor)
             c.assign(c_accum)
 
 
 def test_exp(reset):
     M, N = dim('M', 10), dim('N', 10)
-    a = tpt.random.randn(M, N)
-    c = tpt.TypedResult("exp(M N)")
+    a = ttorch.random.randn(M, N)
+    c = ttorch.TypedResult("exp(M N)")
 
-    a_exped = tpt.exp(a)
+    a_exped = ttorch.exp(a)
 
     a_exped_div_a_exped = a_exped / a_exped
     a_exped_div_a_exped.assert_equivalent("1")
@@ -61,17 +61,17 @@ def test_exp(reset):
 
 def test_numerically_stable_softmax(reset):
     N = dim('N', 8)
-    x = tpt.random.randn(N)
+    x = ttorch.random.randn(N)
 
     # exp(x) / sum(exp(x))
-    naive = tpt.TypedResult("softmax[N](N)")
+    naive = ttorch.TypedResult("softmax[N](N)")
     x_max = x.max(N)
     assert expr_simplifies(x_max, "max[N](N)")
 
     x_stable = x - x_max.repeat(N)
     assert expr_simplifies(x_stable, "N - (max[N](N) -> N)")
 
-    exp_x = tpt.exp(x_stable)
+    exp_x = ttorch.exp(x_stable)
     assert expr_simplifies(exp_x, "exp(N - (max[N](N) -> N))")
 
     sum_exp_x = exp_x.sum(N).repeat(N)
@@ -139,25 +139,25 @@ def test_numerically_stable_softmax(reset):
 
 def test_online_softmax(reset):
     N = dim('N', 8)
-    x = tpt.random.randn(N)
-    online = tpt.TypedResult("softmax[N](N)")
+    x = ttorch.random.randn(N)
+    online = ttorch.TypedResult("softmax[N](N)")
 
     x_block1 = x.slice(N, 0, 4)
     m1 = x_block1.max(N)
-    exp1 = tpt.exp(x_block1 - m1.repeat(N[0:4]))
+    exp1 = ttorch.exp(x_block1 - m1.repeat(N[0:4]))
     l1 = exp1.sum(N)
 
     x_block2 = x.slice(N, 4, 8)
     m2 = x_block2.max(N)
-    exp2 = tpt.exp(x_block2 - m2.repeat(N[4:8]))
+    exp2 = ttorch.exp(x_block2 - m2.repeat(N[4:8]))
     l2 = exp2.sum(N)
 
-    m_global = tpt.maximum(m1, m2)
+    m_global = ttorch.maximum(m1, m2)
 
-    l1_correction = tpt.exp(m1 - m_global)
+    l1_correction = ttorch.exp(m1 - m_global)
     l1_corrected = l1 * l1_correction
 
-    l2_correction = tpt.exp(m2 - m_global)
+    l2_correction = ttorch.exp(m2 - m_global)
     l2_corrected = l2 * l2_correction
     l_global = l1_corrected + l2_corrected
 
@@ -206,8 +206,8 @@ def test_online_softmax(reset):
         "sum[N](exp(N - (max[N](N) -> N)))",
     )
 
-    softmax1 = tpt.exp(x_block1 - m_global.repeat(N[0:4])) / l_global.repeat(N[0:4])
-    softmax2 = tpt.exp(x_block2 - m_global.repeat(N[4:8])) / l_global.repeat(N[4:8])
+    softmax1 = ttorch.exp(x_block1 - m_global.repeat(N[0:4])) / l_global.repeat(N[0:4])
+    softmax2 = ttorch.exp(x_block2 - m_global.repeat(N[4:8])) / l_global.repeat(N[4:8])
     online.assign(softmax1)
     online.assign(softmax2)
 
@@ -215,11 +215,11 @@ def test_online_softmax(reset):
 def test_flash_attention(reset):
     dhead, qctx, nctx = dim('dhead', 16), dim('qctx', 32), dim('nctx', 128)
 
-    Q = tpt.random.randn(qctx, dhead)
-    K = tpt.random.randn(nctx, dhead)
-    V = tpt.random.randn(nctx, dhead)
+    Q = ttorch.random.randn(qctx, dhead)
+    K = ttorch.random.randn(nctx, dhead)
+    V = ttorch.random.randn(nctx, dhead)
 
-    L = tpt.TypedResult("((softmax[nctx](qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)), nctx dhead -> qctx dhead)")
+    L = ttorch.TypedResult("((softmax[nctx](qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)), nctx dhead -> qctx dhead)")
 
     qctx_tile_size = 32
     nctx_tile_size = 32
@@ -232,19 +232,19 @@ def test_flash_attention(reset):
             q_tile = Q.slice(qctx, iqctx, iqctx + qctx_tile_size)
             k_tile = K.slice(nctx, ictx, ictx + nctx_tile_size)
 
-            qk_tile = tpt.einsum(q_tile, k_tile, "qctx dhead, nctx dhead -> nctx qctx") / (dhead.size ** 0.5)
+            qk_tile = ttorch.einsum(q_tile, k_tile, "qctx dhead, nctx dhead -> nctx qctx") / (dhead.size ** 0.5)
             tile_max = qk_tile.max(nctx)
-            logits = tpt.exp(qk_tile - tile_max.repeat(qk_tile.type.dt[0]))
+            logits = ttorch.exp(qk_tile - tile_max.repeat(qk_tile.type.dt[0]))
 
             tile_l = logits.sum(nctx)
-            new_max = tpt.maximum(tile_max, running_max)
-            new_l = tpt.exp(running_max - new_max) * running_l + tpt.exp(tile_max - new_max) * tile_l
+            new_max = ttorch.maximum(tile_max, running_max)
+            new_l = ttorch.exp(running_max - new_max) * running_l + ttorch.exp(tile_max - new_max) * tile_l
 
             v_tile = V.slice(nctx, ictx, ictx + nctx_tile_size)
-            v_proj = tpt.einsum(logits, v_tile, "nctx qctx, nctx dhead -> qctx dhead")
+            v_proj = ttorch.einsum(logits, v_tile, "nctx qctx, nctx dhead -> qctx dhead")
 
-            rescaled_old_o = (running_l * tpt.exp(running_max - new_max)).repeat(dhead).rearrange(qctx, dhead) * o
-            rescaled_v_proj = tpt.exp(tile_max - new_max).repeat(dhead).rearrange(qctx, dhead) * v_proj
+            rescaled_old_o = (running_l * ttorch.exp(running_max - new_max)).repeat(dhead).rearrange(qctx, dhead) * o
+            rescaled_v_proj = ttorch.exp(tile_max - new_max).repeat(dhead).rearrange(qctx, dhead) * v_proj
 
             o = (rescaled_old_o + rescaled_v_proj) / new_l.repeat(dhead).rearrange(qctx, dhead)
             running_l = new_l
@@ -254,7 +254,7 @@ def test_flash_attention(reset):
                 nctx[:(ictx + nctx_tile_size)],
             )
 
-        assert isinstance(o, tpt.TypedTorchTensor)
+        assert isinstance(o, ttorch.TypedTorchTensor)
         L.assign(o)
     print("Formally verified Flash Attention passed!")
 
