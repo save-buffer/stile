@@ -12,7 +12,7 @@ type system can and should be ported to Python DSLs for kernel-writing like Trit
 
 This type system really consists of two kinds of type, which are tracked automatically without manual
 type hints:
-- DimType: The type of a given tensor in terms of its dimensions, and how it's sliced up
+- ShapeType: The type of a given tensor in terms of its dimensions, and how it's sliced up
 - ExprType: The tree of operations performed up till this point
 
 The rough rules that the type system enforces are:

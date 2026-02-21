@@ -9,8 +9,8 @@ M, N, K = dim('M', 10), dim('N', 10), dim('K', 10)
 
 # Wrap your numpy arrays inside of the Typed class, and specify their dimensions.
 # This is the type system's entry point into its knowledge about your program.
-a = tnp.randn(M, N)
-b = tnp.randn(N, K)
+a = tnp.random.randn(M, N)
+b = tnp.random.randn(N, K)
 
 # Slice things! a_slice and b_slice are sliced as if we did a[0:5, 0:5] and b[0:5, 0:5]
 a_sliced = a.slice(M, 0, 5).slice(N, 0, 5)
