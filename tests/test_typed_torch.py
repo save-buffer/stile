@@ -234,7 +234,7 @@ def test_flash_attention(reset):
 
             qk_tile = ttorch.einsum(q_tile, k_tile, "qctx dhead, nctx dhead -> nctx qctx") / (dhead.size ** 0.5)
             tile_max = qk_tile.max(nctx)
-            logits = ttorch.exp(qk_tile - tile_max.repeat(qk_tile.type.dt[0]))
+            logits = ttorch.exp(qk_tile - tile_max.repeat(qk_tile.type.st[0]))
 
             tile_l = logits.sum(nctx)
             new_max = ttorch.maximum(tile_max, running_max)

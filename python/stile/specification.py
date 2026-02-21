@@ -68,9 +68,9 @@ class LexState:
         self.spec = self.spec[len(s):]
 
 def _construct_binary_reduction_expr(
-    a_type : tuple[DimType, ExprType],
-    b_type : tuple[DimType, ExprType],
-    rhs : DimType,
+    a_type : tuple[ShapeType, ExprType],
+    b_type : tuple[ShapeType, ExprType],
+    rhs : ShapeType,
     reduction : ReduceOpType = "sum",
 ) -> ExprType:
     dims_a, expr_a = a_type
@@ -109,8 +109,8 @@ def _construct_binary_reduction_expr(
     return c
 
 def _construct_unary_reduction_expr(
-    a : tuple[DimType, ExprType],
-    rhs : DimType,
+    a : tuple[ShapeType, ExprType],
+    rhs : ShapeType,
     reduction : ReduceOpType = "sum",
 ) -> ExprType:
     dims_a, expr_a = a
@@ -128,16 +128,16 @@ def _construct_unary_reduction_expr(
     return result
 
 
-def _normalize_dts_for_binary_op(lhs : DimType, rhs : DimType) -> DimType:
+def _normalize_dts_for_binary_op(lhs : ShapeType, rhs : ShapeType) -> ShapeType:
     if lhs == tuple():
         return rhs
     if rhs == tuple():
         return lhs
     if lhs != rhs:
-        raise ValueError("Invalid spec: mismatching DimTypes for binary operation")
+        raise ValueError("Invalid spec: mismatching ShapeTypes for binary operation")
     return lhs
 
-def _parse_number(lex : LexState) -> tuple[DimType, ExprType]:
+def _parse_number(lex : LexState) -> tuple[ShapeType, ExprType]:
     lex.consume_whitespace()
     i = 0
     while i < len(lex.spec) and (lex.spec[i].isdigit() or lex.spec[i] == '.'):
@@ -182,7 +182,7 @@ def _parse_dim(lex : LexState) -> Dim:
         )
     return dim
 
-def _parse_tensor(lex : LexState) -> tuple[DimType, ExprType]:
+def _parse_tensor(lex : LexState) -> tuple[ShapeType, ExprType]:
     dims = []
     while (nxt := lex.peek()) is not None and nxt.isalpha():
         d = _parse_dim(lex)
@@ -190,54 +190,54 @@ def _parse_tensor(lex : LexState) -> tuple[DimType, ExprType]:
     full_dims = tuple(dim_full_dim(d) for d in dims)
     return tuple(dims), Tensor(full_dims)
 
-def _parse_contraction(lex : LexState, reduction : ReduceOpType = "sum") -> tuple[DimType, ExprType]:
-    lhs_dt, lhs_et = _parse_spec(lex)
+def _parse_contraction(lex : LexState, reduction : ReduceOpType = "sum") -> tuple[ShapeType, ExprType]:
+    lhs_st, lhs_et = _parse_spec(lex)
     if lex.maybe_consume(','):
-        rhs_dt, rhs_et = _parse_spec(lex)
+        rhs_st, rhs_et = _parse_spec(lex)
         lex.expect('->')
-        result_dt, _ = _parse_tensor(lex)
-        return result_dt, _construct_binary_reduction_expr(
-            (lhs_dt, lhs_et),
-            (rhs_dt, rhs_et),
-            result_dt,
+        result_st, _ = _parse_tensor(lex)
+        return result_st, _construct_binary_reduction_expr(
+            (lhs_st, lhs_et),
+            (rhs_st, rhs_et),
+            result_st,
             reduction=reduction,
         )
     elif lex.maybe_consume('->'):
-        result_dt, _ = _parse_tensor(lex)
-        return result_dt, _construct_unary_reduction_expr(
-            (lhs_dt, lhs_et),
-            result_dt,
+        result_st, _ = _parse_tensor(lex)
+        return result_st, _construct_unary_reduction_expr(
+            (lhs_st, lhs_et),
+            result_st,
             reduction=reduction,
         )
     else:
         raise ValueError("Expected , for binary reduction or -> for unary reduction")
 
-def _parse_paren_expr(lex : LexState) -> tuple[DimType, ExprType]:
-    lhs_dt, lhs_et = _parse_spec(lex)
+def _parse_paren_expr(lex : LexState) -> tuple[ShapeType, ExprType]:
+    lhs_st, lhs_et = _parse_spec(lex)
     if lex.maybe_consume(','):
-        rhs_dt, rhs_et = _parse_spec(lex)
+        rhs_st, rhs_et = _parse_spec(lex)
         lex.expect('->')
-        result_dt, _ = _parse_tensor(lex)
-        return result_dt, _construct_binary_reduction_expr(
-            (lhs_dt, lhs_et),
-            (rhs_dt, rhs_et),
-            result_dt,
+        result_st, _ = _parse_tensor(lex)
+        return result_st, _construct_binary_reduction_expr(
+            (lhs_st, lhs_et),
+            (rhs_st, rhs_et),
+            result_st,
         )
     elif lex.maybe_consume('->'):
-        result_dt, _ = _parse_tensor(lex)
-        return result_dt, _construct_unary_reduction_expr(
-            (lhs_dt, lhs_et),
-            result_dt,
+        result_st, _ = _parse_tensor(lex)
+        return result_st, _construct_unary_reduction_expr(
+            (lhs_st, lhs_et),
+            result_st,
         )
     else:
-        return lhs_dt, lhs_et
+        return lhs_st, lhs_et
     
-def _parse_primary(lex : LexState) -> tuple[DimType, ExprType]:
+def _parse_primary(lex : LexState) -> tuple[ShapeType, ExprType]:
     if lex.peek() == '(':
         lex.consume()
-        dt, et = _parse_paren_expr(lex)
+        st, et = _parse_paren_expr(lex)
         lex.expect(')')
-        return dt, et
+        return st, et
     elif (nxt := lex.peek()) is not None:
         if nxt.isalpha():
             return _parse_tensor(lex)
@@ -245,27 +245,27 @@ def _parse_primary(lex : LexState) -> tuple[DimType, ExprType]:
             return _parse_number(lex)
     raise ValueError("Parenthesized expression, tensor, or number expected")
 
-def _parse_factor(lex : LexState) -> tuple[DimType, ExprType]:
+def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
     if reduction := lex.maybe_consume("sum", "max"):
         if lex.maybe_consume('['):
             dim = _parse_dim(lex)
             lex.expect(']')
             lex.expect('(')
-            dt, et = _parse_paren_expr(lex)
+            st, et = _parse_paren_expr(lex)
             lex.expect(')')
-            reduce_dt = tuple(d for d in dt if dim_full_dim(d) != dim_full_dim(dim))
-            reduce_dim = [d for d in dt if dim_full_dim(d) == dim_full_dim(dim)][0]
+            reduce_st = tuple(d for d in st if dim_full_dim(d) != dim_full_dim(dim))
+            reduce_dim = [d for d in st if dim_full_dim(d) == dim_full_dim(dim)][0]
             reduce_et = Reduce(
                 reduction, # ty: ignore
                 reduce_dim,
                 et,
             )
-            return reduce_dt, reduce_et
+            return reduce_st, reduce_et
         else:
             lex.expect('(')
-            dt, et = _parse_contraction(lex, reduction=reduction) # ty: ignore
+            st, et = _parse_contraction(lex, reduction=reduction) # ty: ignore
             lex.expect(')')
-            return dt, et
+            return st, et
     elif unary_op := lex.maybe_consume("exp", "sin", "cos", "sqrt", "softmax"):
         if lex.maybe_consume('['):
             if unary_op != "softmax":
@@ -275,44 +275,44 @@ def _parse_factor(lex : LexState) -> tuple[DimType, ExprType]:
             lex.expect(']')
 
         lex.expect('(')
-        dt, et = _parse_paren_expr(lex)
+        st, et = _parse_paren_expr(lex)
         lex.expect(')')
         if unary_op == "softmax":
-            return dt, construct_softmax(et, dim_annotation)
+            return st, construct_softmax(et, dim_annotation)
 
-        return dt, UnaryOp(
+        return st, UnaryOp(
             op=unary_op, # ty: ignore
             child=et,
         )
     else:
         return _parse_primary(lex)
 
-def _parse_term(lex : LexState) -> tuple[DimType, ExprType]:
-    result_dt, result_et = _parse_factor(lex)
+def _parse_term(lex : LexState) -> tuple[ShapeType, ExprType]:
+    result_st, result_et = _parse_factor(lex)
     while op := lex.maybe_consume("*", "/"):
-        rhs_dt, rhs_et = _parse_factor(lex)
-        result_dt = _normalize_dts_for_binary_op(result_dt, rhs_dt)
+        rhs_st, rhs_et = _parse_factor(lex)
+        result_st = _normalize_dts_for_binary_op(result_st, rhs_st)
         result_et = BinaryOp(
             op=op, # ty: ignore
             lhs=result_et,
             rhs=rhs_et,
         )
-    return result_dt, result_et
+    return result_st, result_et
 
-def _parse_expr(lex : LexState) -> tuple[DimType, ExprType]:
-    result_dt, result_et = _parse_term(lex)
+def _parse_expr(lex : LexState) -> tuple[ShapeType, ExprType]:
+    result_st, result_et = _parse_term(lex)
     while not lex.startswith("->") and (op := lex.maybe_consume('+', '-')):
-        rhs_dt, rhs_et = _parse_term(lex)
-        result_dt = _normalize_dts_for_binary_op(result_dt, rhs_dt)
+        rhs_st, rhs_et = _parse_term(lex)
+        result_st = _normalize_dts_for_binary_op(result_st, rhs_st)
         result_et = BinaryOp(
             op=op, # ty: ignore
             lhs=result_et,
             rhs=rhs_et,
         )
     
-    return result_dt, result_et
+    return result_st, result_et
 
-def _parse_spec(lex : LexState) -> tuple[DimType, ExprType]:
+def _parse_spec(lex : LexState) -> tuple[ShapeType, ExprType]:
     return _parse_expr(lex)
 
 def parse_spec_into_type(spec : str) -> Type:
@@ -345,5 +345,5 @@ def parse_spec_into_type(spec : str) -> Type:
     REDUCE_OP -> 'sum' | 'max'
     """
     lex = LexState(spec)
-    dt, et = _parse_spec(lex)
-    return Type(dt, et)
+    st, et = _parse_spec(lex)
+    return Type(st, et)

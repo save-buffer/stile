@@ -8,7 +8,7 @@ def randn(*shape : FullDim) -> TypedNumpyArray:
     np_shape = tuple(dim_size(d) for d in shape)
     arr = np.random.randn(*np_shape)
     type = Type(
-        dt=shape,
+        st=shape,
         et=Tensor(shape),
     )
     return TypedNumpyArray(arr, type)

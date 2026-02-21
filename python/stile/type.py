@@ -20,7 +20,7 @@ class FullDim:
         return Sliced(
             self,
             i.start if i.start is not None else 0,
-            i.stop,
+            i.stop if i.stop is not None else self.size,
         )
 
 @dataclass(frozen=True)
@@ -30,10 +30,10 @@ class Sliced:
     end : int
 
 Dim = FullDim | Sliced
-DimType = tuple[Dim, ...]
+ShapeType = tuple[Dim, ...]
 
 def dim_start(dim : Dim):
-    match dim: 
+    match dim:
         case FullDim(_, _):
             return 0
         case Sliced(d, st, _):
@@ -135,7 +135,7 @@ ExprType = Constant | Tensor | UnaryOp | BinaryOp | Repeat | Reduce
 
 @dataclass(frozen=True)
 class Type:
-    dt : DimType
+    st : ShapeType
     et : ExprType
 
     def slice(self, dim : FullDim, start : int, end : int) -> "Type":
@@ -143,7 +143,7 @@ class Type:
         expr_type = self.et
 
         dim_found = False
-        for i, d in enumerate(self.dt):
+        for i, d in enumerate(self.st):
             if dim_contains(d, dim):
                 dim_type.append(
                     Sliced(
@@ -166,7 +166,7 @@ class Type:
 
     def repeat(self, dim : Dim) -> "Type":
         new_dim_type = [dim]
-        for d in self.dt:
+        for d in self.st:
             if dim_name(dim) == dim_name(d):
                 raise ValueError(f"Cannot repeat a dim that already exists ({dim=})")
             new_dim_type.append(d)
@@ -180,7 +180,7 @@ class Type:
 
         dims_by_name = {}
         lhs_str = ""
-        for d in self.dt:
+        for d in self.st:
             name = dim_name(d)
             dims_by_name[name] = d
             lhs_str += f"{name} "
@@ -202,7 +202,7 @@ class Type:
         new_dim_type = []
         reduction_dim = None
         ireduction_dim = None
-        for i, d in enumerate(self.dt):
+        for i, d in enumerate(self.st):
             if dim_name(dim) != dim_name(d):
                 new_dim_type.append(d)
             else:
@@ -255,31 +255,31 @@ class Type:
 def type_from_binary_op(slf : Type | float, other : Type | float, op : BinaryOpType) -> Type:
     match slf, other:
         case Type(), Type():
-            if slf.dt != other.dt:
+            if slf.st != other.st:
                 raise ValueError("Binary operations can only occur between tensors with the same shapes")
-            new_dt = slf.dt
+            new_st = slf.st
             new_et = BinaryOp(
                 op=op,
                 lhs=slf.et,
                 rhs=other.et,
             )
-            return Type(new_dt, new_et)
+            return Type(new_st, new_et)
         case Type(), x:
-            new_dt = slf.dt
+            new_st = slf.st
             new_et = BinaryOp(
                 op=op,
                 lhs=slf.et,
                 rhs=Constant(x),
             )
-            return Type(new_dt, new_et)
+            return Type(new_st, new_et)
         case x, Type():
-            new_dt = other.dt
+            new_st = other.st
             new_et = BinaryOp(
                 op=op,
                 lhs=Constant(x),
                 rhs=other.et,
             )
-            return Type(new_dt, new_et)
+            return Type(new_st, new_et)
     assert False
                 
 def einsum(a : Type, b : Type, einstr : str) -> Type:
@@ -291,13 +291,13 @@ def einsum(a : Type, b : Type, einstr : str) -> Type:
 
     a_dims_by_name = {}
     b_dims_by_name = {}
-    for d in a.dt:
+    for d in a.st:
         name = dim_name(d)
         if name not in a_dims:
             raise ValueError(f"Dimension {name} not found in tensor A's einsum string")
         a_dims_by_name[name] = d
 
-    for d in b.dt:
+    for d in b.st:
         name = dim_name(d)
         if name not in b_dims:
             raise ValueError(f"Dimension {name} not found in tensor B's einsum string")
@@ -305,13 +305,13 @@ def einsum(a : Type, b : Type, einstr : str) -> Type:
 
     common_dims = a_dims_by_name.keys() & b_dims_by_name.keys()
     a_repeated = a
-    for d in b.dt:
+    for d in b.st:
         name = dim_name(d)
         if name not in common_dims:
             a_repeated = a_repeated.repeat(d)
 
     b_repeated = b
-    for d in a.dt:
+    for d in a.st:
         name = dim_name(d)
         if name not in common_dims:
             b_repeated = b_repeated.repeat(d)
@@ -343,7 +343,7 @@ def einsum(a : Type, b : Type, einstr : str) -> Type:
     return c
 
 def exp(x : Type) -> Type:
-    new_dim_type = x.dt
+    new_dim_type = x.st
     new_expr_type = UnaryOp(
         op="exp",
         child=x.et,
@@ -351,7 +351,7 @@ def exp(x : Type) -> Type:
     return Type(new_dim_type, new_expr_type)
 
 def sin(x : Type) -> Type:
-    new_dim_type = x.dt
+    new_dim_type = x.st
     new_expr_type = UnaryOp(
         op="sin",
         child=x.et,
@@ -359,7 +359,7 @@ def sin(x : Type) -> Type:
     return Type(new_dim_type, new_expr_type)
 
 def cos(x : Type) -> Type:
-    new_dim_type = x.dt
+    new_dim_type = x.st
     new_expr_type = UnaryOp(
         op="cos",
         child=x.et,
@@ -367,7 +367,7 @@ def cos(x : Type) -> Type:
     return Type(new_dim_type, new_expr_type)
     
 def sqrt(x : Type) -> Type:
-    new_dim_type = x.dt,
+    new_dim_type = x.st,
     new_expr_type = UnaryOp(
         op="sqrt",
         child=x.et,
@@ -387,7 +387,7 @@ def override_dims_in_type(type : Type, *dim_override : Dim) -> Type:
             return dim_override_by_name[name]
         return d
 
-    new_dt = tuple(get_overridden(d) for d in type.dt)
+    new_st = tuple(get_overridden(d) for d in type.st)
     
     def recursively_replace(et : ExprType) -> ExprType:
         match et:
@@ -418,4 +418,4 @@ def override_dims_in_type(type : Type, *dim_override : Dim) -> Type:
                     recursively_replace(child)
                 )
     new_et = recursively_replace(type.et)
-    return Type(new_dt, new_et)
+    return Type(new_st, new_et)

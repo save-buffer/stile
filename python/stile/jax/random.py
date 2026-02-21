@@ -13,7 +13,7 @@ def normal(key : jax.Array, *shape : FullDim) -> TypedJaxArray:
     jax_shape = tuple(dim_size(d) for d in shape)
     arr = jax.random.normal(key, jax_shape)
     type = Type(
-        dt=shape,
+        st=shape,
         et=Tensor(shape),
     )
     return TypedJaxArray(arr, type)

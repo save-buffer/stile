@@ -21,7 +21,7 @@ class TypedJaxArray:
 
     def slice(self, dim : FullDim, start : int, end : int) -> "TypedJaxArray":
         slice_expr = []
-        for i, d in enumerate(self.type.dt):
+        for i, d in enumerate(self.type.st):
             if dim_contains(d, dim):
                 slice_expr.append(slice(start, end))
             else:
@@ -41,7 +41,7 @@ class TypedJaxArray:
 
         dims_by_name = {}
         lhs_str = ""
-        for d in self.type.dt:
+        for d in self.type.st:
             name = dim_name(d)
             dims_by_name[name] = d
             lhs_str += f"{name} "
@@ -60,7 +60,7 @@ class TypedJaxArray:
     def reduce(self, op : ReduceOpType, dim : Dim) -> "TypedJaxArray":
         new_type = self.type.reduce(op, dim)
 
-        for i, d in enumerate(self.type.dt):
+        for i, d in enumerate(self.type.st):
             if dim_name(dim) == dim_name(d):
                 ireduction_dim = i
                 break
@@ -179,7 +179,7 @@ def einsum(x : TypedJaxArray, y : TypedJaxArray, einstr : str) -> TypedJaxArray:
 class TypedResult:
     def __init__(self, spec : str):
         self.expected_type = parse_spec_into_type(spec)
-        self.shape = tuple(dim_size(d) for d in self.expected_type.dt) if self.expected_type.dt is not None else tuple()
+        self.shape = tuple(dim_size(d) for d in self.expected_type.st) if self.expected_type.st is not None else tuple()
         self.arr = jnp.zeros(self.shape)
 
     def assign(self, result : TypedJaxArray):
@@ -190,7 +190,7 @@ class TypedResult:
             raise ValueError(f"Attempted to assign a tensor that does not match the spec! Expected : {self.expected_expr_type}, actual : {result.expr_type}")
 
         slice_expr = []
-        for d in result.type.dt:
+        for d in result.type.st:
             ds, de = dim_start(d), dim_end(d)
             slice_expr.append(slice(ds, de))
         self.arr = self.arr.at[tuple(slice_expr)].set(result.arr)
@@ -200,7 +200,7 @@ def zeros(shape : tuple[FullDim, ...]) -> TypedJaxArray:
     jax_shape = tuple(dim_size(d) for d in shape)
     arr = jnp.zeros(jax_shape)
     type = Type(
-        dt=shape,
+        st=shape,
         et=0.0,
     )
     return TypedJaxArray(arr, type)

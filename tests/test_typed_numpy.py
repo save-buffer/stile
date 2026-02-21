@@ -243,7 +243,7 @@ def test_flash_attention(reset):
             
             qk_tile = tnp.einsum(q_tile, k_tile, "qctx dhead, nctx dhead -> nctx qctx") / np.sqrt(dhead.size)
             tile_max = qk_tile.max(nctx)
-            logits = tnp.exp(qk_tile - tile_max.repeat(qk_tile.type.dt[0]))
+            logits = tnp.exp(qk_tile - tile_max.repeat(qk_tile.type.st[0]))
             
             tile_l = logits.sum(nctx)
             new_max = tnp.maximum(tile_max, running_max)

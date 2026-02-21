@@ -29,7 +29,7 @@ except ValueError as e:
 c_tile0 = tnp.einsum(a_sliced, b_sliced, "M N, N K -> M K")
 
 print("Shape:    ", c_tile0.arr.shape)
-print("DimType:  ", c_tile0.type.dt)
+print("ShapeType:", c_tile0.type.st)
 print("ExprType: ", c_tile0.type.et)
 
 # Specifications: You can create a TypedResult using this specification string. You can only assign

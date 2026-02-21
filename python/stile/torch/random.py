@@ -13,7 +13,7 @@ def randn(*shape : FullDim, device : str = "cpu") -> TypedTorchTensor:
     torch_shape = tuple(dim_size(d) for d in shape)
     tensor = torch.randn(torch_shape, device=device)
     type = Type(
-        dt=shape,
+        st=shape,
         et=Tensor(shape),
     )
     return TypedTorchTensor(tensor, type)

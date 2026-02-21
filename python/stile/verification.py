@@ -57,7 +57,7 @@ def verify_exprs_equivalent(x : ExprType, y : ExprType) -> bool:
     y_id = egg.insert_expression(y_rust)
     return egg.incrementally_check_equivalence(x_id, y_id)
 
-def verify_dims_equivalent(x : DimType, y : DimType) -> bool:
+def verify_dims_equivalent(x : ShapeType, y : ShapeType) -> bool:
     if len(x) != len(y):
         return False
     for x, y in zip(x, y, strict=True):
@@ -66,7 +66,7 @@ def verify_dims_equivalent(x : DimType, y : DimType) -> bool:
     return True
 
 def verify_types_equivalent(x : Type, y : Type) -> bool:
-    dim_types_match = verify_dims_equivalent(x.dt, y.dt)
+    dim_types_match = verify_dims_equivalent(x.st, y.st)
     if not dim_types_match:
         return False
 

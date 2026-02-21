@@ -12,7 +12,8 @@ import torch
 import triton
 
 import stile.torch as ttorch
-import stile.triton as ttl
+import stile.triton as tt
+import stile.triton.language as ttl
 
 import pytest
 from stile import dim, reset_stile
@@ -25,18 +26,17 @@ def reset():
     reset_stile()
 
 
-@ttl.typed_jit
+@tt.typed_jit
 def add_kernel(
     out : ttl.TypedOutputPointer,
     x : ttl.TypedPointer,
     y : ttl.TypedPointer,
     nelts : int,
-    BLOCK_SIZE : tl.constexpr,
+    block_size : ttl.constexpr,
 ):
-    """Vector addition kernel."""
-    pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    pid = ttl.program_id(axis=0)
+    block_start = pid * block_size
+    offsets = block_start + tl.arange(0, block_size)
     mask = offsets < n_elements
 
     x = tl.load(x_ptr + offsets, mask=mask)
