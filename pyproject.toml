@@ -20,7 +20,10 @@ dependencies = [
 jax = ["jax>=0.4.0"]
 torch = ["torch>=2.0.0"]
 triton = ["torch>=2.0.0", "triton>=2.0.0"]
-all = ["jax>=0.4.0", "torch>=2.0.0", "triton>=2.0.0"]
+all = [
+    "jax>=0.4.0",
+    "torch>=2.0.0",
+]
 
 [tool.maturin]
 python-source = "python"
