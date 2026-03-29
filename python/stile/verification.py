@@ -1,3 +1,6 @@
+from collections import Counter
+from dataclasses import dataclass
+
 from .type import *
 from ._rust import RustEgraph, RustExpr # ty: ignore
 
@@ -48,6 +51,94 @@ def expr_type_to_rust_expr(expr : ExprType) -> RustExpr:
                 case "max":
                     return RustExpr.Max(d, start, end, rust_child)
             raise ValueError(f"Unknown reduction op {op}")
+
+@dataclass(frozen=True)
+class NormalizedTensor:
+    dims : frozenset[FullDim]
+
+@dataclass(frozen=True)
+class NormalizedExp:
+    child : "NormalizedExpr"
+
+@dataclass(frozen=True)
+class NormalizedUnaryOp:
+    op : UnaryOpType
+    child : "NormalizedExpr"
+
+@dataclass(frozen=True)
+class NormalizedSum:
+    children : frozenset["NormalizedProduct"]
+
+@dataclass(frozen=True)
+class NormalizedMax:
+    children : frozenset["NormalizedExpr"]
+
+@dataclass(frozen=True)
+class NormalizedRepeat:
+    dims : frozenset[FullDim]
+    child : "NormalizedExpr"
+
+@dataclass(frozen=True)
+class NormalizedReduce:
+    dim : FullDim
+    op : ReduceOpType
+    intervals : tuple[tuple[int, int], ...]
+    child : "NormalizedExpr"
+
+NormalizedFactor = Tensor | NormalizedExp | NormalizedUnaryOp | NormalizedSum | NormalizedMax | NormalizedRepeat
+
+@dataclass(frozen=True)
+class NormalizedProduct:
+    const : float = 1.0
+    factors : Counter[NormalizedFactor] = field(default_factory=Counter)
+
+@dataclass(frozen=True)
+class NormalizedExpr:
+    num : NormalizedProduct
+    den : NormalizedProduct
+
+    def __post_init__(self):
+        assert self.den.const == 1.0
+
+    @staticmethod
+    def from(x : NormalizedProduct | NormalizedFactor) -> "NormalizedExpr":
+        match x:
+            case NormalizedProduct:
+                num = x
+                den = NormalizedProduct(const=1.0)
+                return NormalizedExpr(num, den)
+            case NormalizedFactor:
+                num = NormalizedProduct(factors=frozenset({x}))
+                den = NormalizedProduct(const=1.0)
+                return NormalizedExpr(num, den)
+
+def normalize(expr : ExprType) -> NormalizedExpr:
+    match expr:
+        case Constant(x):
+            const = NormalizedProduct(const=x)
+            return NormalizedExpr.from(const)
+        case Tensor(dims):
+            t = NormalizedTensor(dims=frozenset(dims))
+            return NormalizedProduct.from(t)
+        case UnaryOp(op, child):
+            normalized_child = normalize(child)
+            unary = (
+                NormalizedExp(normalized_child) 
+                if op == "exp" 
+                else NormalizedUnaryOp(op, normalized_child)
+            )
+            return NormalizedExpr.from(unary)
+        case BinaryOp(op, lhs, rhs):
+            nlhs = normalize(lhs)
+            nrhs = normalize(rhs)
+            lnum, lden = nlhs.num, nlhs.den
+            rnum, rden = nrhs.num, nrhs.den
+            match op:
+                case "+":
+                    new_num = NormalizedProduct(
+                        const=(lnum.const * rden.const) / (lden.const * rnum.const),
+                        factors=lnum.factors + rnum.factors,
+                    )
 
 def verify_exprs_equivalent(x : ExprType, y : ExprType) -> bool:
     egg = RustEgraph()
