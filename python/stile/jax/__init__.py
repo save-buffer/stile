@@ -8,6 +8,7 @@ from ._core import (
     maximum,
     einsum,
     zeros,
+    fori_loop,
 )
 
 from . import random

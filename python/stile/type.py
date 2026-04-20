@@ -2,7 +2,23 @@ from dataclasses import dataclass
 from typing import Literal
 from enum import Enum
 
+from .indexing import SymbolicIndex, AffineExpr, to_affine
+
 g_dim_registry : dict[str, "FullDim"] = {}
+
+
+def as_int(x : SymbolicIndex) -> int | None:
+    """
+    Return `x` as a plain `int` if it's concretely an integer, else `None`.
+    Accepts either a Python int or an `AffineExpr` that happens to have no
+    free variables. Use this when logic needs a concrete value; otherwise,
+    pass `SymbolicIndex` through symbolically.
+    """
+    if isinstance(x, int):
+        return x
+    if isinstance(x, AffineExpr) and not x.terms:
+        return x.const
+    return None
 
 @dataclass(frozen=True)
 class FullDim:
@@ -26,45 +42,45 @@ class FullDim:
 @dataclass(frozen=True)
 class Sliced:
     dim : "Dim"
-    start : int
-    end : int
+    start : SymbolicIndex
+    end : SymbolicIndex
 
 Dim = FullDim | Sliced
 ShapeType = tuple[Dim, ...]
 
-def dim_start(dim : Dim):
+def dim_start(dim : Dim) -> SymbolicIndex:
     match dim:
         case FullDim(_, _):
             return 0
         case Sliced(d, st, _):
             return dim_start(d) + st
 
-def dim_end(dim : Dim):
+def dim_end(dim : Dim) -> SymbolicIndex:
     match dim:
         case FullDim(_, s):
             return s
         case Sliced(d, _, en):
             return dim_start(d) + en
 
-def dim_name(dim : Dim):
+def dim_name(dim : Dim) -> str:
     match dim:
         case FullDim(n, _):
             return n
         case Sliced(d, _, _):
             return dim_name(d)
 
-def dim_contains(dim : Dim, target : FullDim):
+def dim_contains(dim : Dim, target : FullDim) -> bool:
     match dim:
         case FullDim(n, s):
             return n == target.name and s == target.size
         case Sliced(d, _, _):
             return dim_contains(d, target)
 
-def dim_size(dim : Dim) -> int:
+def dim_size(dim : Dim) -> SymbolicIndex:
     match dim:
         case FullDim(_, s):
             return s
-        case Sliced(d, s, e):
+        case Sliced(_, s, e):
             return e - s
 
 def dim_full_dim(dim : Dim) -> FullDim:
@@ -76,24 +92,31 @@ def dim_full_dim(dim : Dim) -> FullDim:
 
 def simplify_dim(dim : Dim) -> Dim:
     match dim:
-        case FullDim(n, sz):
+        case FullDim(_, _):
             return dim
         case Sliced(d, st, en):
             child = simplify_dim(d)
             match child:
-                case FullDim(n, sz):
-                    if st == 0 and en == sz:
+                case FullDim(_, sz):
+                    # Collapse Sliced(full, 0, full.size) -> full when we can verify it.
+                    st_i, en_i = as_int(st), as_int(en)
+                    if st_i == 0 and en_i == sz:
                         return child
                     return Sliced(child, st, en)
                 case Sliced(full, child_st, child_en):
-                    length = en - st
-                    slice_start = child_st + st
-                    slice_end = child_st + st + length
-                    if slice_start > child_en or slice_end > child_en:
-                        raise ValueError("Invalid slice")
-                    if child_st + st == 0 and child_st + st + length == full.size:
-                        return full
-                    return Sliced(full, child_st + st, child_st + st + length)
+                    # Compose nested slices symbolically. When all bounds are
+                    # concrete, also sanity-check the range and try to collapse.
+                    new_start = child_st + st
+                    new_end = child_st + en
+                    start_i = as_int(new_start)
+                    end_i = as_int(new_end)
+                    child_en_i = as_int(child_en)
+                    if start_i is not None and end_i is not None and child_en_i is not None:
+                        if start_i > child_en_i or end_i > child_en_i:
+                            raise ValueError("Invalid slice")
+                        if start_i == 0 and end_i == full.size:
+                            return full
+                    return Sliced(full, new_start, new_end)
 
 @dataclass(frozen=True)
 class Constant:
@@ -133,12 +156,20 @@ class Reduce:
 
 ExprType = Constant | Tensor | UnaryOp | BinaryOp | Repeat | Reduce
 
+class DataType(Enum):
+    bfloat16 = "bfloat16"
+    float32 = "float32"
+    float64 = "float64"
+
+dt = DataType
+
 @dataclass(frozen=True)
 class Type:
     st : ShapeType
     et : ExprType
+    dt : DataType | None = None
 
-    def slice(self, dim : FullDim, start : int, end : int) -> "Type":
+    def slice(self, dim : FullDim, start : SymbolicIndex, end : SymbolicIndex) -> "Type":
         dim_type = []
         expr_type = self.et
 
@@ -162,7 +193,7 @@ class Type:
         for i in range(len(dim_type)):
             dim_type[i] = simplify_dim(dim_type[i])
 
-        return Type(tuple(dim_type), self.et)
+        return Type(tuple(dim_type), self.et, self.dt)
 
     def repeat(self, dim : Dim) -> "Type":
         new_dim_type = [dim]
@@ -173,7 +204,7 @@ class Type:
 
         nrepeats = dim_size(dim)
         new_expr_type = Repeat(dim_full_dim(dim), self.et)
-        return Type(tuple(new_dim_type), new_expr_type)
+        return Type(tuple(new_dim_type), new_expr_type, self.dt)
 
     def rearrange(self, *dims : Dim) -> "Type":
         dims = tuple(dim_full_dim(d) for d in dims)
@@ -194,8 +225,8 @@ class Type:
             new_dim_type.append(dims_by_name[n])
             rhs_str += f"{n} "
 
-        return Type(tuple(new_dim_type), self.et)
-    
+        return Type(tuple(new_dim_type), self.et, self.dt)
+
     def reduce(self, op : ReduceOpType, dim : Dim) -> "Type":
         dim = dim_full_dim(dim)
 
@@ -217,8 +248,8 @@ class Type:
             dim=reduction_dim,
             child=self.et
         )
-        return Type(tuple(new_dim_type), new_expr_type)
-    
+        return Type(tuple(new_dim_type), new_expr_type, self.dt)
+
     def sum(self, dim : Dim) -> "Type":
         return self.reduce("sum", dim)
 
@@ -257,13 +288,20 @@ def type_from_binary_op(slf : Type | float, other : Type | float, op : BinaryOpT
         case Type(), Type():
             if slf.st != other.st:
                 raise ValueError("Binary operations can only occur between tensors with the same shapes")
+            if (
+                slf.dt is not None
+                and other.dt is not None 
+                and slf.dt != other.dt
+            ):
+                raise ValueError("Binary operations must occur between tensors of the same type! You may have forgotten an explicit cast.")
+
             new_st = slf.st
             new_et = BinaryOp(
                 op=op,
                 lhs=slf.et,
                 rhs=other.et,
             )
-            return Type(new_st, new_et)
+            return Type(new_st, new_et, slf.dt)
         case Type(), x:
             new_st = slf.st
             new_et = BinaryOp(
@@ -271,7 +309,7 @@ def type_from_binary_op(slf : Type | float, other : Type | float, op : BinaryOpT
                 lhs=slf.et,
                 rhs=Constant(x),
             )
-            return Type(new_st, new_et)
+            return Type(new_st, new_et, slf.dt)
         case x, Type():
             new_st = other.st
             new_et = BinaryOp(
@@ -279,7 +317,7 @@ def type_from_binary_op(slf : Type | float, other : Type | float, op : BinaryOpT
                 lhs=Constant(x),
                 rhs=other.et,
             )
-            return Type(new_st, new_et)
+            return Type(new_st, new_et, other.dt)
     assert False
                 
 def einsum(a : Type, b : Type, einstr : str) -> Type:
@@ -348,7 +386,7 @@ def exp(x : Type) -> Type:
         op="exp",
         child=x.et,
     )
-    return Type(new_dim_type, new_expr_type)
+    return Type(new_dim_type, new_expr_type, x.dt)
 
 def sin(x : Type) -> Type:
     new_dim_type = x.st
@@ -356,7 +394,7 @@ def sin(x : Type) -> Type:
         op="sin",
         child=x.et,
     )
-    return Type(new_dim_type, new_expr_type)
+    return Type(new_dim_type, new_expr_type, x.dt)
 
 def cos(x : Type) -> Type:
     new_dim_type = x.st
@@ -364,15 +402,15 @@ def cos(x : Type) -> Type:
         op="cos",
         child=x.et,
     )
-    return Type(new_dim_type, new_expr_type)
-    
+    return Type(new_dim_type, new_expr_type, x.dt)
+
 def sqrt(x : Type) -> Type:
     new_dim_type = x.st,
     new_expr_type = UnaryOp(
         op="sqrt",
         child=x.et,
     )
-    return Type(new_dim_type, new_expr_type)
+    return Type(new_dim_type, new_expr_type, x.dt)
 
 def maximum(x : Type | float, y : Type | float) -> Type:
     return type_from_binary_op(x, y, "max")
@@ -418,4 +456,4 @@ def override_dims_in_type(type : Type, *dim_override : Dim) -> Type:
                     recursively_replace(child)
                 )
     new_et = recursively_replace(type.et)
-    return Type(new_st, new_et)
+    return Type(new_st, new_et, type.dt)
