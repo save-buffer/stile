@@ -212,6 +212,17 @@ def test_online_softmax(reset):
     online.assign(softmax2)
 
 
+def softmax_torch(x, dim):
+    ex = torch.exp(x - x.amax(dim=dim, keepdim=True))
+    return ex / ex.sum(dim=dim, keepdim=True)
+
+
+def attention_torch(q, k, v):
+    qk = torch.einsum('qd,nd->qn', q, k) / (q.shape[1] ** 0.5)
+    logits = softmax_torch(qk, dim=-1)
+    return torch.einsum('qn,nd->qd', logits, v)
+
+
 def test_flash_attention(reset):
     dhead, qctx, nctx = dim('dhead', 16), dim('qctx', 32), dim('nctx', 128)
 
@@ -219,7 +230,7 @@ def test_flash_attention(reset):
     K = ttorch.random.randn(nctx, dhead)
     V = ttorch.random.randn(nctx, dhead)
 
-    L = ttorch.TypedResult("((softmax[nctx](qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)), nctx dhead -> qctx dhead)")
+    L = ttorch.TypedResult("(softmax[nctx]((qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)), nctx dhead -> qctx dhead)")
 
     qctx_tile_size = 32
     nctx_tile_size = 32
@@ -250,12 +261,16 @@ def test_flash_attention(reset):
             running_l = new_l
             running_max = new_max
             o.assert_equivalent(
-                "((softmax[nctx](qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)), nctx dhead -> qctx dhead)",
+                "(softmax[nctx]((qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)), nctx dhead -> qctx dhead)",
                 nctx[:(ictx + nctx_tile_size)],
             )
 
         assert isinstance(o, ttorch.TypedTorchTensor)
         L.assign(o)
+
+    expected = attention_torch(Q.tensor, K.tensor, V.tensor)
+    assert torch.allclose(L.tensor, expected, atol=1e-5), \
+        "Flash Attention output does not numerically match reference attention"
     print("Formally verified Flash Attention passed!")
 
 

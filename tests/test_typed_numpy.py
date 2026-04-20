@@ -215,10 +215,9 @@ def softmax_np(x):
 
 
 def attention_np(q, k, v):
-    qk = np.einsum('qd,nd->nq', q, k) / np.sqrt(q.shape[1])
+    qk = np.einsum('qd,nd->qn', q, k) / np.sqrt(q.shape[1])
     logits = softmax_np(qk)
-    result = np.einsum('nq,nd->qd')
-    return result
+    return np.einsum('qn,nd->qd', logits, v)
 
 
 def test_flash_attention(reset):
@@ -228,7 +227,7 @@ def test_flash_attention(reset):
     K = tnp.random.randn(nctx, dhead)
     V = tnp.random.randn(nctx, dhead)
 
-    L = tnp.TypedResult("((softmax[nctx](qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)), nctx dhead -> qctx dhead)")
+    L = tnp.TypedResult("(softmax[nctx]((qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)), nctx dhead -> qctx dhead)")
 
     qctx_tile_size = 32
     nctx_tile_size = 32
@@ -259,12 +258,16 @@ def test_flash_attention(reset):
             running_l = new_l
             running_max = new_max
             o.assert_equivalent(
-                "((softmax[nctx](qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)), nctx dhead -> qctx dhead)",
+                "(softmax[nctx]((qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)), nctx dhead -> qctx dhead)",
                 nctx[:(ictx + nctx_tile_size)],
             )
 
         assert isinstance(o, tnp.TypedNumpyArray)
         L.assign(o)
+
+    expected = attention_np(Q.arr, K.arr, V.arr)
+    assert np.allclose(L.arr, expected, atol=1e-5), \
+        "Flash Attention output does not numerically match reference attention"
     print("Formally verified Flash Attention passed!")
 
 

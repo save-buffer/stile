@@ -114,11 +114,20 @@ class TypedJaxArray:
         assert are_equivalent
 
 
+def _coerce_scalar(x):
+    """If x is a scalar jax.Array, convert it to a Python float so it can flow through
+    Constant(...) into the normalized expression as a hashable value."""
+    if isinstance(x, jax.Array) and x.ndim == 0:
+        return x.item()
+    return x
+
 def _binary_op_helper(
     slf : TypedJaxArray | float,
     other : TypedJaxArray | float,
     op : BinaryOpType,
 ) -> TypedJaxArray | float:
+    slf = _coerce_scalar(slf)
+    other = _coerce_scalar(other)
     lhs_type = slf.type if isinstance(slf, TypedJaxArray) else slf
     rhs_type = other.type if isinstance(other, TypedJaxArray) else other
     new_type = type_from_binary_op(lhs_type, rhs_type, op)

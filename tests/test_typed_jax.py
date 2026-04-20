@@ -222,22 +222,21 @@ def softmax_jnp(x):
 
 
 def attention_jnp(q, k, v):
-    qk = jnp.einsum('qd,nd->nq', q, k) / jnp.sqrt(q.shape[1])
+    qk = jnp.einsum('qd,nd->qn', q, k) / jnp.sqrt(q.shape[1])
     logits = softmax_jnp(qk)
-    result = jnp.einsum('nq,nd->qd')
-    return result
+    return jnp.einsum('qn,nd->qd', logits, v)
 
 
 def test_flash_attention(reset):
     key = jax.random.PRNGKey(0)
     k1, k2, k3 = jax.random.split(key, 3)
-    dhead, qctx, nctx = dim('dhead', 16), dim('qctx', 32), dim('nctx', 128)
+    dhead, qctx, nctx = dim('dhead', 16), dim('qctx', 128), dim('nctx', 512)
 
     Q = tjax.random.normal(k1, qctx, dhead)
     K = tjax.random.normal(k2, nctx, dhead)
     V = tjax.random.normal(k3, nctx, dhead)
 
-    L = tjax.TypedResult("((softmax[nctx](qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)), nctx dhead -> qctx dhead)")
+    L = tjax.TypedResult("(softmax[nctx]((qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)), nctx dhead -> qctx dhead)")
 
     qctx_tile_size = 32
     nctx_tile_size = 32
@@ -268,12 +267,16 @@ def test_flash_attention(reset):
             running_l = new_l
             running_max = new_max
             o.assert_equivalent(
-                "((softmax[nctx](qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)), nctx dhead -> qctx dhead)",
+                "(softmax[nctx]((qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)), nctx dhead -> qctx dhead)",
                 nctx[:(ictx + nctx_tile_size)],
             )
 
         assert isinstance(o, tjax.TypedJaxArray)
         L.assign(o)
+
+    expected = attention_jnp(Q.arr, K.arr, V.arr)
+    assert jnp.allclose(L.arr, expected, atol=1e-5), \
+        "Flash Attention output does not numerically match reference attention"
     print("Formally verified Flash Attention passed!")
 
 
