@@ -9,6 +9,7 @@ from ._core import (
     einsum,
     zeros,
     fori_loop,
+    mask,
 )
 
 from . import random

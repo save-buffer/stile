@@ -1,4 +1,9 @@
 from .type import *
+from .indexing import (
+    AffineExpr, LoopVariable, Domain, to_affine,
+    domain as _indexing_domain,
+    le, lt, ge, gt, eq, free_vars,
+)
 
 def construct_softmax(child : ExprType, dim : Dim):
     if False:
@@ -184,7 +189,15 @@ def _parse_dim(lex : LexState) -> Dim:
 
 def _parse_tensor(lex : LexState) -> tuple[ShapeType, ExprType]:
     dims = []
+    # Stop when the upcoming identifier isn't a registered dim — otherwise
+    # trailing keywords (`where`, …) would be swallowed as dim names.
     while (nxt := lex.peek()) is not None and nxt.isalpha():
+        i = 0
+        while i < len(lex.spec) and (lex.spec[i].isalpha() or lex.spec[i].isdigit()):
+            i += 1
+        word = lex.spec[:i]
+        if word not in g_dim_registry:
+            break
         d = _parse_dim(lex)
         dims.append(d)
     full_dims = tuple(dim_full_dim(d) for d in dims)
@@ -312,13 +325,108 @@ def _parse_expr(lex : LexState) -> tuple[ShapeType, ExprType]:
     
     return result_st, result_et
 
+def _parse_affine_term(lex : LexState) -> AffineExpr:
+    lex.consume_whitespace()
+    nxt = lex.peek()
+    if nxt is None:
+        raise ValueError("Expected affine term in `where`-predicate")
+    if nxt.isdigit():
+        coef = _parse_integer(lex)
+        if lex.maybe_consume('*'):
+            d = _parse_dim_name(lex)
+            return to_affine(LoopVariable(d.name)) * coef
+        return to_affine(coef)
+    if nxt.isalpha():
+        d = _parse_dim_name(lex)
+        return to_affine(LoopVariable(d.name))
+    raise ValueError(f"Expected integer or dim name in `where`-predicate, got {nxt!r}")
+
+
+def _parse_affine(lex : LexState) -> AffineExpr:
+    lex.consume_whitespace()
+    sign = 1
+    if lex.spec.startswith('-') and not lex.spec.startswith('->'):
+        lex.consume()
+        sign = -1
+    elif lex.spec.startswith('+'):
+        lex.consume()
+    result = _parse_affine_term(lex)
+    if sign == -1:
+        result = -result
+    while True:
+        lex.consume_whitespace()
+        if lex.spec.startswith('->'):
+            break
+        if lex.maybe_consume('+'):
+            result = result + _parse_affine_term(lex)
+        elif lex.maybe_consume('-'):
+            result = result - _parse_affine_term(lex)
+        else:
+            break
+    return result
+
+
+def _parse_predicate(lex : LexState) -> Domain:
+    lhs = _parse_affine(lex)
+    relop = lex.maybe_consume("<=", ">=", "==", "<", ">")
+    if relop is None:
+        raise ValueError("Expected comparison operator (<=, <, >=, >, ==) in `where`-predicate")
+    rhs = _parse_affine(lex)
+    variables = free_vars(lhs) | free_vars(rhs)
+    match relop:
+        case "<=":
+            constraints = [le(lhs, rhs)]
+        case ">=":
+            constraints = [ge(lhs, rhs)]
+        case "<":
+            constraints = [lt(lhs, rhs)]
+        case ">":
+            constraints = [gt(lhs, rhs)]
+        case "==":
+            c1, c2 = eq(lhs, rhs)
+            constraints = [c1, c2]
+    return _indexing_domain(variables, constraints)
+
+
+def _apply_where_mask(
+    result_st : ShapeType,
+    result_et : ExprType,
+    pred_domain : Domain,
+) -> ExprType:
+    dim_names_in_shape = {dim_name(d) for d in result_st}
+    for v in pred_domain.variables:
+        if v.name not in dim_names_in_shape:
+            raise ValueError(
+                f"`where`-clause references dim {v.name!r} which is not "
+                f"present in the expression's shape {sorted(dim_names_in_shape)}"
+            )
+    mask_dims = tuple(dim_full_dim(d) for d in result_st)
+    mask = Tensor(
+        dims=mask_dims,
+        tag=TagCond(
+            domain=pred_domain,
+            if_true=Constant(1.0),
+            if_false=Constant(0.0),
+        ),
+    )
+    return BinaryOp(op="*", lhs=result_et, rhs=mask)
+
+
 def _parse_spec(lex : LexState) -> tuple[ShapeType, ExprType]:
-    return _parse_expr(lex)
+    result_st, result_et = _parse_expr(lex)
+    while lex.maybe_consume("where"):
+        pred_domain = _parse_predicate(lex)
+        result_et = _apply_where_mask(result_st, result_et, pred_domain)
+    return result_st, result_et
 
 def parse_spec_into_type(spec : str) -> Type:
     """
     Grammar:
-    Spec      -> Expr
+    Spec      -> Expr ('where' Predicate)*
+    Predicate -> Affine RELOP Affine
+    Affine    -> [+-]? AffineTerm (('+'|'-') AffineTerm)*
+    AffineTerm-> Integer | Integer '*' DimName | DimName
+    RELOP     -> '<=' | '<' | '>=' | '>' | '=='
     Expr      -> Term Expr'
     Expr'     -> '+' Term Expr' | '-' Term Expr' | ε
 

@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Literal
 from enum import Enum
 
-from .indexing import SymbolicIndex, AffineExpr, to_affine
+from .indexing import SymbolicIndex, AffineExpr, LoopVariable, Domain, to_affine
 
 g_dim_registry : dict[str, "FullDim"] = {}
 
@@ -122,9 +122,38 @@ def simplify_dim(dim : Dim) -> Dim:
 class Constant:
     value: float
 
+
+@dataclass(frozen=True)
+class TagCond:
+    """
+    Branch of a `TagTree`: on positions satisfying `domain`, the tensor's
+    value is given by `if_true`; elsewhere by `if_false`. The two subtrees
+    partition the index space by construction — no overlap bookkeeping.
+
+    Leaves are just `ExprType`s — the tensor's value on that sub-region.
+    So a mask is `TagCond(domain, Constant(1.0), Constant(0.0))`, a bias
+    is `TagCond(domain, Constant(0.0), Constant(-inf))`, and nested
+    `TagCond`s handle compound patterns.
+    """
+    domain : Domain
+    if_true : "TagTree"
+    if_false : "TagTree"
+
+
+# TagTree is defined at the bottom of the file, once ExprType is in scope.
+
+
 @dataclass(frozen=True)
 class Tensor:
+    """
+    A named-dims tensor. `tag`, when non-None, is a tree of partial
+    known-value annotations over the tensor's index space — used for
+    masks, biases, padding, and other structured-sparsity patterns. The
+    tag's `Domain`s constrain the dim-indices (symbolic `LoopVariable`s
+    named after the dims).
+    """
     dims : tuple[FullDim, ...]
+    tag : "TagTree | None" = None
 
 UnaryOpType = Literal["exp", "sin", "cos", "sqrt"]
 
@@ -154,7 +183,25 @@ class Reduce:
     dim : Dim
     child : "ExprType"
 
-ExprType = Constant | Tensor | UnaryOp | BinaryOp | Repeat | Reduce
+@dataclass(frozen=True)
+class ParametricReduce:
+    """
+    A sum/max reduction over a rolled loop: `reduce_{k in [lo, hi)} body(k)`.
+
+    `loop_var` is bound by this node — it refers to this reduction's
+    iteration index, and any `SymbolicIndex` inside `body` that mentions
+    `loop_var` picks up that binding. Emitted by `fori_loop` when its
+    `upper` bound is symbolic.
+    """
+    loop_var : LoopVariable
+    lo : SymbolicIndex
+    hi : SymbolicIndex
+    op : ReduceOpType
+    body : "ExprType"
+
+ExprType = Constant | Tensor | UnaryOp | BinaryOp | Repeat | Reduce | ParametricReduce
+
+TagTree = ExprType | TagCond
 
 class DataType(Enum):
     bfloat16 = "bfloat16"

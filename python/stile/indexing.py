@@ -118,20 +118,29 @@ class AffineConstraint:
     expr : AffineExpr
 
 
+Conjunction = frozenset[AffineConstraint]
+
+
 @dataclass(frozen=True)
 class Domain:
     """
-    A polyhedral iteration domain: a set of `LoopVariable`s and a conjunction
-    of `AffineConstraint`s over them. The iteration set is the integer
-    assignments to `variables` that satisfy every constraint.
+    A polyhedral iteration domain in DNF: a union of conjunctions of affine
+    inequalities over a shared set of `LoopVariable`s. The iteration set is
+    the integer assignments to `variables` that satisfy at least one
+    conjunction ("disjunct").
 
-    A `LoopVariable` with bounds is just a 1-variable `Domain` (see
-    `range_domain`), and fancier patterns — band-diagonal masks for local
-    attention, block-triangular sparsity, alignment constraints — drop in as
-    additional inequalities on the same variables.
+    A single-conjunct Domain represents the familiar "`all of these
+    constraints hold`" shape — that's how `range_domain` produces a loop
+    range, and how `and_constraints` composes constraints. Disjunction
+    arises from `or_domains` and from mask predicates that combine via `or`
+    (e.g., local-attention-band OR global-sink-positions).
     """
     variables : frozenset[LoopVariable]
-    constraints : frozenset[AffineConstraint]
+    disjuncts : frozenset[Conjunction]
+
+
+def _conjunction(constraints : Iterable[AffineConstraint]) -> Conjunction:
+    return frozenset(constraints)
 
 
 def le(a : SymbolicIndex, b : SymbolicIndex) -> AffineConstraint:
@@ -175,9 +184,12 @@ def domain(
     constraints : Iterable[AffineConstraint],
 ) -> Domain:
     """
-    Shorthand for `Domain(frozenset(variables), frozenset(constraints))`.
+    Shorthand for a single-conjunct Domain.
     """
-    return Domain(frozenset(variables), frozenset(constraints))
+    return Domain(
+        frozenset(variables),
+        frozenset({_conjunction(constraints)}),
+    )
 
 
 def range_domain(
@@ -186,12 +198,134 @@ def range_domain(
     end : SymbolicIndex,
 ) -> Domain:
     """
-    The 1D domain `{var : start <= var < end}`.
+    The 1D domain `{var : start <= var < end}`, as a single-conjunct Domain.
     """
     return Domain(
         frozenset({var}),
-        frozenset({ge(var, start), lt(var, end)}),
+        frozenset({_conjunction({ge(var, start), lt(var, end)})}),
     )
+
+
+def and_constraints(
+    d : Domain,
+    *extra : AffineConstraint,
+) -> Domain:
+    """
+    Conjoin `extra` onto every disjunct of `d`. Extra constraints can
+    reference variables already in `d.variables` or introduce new ones.
+    """
+    if not extra:
+        return d
+    new_disjuncts = frozenset(
+        _conjunction(list(conj) + list(extra)) for conj in d.disjuncts
+    )
+    new_vars = d.variables | frozenset(
+        v for c in extra for v, _ in c.expr.terms
+    )
+    return Domain(new_vars, new_disjuncts)
+
+
+def or_domains(*domains : Domain) -> Domain:
+    """
+    Union of domains: the DNF whose disjuncts are the union of the inputs'.
+    All inputs' variables are combined.
+    """
+    if not domains:
+        return Domain(frozenset(), frozenset())
+    variables : frozenset = frozenset()
+    disjuncts : frozenset = frozenset()
+    for d in domains:
+        variables = variables | d.variables
+        disjuncts = disjuncts | d.disjuncts
+    return Domain(variables, disjuncts)
+
+
+def and_domains(d1 : Domain, d2 : Domain) -> Domain:
+    """
+    Intersection of two DNF domains:
+    `(A1 ∨ A2) ∩ (B1 ∨ B2) = (A1 ∧ B1) ∨ (A1 ∧ B2) ∨ (A2 ∧ B1) ∨ (A2 ∧ B2)`.
+    Variable sets are unioned (each side may reference vars the other doesn't).
+    """
+    new_disjuncts = frozenset(
+        _conjunction(list(c1) + list(c2))
+        for c1 in d1.disjuncts
+        for c2 in d2.disjuncts
+    )
+    return Domain(d1.variables | d2.variables, new_disjuncts)
+
+
+def _simplify_conjunction_over_var(
+    conj : Conjunction,
+    var : LoopVariable,
+) -> Conjunction:
+    """
+    Collapse redundant 1-D bounds on `var` in a conjunction. For every
+    constraint of the form `var + c >= 0` (lower bound `var >= -c`) or
+    `-var + c >= 0` (upper bound `var <= c`) whose non-`var` part is a
+    plain constant, take the tightest pair. Constraints that reference
+    `var` with a higher-magnitude coefficient or that mix `var` with
+    other variables are passed through unchanged.
+    """
+    lower_const_bounds : list[int] = []
+    upper_exclusive_const_bounds : list[int] = []
+    other : list[AffineConstraint] = []
+    for c in conj:
+        aff = c.expr
+        var_coeff = 0
+        mixes_other_vars = False
+        for v, co in aff.terms:
+            if v == var:
+                var_coeff = co
+            else:
+                mixes_other_vars = True
+        if mixes_other_vars or var_coeff not in (1, -1):
+            other.append(c)
+            continue
+        if var_coeff == 1:
+            # `var + aff.const >= 0` → `var >= -aff.const`
+            lower_const_bounds.append(-aff.const)
+        else:
+            # `-var + aff.const >= 0` → `var <= aff.const` → `var < aff.const + 1`
+            upper_exclusive_const_bounds.append(aff.const + 1)
+
+    result = list(other)
+    if lower_const_bounds:
+        result.append(ge(var, max(lower_const_bounds)))
+    if upper_exclusive_const_bounds:
+        result.append(lt(var, min(upper_exclusive_const_bounds)))
+    return _conjunction(result)
+
+
+def simplify_domain(d : Domain) -> Domain:
+    """
+    Remove redundant 1-D interval constraints per variable in each disjunct.
+    For each disjunct, collapse multiple lower bounds on a single variable
+    to the tightest, and likewise for upper bounds. Mixed-variable and
+    higher-coefficient constraints are untouched — full polyhedral
+    simplification is out of scope.
+    """
+    new_disjuncts : set[Conjunction] = set()
+    for conj in d.disjuncts:
+        simplified = conj
+        for var in d.variables:
+            simplified = _simplify_conjunction_over_var(simplified, var)
+        new_disjuncts.add(simplified)
+    return Domain(d.variables, frozenset(new_disjuncts))
+
+
+def interval_domain(
+    var : LoopVariable,
+    intervals : Iterable[tuple[SymbolicIndex, SymbolicIndex]],
+) -> Domain:
+    """
+    Build a 1D `Domain` from a list of half-open intervals: one conjunct
+    per interval, each expressing `start <= var < end`. The union represents
+    the set of positions covered by *any* of the intervals.
+    """
+    disjuncts = frozenset(
+        _conjunction({ge(var, s), lt(var, e)}) for s, e in intervals
+    )
+    return Domain(frozenset({var}), disjuncts)
 
 
 # ---- Analysis -------------------------------------------------------------
@@ -245,9 +379,12 @@ def constraint_holds(
 
 def domain_contains(domain : Domain, bindings : dict[LoopVariable, int]) -> bool:
     """
-    True iff `bindings` assigns an integer to every variable in `domain` and
-    every constraint is satisfied.
+    True iff `bindings` assigns an integer to every variable in `domain`
+    and at least one disjunct is fully satisfied.
     """
     if not all(v in bindings for v in domain.variables):
         return False
-    return all(constraint_holds(c, bindings) for c in domain.constraints)
+    return any(
+        all(constraint_holds(c, bindings) for c in conjunction)
+        for conjunction in domain.disjuncts
+    )

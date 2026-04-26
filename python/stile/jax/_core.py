@@ -6,9 +6,11 @@ except ImportError:
         "JAX support requires the jax extra: pip install stile[jax]"
     ) from None
 
+import math
+
 import stile.type as t
 from ..type import *
-from ..specification import parse_spec_into_type
+from ..specification import parse_spec_into_type, _parse_predicate, LexState
 from ..verification import verify_types_equivalent, verify_exprs_equivalent
 from ..indexing import evaluate as _eval_index, free_vars as _free_vars, to_affine
 from .. import LoopScope, _active_loop_scopes
@@ -117,6 +119,17 @@ class TypedJaxArray:
     def __matmul__(self, other) -> "TypedJaxArray":
         return einsum(self, other, "M N, N K -> M K")
 
+    def where(self, predicate_str : str) -> "TypedJaxArray":
+        """
+        Multiplicative-mask sugar: `self * tjax.mask(self.type.st, p)`.
+        Same surface shape the spec parser's `where`-clause produces, so
+        a kernel calling `.where(p)` and a spec written with `where`
+        normalize to the same form. For bias-form masks, build the
+        tagged tensor explicitly via `tjax.mask(..., 0.0, -jnp.inf)`
+        and add it instead.
+        """
+        return self * mask(self.type.st, predicate_str)
+
     def assert_equivalent(self, spec : str, *dim_override : Dim):
         expected_type = parse_spec_into_type(spec)
         expected_type = override_dims_in_type(expected_type, *dim_override)
@@ -125,6 +138,100 @@ class TypedJaxArray:
             self.type.et,
         )
         assert are_equivalent
+
+
+def _build_predicate_array(
+    domain,
+    st : tuple[Dim, ...],
+    in_value : float,
+    out_value : float,
+):
+    """
+    Materialize a `Domain` (DNF: OR over conjunctions of `expr >= 0`) into
+    a `jnp` array of shape matching `st`, with `in_value` at positions
+    satisfying the domain and `out_value` elsewhere. Each axis index is
+    offset by its `dim_start` so sliced dims evaluate the predicate at
+    their absolute positions (a `qctx[8:16]` slice supplies q-values
+    8..15, not 0..7). Axes whose dim isn't referenced by the predicate
+    are constant along that axis (broadcast).
+    """
+    shape = tuple(as_int(dim_size(d)) for d in st)
+    starts = tuple(as_int(dim_start(d)) for d in st)
+    if any(s is None for s in shape) or any(s is None for s in starts):
+        raise ValueError(
+            f"Predicate-mask requires concrete shape/start; got "
+            f"shape={shape}, starts={starts}"
+        )
+    name_to_axis = {dim_name(d) : i for i, d in enumerate(st)}
+
+    final_mask = None
+    for conj in domain.disjuncts:
+        conj_mask = None
+        for c in conj:
+            term_value = jnp.full(shape, c.expr.const, dtype=jnp.int32)
+            for var, coeff in c.expr.terms:
+                if var.name not in name_to_axis:
+                    raise ValueError(
+                        f"Predicate variable {var.name!r} not in tensor's dims"
+                    )
+                axis = name_to_axis[var.name]
+                idx = jnp.arange(shape[axis], dtype=jnp.int32) + starts[axis]
+                shape_bc = [1] * len(shape)
+                shape_bc[axis] = shape[axis]
+                term_value = term_value + coeff * idx.reshape(shape_bc)
+            constraint = term_value >= 0
+            conj_mask = constraint if conj_mask is None else (conj_mask & constraint)
+        if conj_mask is None:
+            conj_mask = jnp.ones(shape, dtype=jnp.bool_)
+        final_mask = conj_mask if final_mask is None else (final_mask | conj_mask)
+    if final_mask is None:
+        final_mask = jnp.zeros(shape, dtype=jnp.bool_)
+    return jnp.where(final_mask, in_value, out_value).astype(jnp.float32)
+
+
+def mask(
+    shape : tuple[Dim, ...],
+    predicate_str : str,
+    in_value : float = 1.0,
+    out_value : float = 0.0,
+) -> "TypedJaxArray":
+    """
+    A constant tagged tensor: `in_value` at positions satisfying the
+    predicate, `out_value` elsewhere. The type's `st` is `shape` (which
+    may carry `Sliced` dims so the mask composes with sliced operands
+    via binary ops); the TagCond's domain references the dims' names via
+    `LoopVariable`s, so the same predicate is meaningful regardless of
+    slicing.
+
+    Common uses:
+      - mult-mask (default): `tjax.mask((qctx, nctx), "nctx <= qctx")`
+        gives 1 inside / 0 outside; multiply into a tensor.
+      - bias-mask: `tjax.mask((qctx, nctx), "nctx <= qctx", 0.0, -jnp.inf)`
+        gives 0 inside / -inf outside; add to a tensor (the bias-form
+        used by online softmax).
+
+    `.where(predicate)` is sugar for `self * mask(self.type.st, p)`.
+    """
+    lex = LexState(predicate_str)
+    pred_domain = _parse_predicate(lex)
+    dim_names_in_shape = {dim_name(d) for d in shape}
+    for v in pred_domain.variables:
+        if v.name not in dim_names_in_shape:
+            raise ValueError(
+                f"`mask` predicate references dim {v.name!r} not in "
+                f"shape {sorted(dim_names_in_shape)}"
+            )
+    full_dims = tuple(dim_full_dim(d) for d in shape)
+    mask_et = Tensor(
+        dims=full_dims,
+        tag=TagCond(
+            domain=pred_domain,
+            if_true=Constant(in_value),
+            if_false=Constant(out_value),
+        ),
+    )
+    arr = _build_predicate_array(pred_domain, shape, in_value, out_value)
+    return TypedJaxArray(arr, Type(shape, mask_et, None))
 
 
 def _coerce_scalar(x):
@@ -201,34 +308,85 @@ def einsum(x : TypedJaxArray, y : TypedJaxArray, einstr : str) -> TypedJaxArray:
 
 def fori_loop(lower, upper, body_fn, init_val):
     """
-    Verification-mode analogue of `jax.lax.fori_loop`. Folds `body_fn` over
-    `range(lower, upper)` with concrete integer indices, producing the
-    actual final carry as if the loop had been manually unrolled. The
-    normalizer then canonicalizes the resulting expression, which for
-    online-softmax-style bodies collapses into a closed form that matches
-    the full-sequence spec.
+    Verification-mode analogue of `jax.lax.fori_loop`. Two paths depending
+    on whether the loop count is known at tracing time:
 
-    Signature mirrors `jax.lax.fori_loop(lower, upper, body_fn, init_val)`:
-    migrating existing code is a one-line import change. When lowered for
-    actual execution, the same user code becomes `jax.lax.fori_loop`; only
-    the verification pathway unrolls.
+    - **Concrete `lower`/`upper`**: fold `body_fn` over `range(lower, upper)`
+      with concrete integer indices, producing the actual final carry as if
+      the loop had been manually unrolled. The normalizer then canonicalizes
+      the resulting expression; for online-softmax-style bodies it collapses
+      into a closed form that matches the full-sequence spec. Verification
+      cost scales O(N) with the trip count.
 
-    Loop bounds must be concrete ints. Fully dynamic loop counts (e.g.,
-    paged attention with variable page count) will need parametric
-    reductions in the IR or explicit loop invariants — neither of which
-    is built yet.
+    - **Symbolic `upper`**: run `body_fn` once with a symbolic `LoopVariable`
+      bound to the iteration index, and wrap the result as a
+      `ParametricReduce` — the rolled-loop reduction primitive. This path
+      currently supports only sum accumulators (`body(i, s) = s + f(i)`),
+      and relies on the normalizer to recognize the pattern via
+      `first_iter - init_val = f(i)`. Verification cost is invariant to the
+      trip count.
+
+    Signature mirrors `jax.lax.fori_loop(lower, upper, body_fn, init_val)`;
+    same user code lowers to real `jax.lax.fori_loop` at runtime.
     """
     lower_i, upper_i = as_int(lower), as_int(upper)
-    if lower_i is None or upper_i is None:
+    if lower_i is not None and upper_i is not None:
+        carry = init_val
+        for i in range(lower_i, upper_i):
+            carry = body_fn(i, carry)
+        return carry
+
+    # Symbolic path: dispatch on init_val's identity value.
+    #   init=0     -> sum accumulator, body(k, s) = s + f(k)
+    #   init=-inf  -> max accumulator, body(k, s) = max(s, f(k))
+    # Both are the identity element for their respective op, which lets us
+    # extract the per-iteration contribution cleanly.
+    scalar_init = _init_scalar(init_val)
+    if scalar_init == 0:
+        op = "sum"
+    elif scalar_init is not None and math.isinf(scalar_init) and scalar_init < 0:
+        op = "max"
+    else:
         raise NotImplementedError(
-            "tjax.fori_loop currently requires concrete integer bounds. "
-            "Symbolic loop counts (paged-attention-style dynamic iteration) "
-            "will need parametric reductions or explicit loop invariants."
+            "tjax.fori_loop symbolic path currently supports init=0 (sum "
+            "accumulator) or init=-inf (max accumulator). Other init values "
+            "need explicit op dispatch or loop-invariant annotations."
         )
-    carry = init_val
-    for i in range(lower_i, upper_i):
-        carry = body_fn(i, carry)
-    return carry
+
+    name = f"_fori_{len(_active_loop_scopes)}"
+    with LoopScope(name, lower, upper) as k:
+        first_iter = body_fn(k, init_val)
+        if op == "sum":
+            delta = first_iter - init_val
+            return init_val + _wrap_parametric_reduce(k, lower, upper, "sum", delta)
+        # max: init is -inf (identity), so first_iter = max(-inf, f(k)) = f(k)
+        # after normalization — the outer max(-inf, …) collapses away when
+        # `first_iter` is normalized inside the ParametricReduce.
+        return _wrap_parametric_reduce(k, lower, upper, "max", first_iter)
+
+
+def _init_scalar(init_val):
+    """Extract a Python scalar value from init_val if it's scalar-typed."""
+    if isinstance(init_val, (int, float)):
+        return init_val
+    if isinstance(init_val, jax.Array) and init_val.ndim == 0:
+        return init_val.item()
+    return None
+
+
+def _wrap_parametric_reduce(
+    loop_var,
+    lo : SymbolicIndex,
+    hi : SymbolicIndex,
+    op : ReduceOpType,
+    body : TypedJaxArray,
+) -> TypedJaxArray:
+    """
+    Package `body` as a `ParametricReduce` in the `ExprType` layer.
+    """
+    new_et = ParametricReduce(loop_var, lo, hi, op, body.type.et)
+    new_type = Type(body.type.st, new_et, body.type.dt)
+    return TypedJaxArray(None, new_type)
 
 
 class TypedResult:
