@@ -262,10 +262,15 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
     if reduction := lex.maybe_consume("sum", "max"):
         if lex.maybe_consume('['):
             dim = _parse_dim(lex)
+            pred_domain = None
+            if lex.maybe_consume("where"):
+                pred_domain = _parse_predicate(lex)
             lex.expect(']')
             lex.expect('(')
             st, et = _parse_paren_expr(lex)
             lex.expect(')')
+            if pred_domain is not None:
+                et = _apply_iteration_restriction(st, et, pred_domain, reduction)
             reduce_st = tuple(d for d in st if dim_full_dim(d) != dim_full_dim(dim))
             reduce_dim = [d for d in st if dim_full_dim(d) == dim_full_dim(dim)][0]
             reduce_et = Reduce(
@@ -280,17 +285,22 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
             lex.expect(')')
             return st, et
     elif unary_op := lex.maybe_consume("exp", "sin", "cos", "sqrt", "softmax"):
+        pred_domain = None
         if lex.maybe_consume('['):
             if unary_op != "softmax":
                 raise ValueError("Dimension annotation only makes sense for softmax")
 
             dim_annotation = _parse_dim(lex)
+            if lex.maybe_consume("where"):
+                pred_domain = _parse_predicate(lex)
             lex.expect(']')
 
         lex.expect('(')
         st, et = _parse_paren_expr(lex)
         lex.expect(')')
         if unary_op == "softmax":
+            if pred_domain is not None:
+                et = _apply_iteration_restriction(st, et, pred_domain, "softmax")
             return st, construct_softmax(et, dim_annotation)
 
         return st, UnaryOp(
@@ -412,6 +422,52 @@ def _apply_where_mask(
     return BinaryOp(op="*", lhs=result_et, rhs=mask)
 
 
+def _apply_iteration_restriction(
+    body_st : ShapeType,
+    body_et : ExprType,
+    pred_domain : Domain,
+    op : str,
+) -> ExprType:
+    """
+    Lower a `[d where P]` dim-annotation to the appropriate mask shape for
+    the surrounding op:
+      - `sum[d where P]`     → multiplicative mask: body * Cond(P, 1, 0).
+      - `max[d where P]`     → bias mask: body + Cond(P, 0, -inf).
+      - `softmax[d where P]` → bias mask (applied before macro expansion);
+        bias-form `-inf` reaches both num and den so the softmax is
+        properly restricted to the predicate.
+    """
+    dim_names_in_shape = {dim_name(d) for d in body_st}
+    for v in pred_domain.variables:
+        if v.name not in dim_names_in_shape:
+            raise ValueError(
+                f"`{op}[d where P]` predicate references dim {v.name!r} "
+                f"not in the body's shape {sorted(dim_names_in_shape)}"
+            )
+    mask_dims = tuple(dim_full_dim(d) for d in body_st)
+    if op == "sum":
+        mask = Tensor(
+            dims=mask_dims,
+            tag=TagCond(
+                domain=pred_domain,
+                if_true=Constant(1.0),
+                if_false=Constant(0.0),
+            ),
+        )
+        return BinaryOp(op="*", lhs=body_et, rhs=mask)
+    # max, softmax: bias-form. -inf outside the predicate vanishes through
+    # exp (softmax) and is the identity for max.
+    bias = Tensor(
+        dims=mask_dims,
+        tag=TagCond(
+            domain=pred_domain,
+            if_true=Constant(0.0),
+            if_false=Constant(float("-inf")),
+        ),
+    )
+    return BinaryOp(op="+", lhs=body_et, rhs=bias)
+
+
 def _parse_spec(lex : LexState) -> tuple[ShapeType, ExprType]:
     result_st, result_et = _parse_expr(lex)
     while lex.maybe_consume("where"):
@@ -434,7 +490,7 @@ def parse_spec_into_type(spec : str) -> Type:
     Term'     -> '*' Factor Term' | '/' Factor Term' | ε
 
     Factor    -> REDUCE_OP '(' Contraction ')' | REDUCE_OP DimAnnot '(' ParenExpr ')' | UNARY_FN DimAnnot? '(' ParenExpr ')' | Primary
-    DimAnnot  -> '[' DIM ']'
+    DimAnnot  -> '[' DIM ('where' Predicate)? ']'
     Primary   -> '(' ParenExpr ')' | Tensor | Number
 
     ParenExpr -> Spec ParenExpr'

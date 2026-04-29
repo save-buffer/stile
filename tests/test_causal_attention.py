@@ -113,10 +113,9 @@ def test_causal_qk_sum_tile_walking(reset):
 
 
 _CAUSAL_SPEC = (
-    "(sum(exp((qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)) where nctx <= qctx, "
-    "nctx dhead -> qctx dhead) / "
-    "(sum[nctx](exp((qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)) where nctx <= qctx) "
-    "-> qctx dhead))"
+    "(softmax[nctx where nctx <= qctx]"
+    "((qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)), "
+    "nctx dhead -> qctx dhead)"
 )
 
 
