@@ -1,16 +1,15 @@
 [build-system]
-requires = ["maturin>=1.10,<2.0"]
-build-backend = "maturin"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "stile"
+version = "0.1.0"
 requires-python = ">=3.11"
 classifiers = [
-    "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
-dynamic = ["version"]
 dependencies = [
     "einops>=0.8.1",
     "numpy>=1.24.4",
@@ -19,15 +18,13 @@ dependencies = [
 [project.optional-dependencies]
 jax = ["jax>=0.4.0"]
 torch = ["torch>=2.0.0"]
-triton = ["torch>=2.0.0", "triton>=2.0.0"]
 all = [
     "jax>=0.4.0",
     "torch>=2.0.0",
 ]
 
-[tool.maturin]
-python-source = "python"
-module-name = "stile._rust"
+[tool.hatch.build.targets.wheel]
+packages = ["stile"]
 
 [dependency-groups]
 dev = [
