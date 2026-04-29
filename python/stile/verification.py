@@ -1048,9 +1048,14 @@ def make_expr(num : NormalizedProduct, den : NormalizedProduct) -> NormalizedExp
     hoists Repeat(D, ...)-invariant factors out of Repeats, enforces den.const == 1.0,
     and drops factors from a numerator whose const is 0 (zero annihilates).
     """
-    # 0 * anything = 0: canonicalize Product(0, factors=...) to Product(0).
-    if num.const == 0.0 and num.factors:
-        num = NormalizedProduct(const=0.0, factors=FrozenCounter.empty())
+    # 0 * anything = 0 and 0 / anything = 0: canonicalize so both the
+    # num's factors and the den drop, otherwise `0 / x` and `0` are
+    # structurally distinct even though they're algebraically equal.
+    if num.const == 0.0:
+        return NormalizedExpr(
+            NormalizedProduct(const=0.0, factors=FrozenCounter.empty()),
+            NormalizedProduct(const=1.0, factors=FrozenCounter.empty()),
+        )
 
     # Fast path: no NormalizedRepeats anywhere, so the hoist step is a no-op.
     # Just cancel common factors and return.
@@ -1603,6 +1608,31 @@ def reduce(dim : FullDim, op : ReduceOpType, interval : tuple[SymbolicIndex, Sym
     if extracted is not None:
         expr_to_reduce, tag_domain = extracted
         final_domain = and_domains(base_domain, tag_domain)
+        # The fold may have surfaced new invariant factors (e.g., when
+        # `div` pushed through the tag, the rhs's now-unwrapped body
+        # ends up inside the if_true branch — and any of those factors
+        # that don't depend on `dim` should be hoisted just like the
+        # pre-fold partition did at the top of `reduce`).
+        post_varying_num, post_invariant_num = partition_by_dim_variance(
+            dim, expr_to_reduce.num,
+        )
+        post_varying_den, post_invariant_den = partition_by_dim_variance(
+            dim, expr_to_reduce.den,
+        )
+        post_inv_num_expr = strip_repeats_from_product(
+            NormalizedProduct(const=expr_to_reduce.num.const, factors=post_invariant_num),
+            dim,
+        )
+        post_inv_den_expr = strip_repeats_from_product(
+            NormalizedProduct(const=1.0, factors=post_invariant_den),
+            dim,
+        )
+        invariant_num_expr = mul(invariant_num_expr, post_inv_num_expr)
+        invariant_den_expr = mul(invariant_den_expr, post_inv_den_expr)
+        expr_to_reduce = make_expr(
+            NormalizedProduct(const=1.0, factors=post_varying_num),
+            NormalizedProduct(const=1.0, factors=post_varying_den),
+        )
     else:
         final_domain = base_domain
 
