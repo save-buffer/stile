@@ -6,7 +6,7 @@ import pytest
 
 import stile
 from stile import dim, reset_stile, mask_expr, Domain, LoopVariable
-from stile.type import Tensor, Constant, TagCond, Reduce, BinaryOp
+from stile.type import Tensor, Constant, TagCond, Reduce, BinaryOp, Repeat
 from stile.indexing import domain, le, ge
 from stile.verification import (
     normalize, NormalizedTensor, NormalizedTagCond, NormalizedReduce,
@@ -128,7 +128,6 @@ def test_repeat_pushes_through_mask_tag(reset):
     structure survives the shape extension and the mask stays recognizable
     for downstream push-through and reduce-fold.
     """
-    from stile.type import Repeat
     M = dim("RT_M", 32)
     N = dim("RT_N", 64)
     i = LoopVariable("RT_M")
@@ -155,7 +154,6 @@ def test_reduce_of_t_times_repeated_mask_folds(reset):
     distributes into it, and the reduce extractor absorbs the identity-
     else branch into the reduce's domain.
     """
-    from stile.type import Repeat
     M = dim("RTF_M", 32)
     N = dim("RTF_N", 64)
     i = LoopVariable("RTF_M")

@@ -13,7 +13,7 @@ from stile.indexing import LoopVariable, interval_domain
 from stile.verification import (
     NormalizedTensor, NormalizedReduce, NormalizedParametricReduce,
     NormalizedExpr, NormalizedProduct,
-    make_reduce, make_parametric_reduce, make_max, normalize,
+    add as _add, make_reduce, make_parametric_reduce, make_max, normalize,
 )
 from stile.type import FullDim
 from stile import dim, reset_stile
@@ -242,7 +242,6 @@ def test_sum_absorbs_boundary_term(reset):
     # add(param_expr, sibling) routes through make_sum under the hood.
     # We use the two-argument public sub/add pathway directly via the
     # internal add helper applied to NormalizedExpr values.
-    from stile.verification import add as _add  # NormalizedExpr-level add
     result = _add(param_expr, sibling)
 
     expected = make_parametric_reduce(k, 0, 5, "sum", body)

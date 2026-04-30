@@ -11,6 +11,7 @@ import pytest
 
 import stile.jax as tjax
 from stile import dim, reset_stile
+from stile.verification import verify_exprs_equivalent
 
 
 @pytest.fixture
@@ -75,8 +76,6 @@ def test_bias_form_equivalent_to_mult_form_under_exp(reset):
     """End-to-end: `exp(x) * mask(p)` and `exp(x + mask(p, 0, -inf))`
     normalize to the same expression via the bias→mult convergence
     landed in task #7."""
-    from stile.verification import verify_exprs_equivalent
-
     qctx = dim('emq', 4)
     nctx = dim('emn', 4)
     key = jax.random.PRNGKey(0)
