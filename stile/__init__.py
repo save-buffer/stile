@@ -1,6 +1,9 @@
 from .verification import verify_exprs_equivalent
 from .specification import parse_spec_into_type
-from .type import Type, FullDim, g_dim_registry, Tensor, Constant, TagCond
+from .type import (
+    Type, FullDim, g_dim_registry, Tensor, Constant, TagCond,
+    _reset_tensor_counter,
+)
 from .indexing import LoopVariable, AffineExpr, SymbolicIndex, Domain, range_domain
 
 def dim(name : str, size : int) -> FullDim:
@@ -16,6 +19,7 @@ def expr_simplifies(
 def reset_stile():
     g_dim_registry.clear()
     _active_loop_scopes.clear()
+    _reset_tensor_counter()
 
 
 def mask_expr(
@@ -36,7 +40,10 @@ def mask_expr(
         if_true=Constant(1.0),
         if_false=Constant(0.0),
     )
-    return Tensor(dims=dims, tag=tag)
+    # Mask tensors use a fixed name so two `mask_expr` calls with the
+    # same dims+predicate produce equal tensors (the tag carries the
+    # identifying info).
+    return Tensor(dims=dims, tag=tag, name="_mask")
 
 
 # --- Rolled loops ---------------------------------------------------------

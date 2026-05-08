@@ -1,4 +1,5 @@
 from .type import *
+from .type import _g_tensor_counter
 from .indexing import (
     AffineExpr, LoopVariable, Domain, to_affine,
     domain as _indexing_domain,
@@ -187,7 +188,12 @@ def _parse_dim(lex : LexState) -> Dim:
         )
     return dim
 
-def _parse_tensor(lex : LexState) -> tuple[ShapeType, ExprType]:
+def _parse_shape(lex : LexState) -> ShapeType:
+    """
+    Parse a sequence of dim references into a `ShapeType` *without*
+    constructing a Tensor — used for `-> ResultShape` slots where the
+    parser only needs the shape, not a tensor identity.
+    """
     dims = []
     # Stop when the upcoming identifier isn't a registered dim — otherwise
     # trailing keywords (`where`, …) would be swallowed as dim names.
@@ -200,15 +206,43 @@ def _parse_tensor(lex : LexState) -> tuple[ShapeType, ExprType]:
             break
         d = _parse_dim(lex)
         dims.append(d)
+    return tuple(dims)
+
+
+def _maybe_parse_label(lex : LexState) -> str | None:
+    """
+    Optional `label:` prefix on a tensor reference. Two `label:dims`
+    occurrences with the same label refer to the same tensor leaf. An
+    unlabeled tensor gets an auto-generated `_tensor_<n>` name and is
+    distinct from every other unlabeled tensor in the spec.
+    """
+    lex.consume_whitespace()
+    i = 0
+    while i < len(lex.spec) and (
+        lex.spec[i].isalpha() or lex.spec[i].isdigit() or lex.spec[i] == '_'
+    ):
+        i += 1
+    if i == 0:
+        return None
+    if i >= len(lex.spec) or lex.spec[i] != ':':
+        return None
+    label = lex.spec[:i]
+    lex.spec = lex.spec[i+1:]
+    return label
+
+
+def _parse_tensor(lex : LexState) -> tuple[ShapeType, ExprType]:
+    name = _maybe_parse_label(lex)
+    dims = _parse_shape(lex)
     full_dims = tuple(dim_full_dim(d) for d in dims)
-    return tuple(dims), Tensor(full_dims)
+    return dims, Tensor(full_dims, name=name)
 
 def _parse_contraction(lex : LexState, reduction : ReduceOpType = "sum") -> tuple[ShapeType, ExprType]:
     lhs_st, lhs_et = _parse_spec(lex)
     if lex.maybe_consume(','):
         rhs_st, rhs_et = _parse_spec(lex)
         lex.expect('->')
-        result_st, _ = _parse_tensor(lex)
+        result_st = _parse_shape(lex)
         return result_st, _construct_binary_reduction_expr(
             (lhs_st, lhs_et),
             (rhs_st, rhs_et),
@@ -216,7 +250,7 @@ def _parse_contraction(lex : LexState, reduction : ReduceOpType = "sum") -> tupl
             reduction=reduction,
         )
     elif lex.maybe_consume('->'):
-        result_st, _ = _parse_tensor(lex)
+        result_st = _parse_shape(lex)
         return result_st, _construct_unary_reduction_expr(
             (lhs_st, lhs_et),
             result_st,
@@ -230,14 +264,14 @@ def _parse_paren_expr(lex : LexState) -> tuple[ShapeType, ExprType]:
     if lex.maybe_consume(','):
         rhs_st, rhs_et = _parse_spec(lex)
         lex.expect('->')
-        result_st, _ = _parse_tensor(lex)
+        result_st = _parse_shape(lex)
         return result_st, _construct_binary_reduction_expr(
             (lhs_st, lhs_et),
             (rhs_st, rhs_et),
             result_st,
         )
     elif lex.maybe_consume('->'):
-        result_st, _ = _parse_tensor(lex)
+        result_st = _parse_shape(lex)
         return result_st, _construct_unary_reduction_expr(
             (lhs_st, lhs_et),
             result_st,
@@ -418,6 +452,7 @@ def _apply_where_mask(
             if_true=Constant(1.0),
             if_false=Constant(0.0),
         ),
+        name="_mask",
     )
     return BinaryOp(op="*", lhs=result_et, rhs=mask)
 
@@ -453,6 +488,7 @@ def _apply_iteration_restriction(
                 if_true=Constant(1.0),
                 if_false=Constant(0.0),
             ),
+            name="_mask",
         )
         return BinaryOp(op="*", lhs=body_et, rhs=mask)
     # max, softmax: bias-form. -inf outside the predicate vanishes through
@@ -464,6 +500,7 @@ def _apply_iteration_restriction(
             if_true=Constant(0.0),
             if_false=Constant(float("-inf")),
         ),
+        name="_mask",
     )
     return BinaryOp(op="+", lhs=body_et, rhs=bias)
 
@@ -508,6 +545,15 @@ def parse_spec_into_type(spec : str) -> Type:
     UNARY_FN  -> 'exp' | 'sin' | 'cos' | 'sqrt' | 'softmax'
     REDUCE_OP -> 'sum' | 'max'
     """
-    lex = LexState(spec)
-    st, et = _parse_spec(lex)
-    return Type(st, et)
+    # Save / reset / restore the tensor-naming counter so each spec
+    # parses with auto-names starting from `_tensor_1`. The kernel side
+    # also starts at 1 after `reset_stile`, so spec-leaf names align
+    # with kernel-leaf names by construction order.
+    saved = _g_tensor_counter[0]
+    _g_tensor_counter[0] = 0
+    try:
+        lex = LexState(spec)
+        st, et = _parse_spec(lex)
+        return Type(st, et)
+    finally:
+        _g_tensor_counter[0] = saved

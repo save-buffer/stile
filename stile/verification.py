@@ -35,12 +35,13 @@ class NormalizedTagCond:
 class NormalizedTensor:
     dims : frozenset[FullDim]
     tag : "NormalizedTagTree | None" = None
+    name : str = ""
 
     def __hash__(self) -> int:
         cached = getattr(self, '_h', None)
         if cached is not None:
             return cached
-        h = hash((self.dims, self.tag))
+        h = hash((self.dims, self.tag, self.name))
         object.__setattr__(self, '_h', h)
         return h
 
@@ -1113,7 +1114,7 @@ def _push_through_tag(
             )
         return transform(tag)
     return NormalizedExpr.of(
-        NormalizedTensor(dims=tensor.dims, tag=apply(tensor.tag))
+        NormalizedTensor(dims=tensor.dims, tag=apply(tensor.tag), name=tensor.name)
     )
 
 
@@ -1373,7 +1374,11 @@ def repeat(dims : frozenset[FullDim], x : ExprType) -> NormalizedExpr:
                         )
                     return push(tag)
                 return NormalizedExpr.of(
-                    NormalizedTensor(dims=tagged.dims | dims, tag=apply(tagged.tag))
+                    NormalizedTensor(
+                        dims=tagged.dims | dims,
+                        tag=apply(tagged.tag),
+                        name=tagged.name,
+                    )
                 )
             return NormalizedExpr.of(NormalizedRepeat(dims, child_normalized))
 
@@ -1619,9 +1624,9 @@ def normalize(expr : ExprType) -> NormalizedExpr:
         case Constant(x):
             const = NormalizedProduct(const=x)
             return NormalizedExpr.of(const)
-        case Tensor(dims, tag):
+        case Tensor(dims=dims, tag=tag, name=name):
             norm_tag = _normalize_tag(tag) if tag is not None else None
-            t = NormalizedTensor(dims=frozenset(dims), tag=norm_tag)
+            t = NormalizedTensor(dims=frozenset(dims), tag=norm_tag, name=name)
             return NormalizedExpr.of(t)
         case UnaryOp(op, child):
             return unary_op(op, normalize(child))

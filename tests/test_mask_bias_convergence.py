@@ -45,6 +45,7 @@ def _multiplicative(score_tensor, mask_domain):
                 if_true=Constant(1.0),
                 if_false=Constant(0.0),
             ),
+            name="_mask",
         ),
     )
 
@@ -57,6 +58,7 @@ def _bias_form(score_tensor, mask_domain):
             if_true=Constant(0.0),
             if_false=Constant(float("-inf")),
         ),
+        name="_mask",
     )
     return UnaryOp(op="exp", child=BinaryOp(op="+", lhs=score_tensor, rhs=bias))
 

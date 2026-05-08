@@ -6,6 +6,26 @@ from .indexing import SymbolicIndex, AffineExpr, LoopVariable, Domain, to_affine
 
 g_dim_registry : dict[str, "FullDim"] = {}
 
+# Counter used to auto-generate names for `Tensor` leaves. Each leaf
+# gets a fresh `_tensor_<n>` name so that two distinct constructions
+# with the same dim signature are still distinct tensors at the AST
+# level — this is what stops `a + b` from collapsing to `2 * a` when
+# `a` and `b` are two unrelated inputs that happen to share a shape.
+#
+# `reset_stile` resets this counter; `parse_spec_into_type` saves /
+# resets / restores it so spec parsing always starts at 1, letting
+# spec-side and kernel-side names align by construction order.
+_g_tensor_counter : list[int] = [0]
+
+
+def _next_tensor_name() -> str:
+    _g_tensor_counter[0] += 1
+    return f"_tensor_{_g_tensor_counter[0]}"
+
+
+def _reset_tensor_counter():
+    _g_tensor_counter[0] = 0
+
 
 def as_int(x : SymbolicIndex) -> int | None:
     """
@@ -151,9 +171,22 @@ class Tensor:
     masks, biases, padding, and other structured-sparsity patterns. The
     tag's `Domain`s constrain the dim-indices (symbolic `LoopVariable`s
     named after the dims).
+
+    `name` is the tensor's *identity*. Two distinct constructions with
+    the same `dims` but different `name`s are distinct leaves. If
+    `name` is left `None`, a fresh `_tensor_<n>` name is generated —
+    so the natural pattern (one Python expression per logical input)
+    Just Works without explicit labels. Mask/bias tensors should pass
+    a fixed `name` (e.g. `"_mask"`) so two same-tag invocations are
+    equal rather than spuriously distinct.
     """
     dims : tuple[FullDim, ...]
     tag : "TagTree | None" = None
+    name : str | None = None
+
+    def __post_init__(self):
+        if self.name is None:
+            object.__setattr__(self, 'name', _next_tensor_name())
 
 UnaryOpType = Literal["exp", "sin", "cos", "sqrt"]
 

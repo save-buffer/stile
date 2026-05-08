@@ -12,10 +12,57 @@ import stile.type as t
 from ..type import *
 from ..specification import parse_spec_into_type, _parse_predicate, LexState
 from ..verification import verify_types_equivalent, verify_exprs_equivalent
-from ..indexing import evaluate as _eval_index, free_vars as _free_vars, to_affine
+from ..indexing import evaluate as _eval_index, free_vars as _free_vars, to_affine, LoopVariable
 from .. import LoopScope, _active_loop_scopes
 
 import einops
+
+
+# Module-level registry of `LoopVariable` name → JAX value, used by
+# tjax internals (notably `_build_predicate_array`) to evaluate symbolic
+# slice offsets at runtime. Set by `typed_pallas_call` before tracing
+# the kernel — `_pid_<i>` resolves to `pl.program_id(i)`. Outside a
+# binding context, symbolic offsets stay an error.
+_loop_var_resolver : dict = {}
+
+
+class loop_var_binding:
+    """Context manager that binds `LoopVariable` names to JAX values for
+    the duration of the `with` block. Used by `typed_pallas_call` to
+    expose `pl.program_id` to in-kernel mask construction."""
+    def __init__(self, bindings : dict):
+        self.bindings = bindings
+        self.previous = None
+    def __enter__(self):
+        global _loop_var_resolver
+        self.previous = _loop_var_resolver
+        _loop_var_resolver = self.bindings
+        return self
+    def __exit__(self, *_):
+        global _loop_var_resolver
+        _loop_var_resolver = self.previous
+
+
+def _resolve_to_runtime(symbolic, var_resolver):
+    """Convert a `SymbolicIndex` (int / `LoopVariable` / `AffineExpr`)
+    to a runtime value — a Python int when fully concrete, a `jnp`
+    expression involving the resolver's bound jax-side values otherwise.
+    Errors if a `LoopVariable` is encountered that the resolver doesn't
+    cover."""
+    s_int = as_int(symbolic)
+    if s_int is not None:
+        return s_int
+    aff = to_affine(symbolic)
+    result = aff.const
+    for var, coeff in aff.terms:
+        if var.name not in var_resolver:
+            raise ValueError(
+                f"Cannot resolve symbolic LoopVariable {var.name!r} to "
+                f"a runtime value. Bind it via `loop_var_binding` or "
+                f"use a concrete slice offset."
+            )
+        result = result + coeff * var_resolver[var.name]
+    return result
 
 
 class TypedJaxArray:
@@ -156,12 +203,16 @@ def _build_predicate_array(
     are constant along that axis (broadcast).
     """
     shape = tuple(as_int(dim_size(d)) for d in st)
-    starts = tuple(as_int(dim_start(d)) for d in st)
-    if any(s is None for s in shape) or any(s is None for s in starts):
+    if any(s is None for s in shape):
         raise ValueError(
-            f"Predicate-mask requires concrete shape/start; got "
-            f"shape={shape}, starts={starts}"
+            f"Predicate-mask requires concrete dim sizes; got shape={shape}"
         )
+    # Slice offsets may be symbolic (an `AffineExpr` over `LoopVariable`s)
+    # when this is invoked inside a tiled Pallas kernel. Resolve via the
+    # active `loop_var_binding`, which maps each `_pid_<i>` to its
+    # `pl.program_id(i)` runtime value. Concrete-int starts pass through
+    # unchanged.
+    starts = tuple(_resolve_to_runtime(dim_start(d), _loop_var_resolver) for d in st)
     name_to_axis = {dim_name(d) : i for i, d in enumerate(st)}
 
     final_mask = None
@@ -229,6 +280,7 @@ def mask(
             if_true=Constant(in_value),
             if_false=Constant(out_value),
         ),
+        name="_mask",
     )
     arr = _build_predicate_array(pred_domain, shape, in_value, out_value)
     return TypedJaxArray(arr, Type(shape, mask_et, None))
@@ -236,9 +288,14 @@ def mask(
 
 def _coerce_scalar(x):
     """If x is a scalar jax.Array, convert it to a Python float so it can flow through
-    Constant(...) into the normalized expression as a hashable value."""
+    Constant(...) into the normalized expression as a hashable value.
+    Inside Pallas kernels, jax tracers can't `.item()` — fall through
+    and let downstream code see the raw tracer."""
     if isinstance(x, jax.Array) and x.ndim == 0:
-        return x.item()
+        try:
+            return x.item()
+        except (jax.errors.ConcretizationTypeError, jax.errors.TracerArrayConversionError):
+            return x
     return x
 
 def _binary_op_helper(
@@ -291,7 +348,18 @@ def cos(x : TypedJaxArray) -> TypedJaxArray:
     return _apply_unary(x, t.cos(x.type), jnp.cos)
 
 
-def sqrt(x : TypedJaxArray) -> TypedJaxArray:
+def sqrt(x):
+    """`tjax.sqrt` — eager on Python scalars, JAX-traced on TypedJaxArrays.
+    Lets `tjax.sqrt(dhead.size)` (a Python int) return a concrete float
+    so it can be used as a divisor inside Pallas kernels (where
+    `jnp.sqrt` would produce an abstract tracer that can't be coerced
+    to a Python scalar)."""
+    if isinstance(x, (int, float)):
+        return math.sqrt(x)
+    return _sqrt_typed(x)
+
+
+def _sqrt_typed(x : TypedJaxArray) -> TypedJaxArray:
     return _apply_unary(x, t.sqrt(x.type), jnp.sqrt)
 
 

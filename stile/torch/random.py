@@ -9,11 +9,15 @@ from ..type import FullDim, Tensor, Type, dim_size
 from ._core import TypedTorchTensor
 
 
-def randn(*shape : FullDim, device : str = "cpu") -> TypedTorchTensor:
+def randn(
+    *shape : FullDim,
+    device : str = "cpu",
+    name : str | None = None,
+) -> TypedTorchTensor:
     torch_shape = tuple(dim_size(d) for d in shape)
     tensor = torch.randn(torch_shape, device=device)
     type = Type(
         st=shape,
-        et=Tensor(shape),
+        et=Tensor(shape, name=name),
     )
     return TypedTorchTensor(tensor, type)

@@ -65,77 +65,80 @@ def test_exp(reset):
 def test_numerically_stable_softmax(reset):
     key = jax.random.PRNGKey(0)
     N = dim('N', 8)
-    x = tjax.random.normal(key, N)
+    # `name="x"` ties the input's leaf identity to the spec label `x`
+    # — every spec-side `x:N` references the same tensor as the
+    # kernel's `x` variable.
+    x = tjax.random.normal(key, N, name="x")
 
     # exp(x) / sum(exp(x))
-    naive = tjax.TypedResult("softmax[N](N)")
+    naive = tjax.TypedResult("softmax[N](x:N)")
     x_max = x.max(N)
-    assert expr_simplifies(x_max, "max[N](N)")
-    
+    assert expr_simplifies(x_max, "max[N](x:N)")
+
     x_stable = x - x_max.repeat(N)
-    assert expr_simplifies(x_stable, "N - (max[N](N) -> N)")
+    assert expr_simplifies(x_stable, "x:N - (max[N](x:N) -> N)")
 
     exp_x = tjax.exp(x_stable)
-    assert expr_simplifies(exp_x, "exp(N - (max[N](N) -> N))")
+    assert expr_simplifies(exp_x, "exp(x:N - (max[N](x:N) -> N))")
 
     sum_exp_x = exp_x.sum(N).repeat(N)
-    assert expr_simplifies(sum_exp_x, "(sum[N](exp(N - (max[N](N) -> N))) -> N)")
+    assert expr_simplifies(sum_exp_x, "(sum[N](exp(x:N - (max[N](x:N) -> N))) -> N)")
 
     softmax = exp_x / sum_exp_x
     # Literally what softmax is
     assert expr_simplifies(
         softmax,
-        "(exp(N - (max[N](N) -> N))) / (sum[N](exp(N - (max[N](N) -> N))) -> N)",
+        "(exp(x:N - (max[N](x:N) -> N))) / (sum[N](exp(x:N - (max[N](x:N) -> N))) -> N)",
     )
     # Convert exponent to quotient in numerator
     assert expr_simplifies(
         softmax,
-        "(exp(N) / exp(max[N](N) -> N)) / (sum[N](exp(N - (max[N](N) -> N))) -> N)",
+        "(exp(x:N) / exp(max[N](x:N) -> N)) / (sum[N](exp(x:N - (max[N](x:N) -> N))) -> N)",
     )
     # Component exponent to quotient in denominator
     assert expr_simplifies(
         softmax,
-        "(exp(N) / exp(max[N](N) -> N)) / (sum[N](exp(N) / exp(max[N](N) -> N)) -> N)",
+        "(exp(x:N) / exp(max[N](x:N) -> N)) / (sum[N](exp(x:N) / exp(max[N](x:N) -> N)) -> N)",
     )
     # Pull repeat outside of the exp in the denominator
     assert expr_simplifies(
         softmax,
-        "(exp(N) / exp(max[N](N) -> N)) / (sum[N](exp(N) / (exp(max[N](N)) -> N)) -> N)",
+        "(exp(x:N) / exp(max[N](x:N) -> N)) / (sum[N](exp(x:N) / (exp(max[N](x:N)) -> N)) -> N)",
     )
     # Pull the denominator outside of the sum
     assert expr_simplifies(
         softmax,
-        "(exp(N) / exp(max[N](N) -> N)) / (sum[N](exp(N)) / exp(max[N](N)) -> N)",
+        "(exp(x:N) / exp(max[N](x:N) -> N)) / (sum[N](exp(x:N)) / exp(max[N](x:N)) -> N)",
     )
     # Duplicate repeat in demoniator
     assert expr_simplifies(
         softmax,
-        "(exp(N) / exp(max[N](N) -> N)) / ((sum[N](exp(N)) -> N) / (exp(max[N](N)) -> N))",
+        "(exp(x:N) / exp(max[N](x:N) -> N)) / ((sum[N](exp(x:N)) -> N) / (exp(max[N](x:N)) -> N))",
     )
     # Flip the denominator and turn it into a multiplication
     assert expr_simplifies(
         softmax,
-        "(exp(N) / exp(max[N](N) -> N)) * ((exp(max[N](N)) -> N) / (sum[N](exp(N)) -> N))",
+        "(exp(x:N) / exp(max[N](x:N) -> N)) * ((exp(max[N](x:N)) -> N) / (sum[N](exp(x:N)) -> N))",
     )
     # Turn it into quotient of products
     assert expr_simplifies(
         softmax,
-        "(exp(N) * (exp(max[N](N)) -> N)) / (exp(max[N](N) -> N) * (sum[N](exp(N)) -> N))",
+        "(exp(x:N) * (exp(max[N](x:N)) -> N)) / (exp(max[N](x:N) -> N) * (sum[N](exp(x:N)) -> N))",
     )
     # Associativity of multiplication in denominator
     assert expr_simplifies(
         softmax,
-        "(exp(N) * (exp(max[N](N)) -> N)) / ((sum[N](exp(N)) -> N) * exp(max[N](N) -> N))",
+        "(exp(x:N) * (exp(max[N](x:N)) -> N)) / ((sum[N](exp(x:N)) -> N) * exp(max[N](x:N) -> N))",
     )
     # Break back into multiplication of fractions
     assert expr_simplifies(
         softmax,
-        "(exp(N) / (sum[N](exp(N)) -> N)) * ((exp(max[N](N)) -> N) / (exp(max[N](N)) -> N))",
+        "(exp(x:N) / (sum[N](exp(x:N)) -> N)) * ((exp(max[N](x:N)) -> N) / (exp(max[N](x:N)) -> N))",
     )
     # Check that RHS fraction simplifies to 1
     assert expr_simplifies(
        softmax,
-       "(exp(N) / (sum[N](exp(N)) -> N)) * 1",
+       "(exp(x:N) / (sum[N](exp(x:N)) -> N)) * 1",
     )
 
     naive.assign(softmax)
@@ -143,8 +146,8 @@ def test_numerically_stable_softmax(reset):
 def test_online_softmax(reset):
     key = jax.random.PRNGKey(0)
     N = dim('N', 8)
-    x = tjax.random.normal(key, N)
-    online = tjax.TypedResult("softmax[N](N)")
+    x = tjax.random.normal(key, N, name="x")
+    online = tjax.TypedResult("softmax[N](x:N)")
 
     x_block1 = x.slice(N, 0, 4)
     m1 = x_block1.max(N)
@@ -165,49 +168,49 @@ def test_online_softmax(reset):
     l2_corrected = l2 * l2_correction
     l_global = l1_corrected + l2_corrected
 
-    assert expr_simplifies(m_global, "max[N](N)")
-    assert expr_simplifies(l1, "sum[N](exp(N[0:4] - (max[N](N[0:4]) -> N[0:4])))")
-    assert expr_simplifies(l2, "sum[N](exp(N[4:8] - (max[N](N[4:8]) -> N[4:8])))")
-    assert expr_simplifies(l1, "sum[N](exp(N[0:4])) / exp(max[N](N[0:4]))")
-    assert expr_simplifies(l1_correction, "exp(max[N](N[0:4])) / exp(max[N](N))")
-    assert expr_simplifies(l1_corrected, "(sum[N](exp(N[0:4])) / exp(max[N](N[0:4]))) * (exp(max[N](N[0:4])) / exp(max[N](N)))")
-    assert expr_simplifies(l1_corrected, "(sum[N](exp(N[0:4])) * exp(max[N](N[0:4]))) / (exp(max[N](N[0:4])) * exp(max[N](N)))")
-    assert expr_simplifies(l1_corrected, "(sum[N](exp(N[0:4])) * exp(max[N](N[0:4]))) / (exp(max[N](N)) * exp(max[N](N[0:4])))")
+    assert expr_simplifies(m_global, "max[N](x:N)")
+    assert expr_simplifies(l1, "sum[N](exp(x:N[0:4] - (max[N](x:N[0:4]) -> N[0:4])))")
+    assert expr_simplifies(l2, "sum[N](exp(x:N[4:8] - (max[N](x:N[4:8]) -> N[4:8])))")
+    assert expr_simplifies(l1, "sum[N](exp(x:N[0:4])) / exp(max[N](x:N[0:4]))")
+    assert expr_simplifies(l1_correction, "exp(max[N](x:N[0:4])) / exp(max[N](x:N))")
+    assert expr_simplifies(l1_corrected, "(sum[N](exp(x:N[0:4])) / exp(max[N](x:N[0:4]))) * (exp(max[N](x:N[0:4])) / exp(max[N](x:N)))")
+    assert expr_simplifies(l1_corrected, "(sum[N](exp(x:N[0:4])) * exp(max[N](x:N[0:4]))) / (exp(max[N](x:N[0:4])) * exp(max[N](x:N)))")
+    assert expr_simplifies(l1_corrected, "(sum[N](exp(x:N[0:4])) * exp(max[N](x:N[0:4]))) / (exp(max[N](x:N)) * exp(max[N](x:N[0:4])))")
     assert expr_simplifies(
         l1_corrected,
-        "(sum[N](exp(N[0:4])) / exp(max[N](N))) * (exp(max[N](N[0:4])) / exp(max[N](N[0:4])))",
+        "(sum[N](exp(x:N[0:4])) / exp(max[N](x:N))) * (exp(max[N](x:N[0:4])) / exp(max[N](x:N[0:4])))",
     )
     assert expr_simplifies(
         l1_corrected,
-        "(sum[N](exp(N[0:4])) / exp(max[N](N))) * 1",
+        "(sum[N](exp(x:N[0:4])) / exp(max[N](x:N))) * 1",
     )
     assert expr_simplifies(
         l1_corrected,
-        "sum[N](exp(N[0:4])) / exp(max[N](N))",
+        "sum[N](exp(x:N[0:4])) / exp(max[N](x:N))",
     )
     assert expr_simplifies(
         l2_corrected,
-        "sum[N](exp(N[4:8])) / exp(max[N](N))",
+        "sum[N](exp(x:N[4:8])) / exp(max[N](x:N))",
     )
     assert expr_simplifies(
         l_global,
-        "(sum[N](exp(N[0:4])) / exp(max[N](N))) + (sum[N](exp(N[4:8])) / exp(max[N](N)))",
+        "(sum[N](exp(x:N[0:4])) / exp(max[N](x:N))) + (sum[N](exp(x:N[4:8])) / exp(max[N](x:N)))",
     )
     assert expr_simplifies(
         l_global,
-        "(sum[N](exp(N[0:4])) + sum[N](exp(N[4:8]))) / exp(max[N](N))",
+        "(sum[N](exp(x:N[0:4])) + sum[N](exp(x:N[4:8]))) / exp(max[N](x:N))",
     )
     assert expr_simplifies(
         l_global,
-        "sum[N](exp(N)) / exp(max[N](N))",
+        "sum[N](exp(x:N)) / exp(max[N](x:N))",
     )
     assert expr_simplifies(
         l_global,
-        "sum[N](exp(N) / (exp(max[N](N)) -> N))",
+        "sum[N](exp(x:N) / (exp(max[N](x:N)) -> N))",
     )
     assert expr_simplifies(
         l_global,
-        "sum[N](exp(N - (max[N](N) -> N)))",
+        "sum[N](exp(x:N - (max[N](x:N) -> N)))",
     )
 
     softmax1 = tjax.exp(x_block1 - m_global.repeat(N[0:4])) / l_global.repeat(N[0:4])

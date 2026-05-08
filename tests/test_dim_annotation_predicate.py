@@ -64,14 +64,15 @@ def test_softmax_dim_annotation_predicate_restricts_iteration(reset):
     dim("DASMQ", 8)
     dim("DASMK", 8)
     spec_annot = parse_spec_into_type(
-        "softmax[DASMK where DASMK <= DASMQ](DASMQ DASMK)"
+        "softmax[DASMK where DASMK <= DASMQ](s:DASMQ DASMK)"
     )
     # Explicit form (no softmax macro): mult-mask after exp, both num
     # and den restricted by the same predicate. Bias and mult forms
-    # converge in normalization (#7), so the two specs must match.
+    # converge in normalization (#7); both forms reference the same
+    # underlying score tensor so we tie them together via the `s:` label.
     spec_explicit = parse_spec_into_type(
-        "(exp(DASMQ DASMK) where DASMK <= DASMQ) / "
-        "(sum[DASMK](exp(DASMQ DASMK) where DASMK <= DASMQ) -> DASMQ DASMK)"
+        "(exp(s:DASMQ DASMK) where DASMK <= DASMQ) / "
+        "(sum[DASMK](exp(s:DASMQ DASMK) where DASMK <= DASMQ) -> DASMQ DASMK)"
     )
     assert verify_exprs_equivalent(spec_annot.et, spec_explicit.et)
 

@@ -96,3 +96,41 @@ def test_sum_of_repeat_is_not_identity(reset):
     dim('M', 8)
     # sum over N of (M repeated over N) = size(N) * M = 8 * M, not M.
     assert_not_equivalent("sum[N](M -> N M)", "M")
+
+
+# ---------------------------------------------------------------------------
+# Tensor-identity-by-name (#16). The soundness contract: two distinct
+# named tensors with the same shape do NOT collapse to one. Pinned here
+# so any future regression in `Tensor.name` propagation surfaces loudly.
+# ---------------------------------------------------------------------------
+
+def test_distinct_labels_do_not_collapse_under_addition(reset):
+    """`x + y` is NOT `2 * x` when `x` and `y` are distinct labeled
+    tensors. The flaw before #16 silently accepted this; the fix makes
+    name part of the leaf identity."""
+    dim('N', 8)
+    assert_not_equivalent("x:N + y:N", "2 * x:N")
+
+
+def test_distinct_labels_are_distinct_leaves(reset):
+    """Two labeled tensors with the same dim signature but different
+    labels are different tensors."""
+    dim('N', 8)
+    assert_not_equivalent("x:N", "y:N")
+
+
+def test_anonymous_occurrences_do_not_collapse(reset):
+    """Two unlabeled tensor references in the same spec are distinct
+    anonymous tensors — an unlabeled `N + N` is NOT `2 * N`. (For
+    sharing, the user must use an explicit label.)"""
+    dim('N', 8)
+    assert_not_equivalent("N + N", "2 * N")
+
+
+def test_same_label_is_the_same_leaf(reset):
+    """The contract goes both ways: when the user *does* use the same
+    label, those references *do* collapse. `x + x` ≡ `2 * x`."""
+    dim('N', 8)
+    a = parse_spec_into_type("x:N + x:N")
+    b = parse_spec_into_type("2 * x:N")
+    assert verify_exprs_equivalent(a.et, b.et)
