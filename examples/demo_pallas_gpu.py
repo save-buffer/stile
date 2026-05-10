@@ -9,13 +9,18 @@ What you'll see:
      factor — the verifier rejects it before Pallas ever lowers, so
      no GPU work is launched.
 
-Today's gaps (upstream Pallas):
-  - Mosaic-GPU `Lane` lowering doesn't implement `dot_general`, so
-    matmul / flash-attention kernels stay on the interpret path
-    until that ships. The same typed kernels (see
-    `tests/test_typed_pallas.py`) run end-to-end on CPU interpret;
-    when upstream lands the missing primitives, no stile changes
-    are needed to flip them to GPU.
+Today's matmul gap (Pallas design):
+  - Pallas-GPU is a low-level kernel framework. There's no automatic
+    `dot_general` → MMA lowering: matmul on GPU is via the explicit
+    `plgpu.wgmma` (Hopper) or `plgpu.tcgen05_mma` (Blackwell)
+    intrinsics, with `TilingTransform` + `SwizzleTransform` on the
+    SMEM-resident inputs. The reference is
+    `jax.experimental.pallas.ops.gpu.blackwell_matmul_mgpu` (~200
+    lines: TMA + warp-specialization + accumulator + pipeline).
+  - Wrapping such a kernel with stile typing is a clean follow-up
+    — stile types the kernel's inputs/outputs and verifies the
+    high-level effect, regardless of whether the body uses `wgmma`
+    or anything else.
 
 Run from the project root on a CUDA-equipped host:
   uv run python examples/demo_pallas_gpu.py
