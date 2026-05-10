@@ -3,7 +3,10 @@ import math
 from dataclasses import dataclass, field
 
 from .type import *
-from .indexing import Domain, AffineConstraint, interval_domain, ge, lt, and_domains, simplify_domain
+from .indexing import (
+    Domain, AffineConstraint, interval_domain, ge, lt, and_domains,
+    simplify_domain, active_loop_vars, _active_loop_scopes,
+)
 from .frozen_counter import FrozenCounter
 
 
@@ -441,6 +444,133 @@ def _substitute_loop_var(
     return result
 
 
+def substitute_loop_var_in_et(
+    et : ExprType,
+    loop_var : LoopVariable,
+    value : SymbolicIndex,
+) -> ExprType:
+    """
+    Walk an `ExprType` AST and substitute every occurrence of
+    `loop_var` with `value`. Affects:
+
+      - `Sliced` dim bounds (in `Tensor.dims`, `Repeat.dim`,
+        `Reduce.dim`, and nested).
+      - `TagCond` domain constraints (recursively).
+      - `ParametricReduce` `lo`/`hi` (and inner body, but not when
+        the parametric loop variable matches `loop_var`'s name —
+        that's a binder shadow).
+
+    Used by `fori_loop(invariant=...)` to materialize the loop's
+    return value as `invariant[k=upper]` at the AST level so
+    downstream `tjax` ops can keep building.
+    """
+    def sub_dim(d):
+        match d:
+            case FullDim():
+                return d
+            case Sliced(child, start, end):
+                return Sliced(
+                    sub_dim(child),
+                    _substitute_loop_var(start, loop_var, value),
+                    _substitute_loop_var(end, loop_var, value),
+                )
+        return d
+
+    def sub_domain(domain):
+        new_disjuncts = frozenset(
+            frozenset(
+                AffineConstraint(
+                    _substitute_loop_var(c.expr, loop_var, value)
+                )
+                for c in conj
+            )
+            for conj in domain.disjuncts
+        )
+        new_vars = frozenset(v for v in domain.variables if v != loop_var)
+        # Add any free vars that came in via `value`.
+        new_vars |= frozenset(
+            v for c in to_affine(value).terms for (v, _) in [c]
+        )
+        return Domain(new_vars, new_disjuncts)
+
+    def sub_tag(tag):
+        if isinstance(tag, TagCond):
+            return TagCond(
+                domain=sub_domain(tag.domain),
+                if_true=sub_tag(tag.if_true),
+                if_false=sub_tag(tag.if_false),
+            )
+        return sub_et(tag)
+
+    def sub_et(et):
+        match et:
+            case Constant():
+                return et
+            case Tensor(dims=dims, tag=tag, name=name):
+                new_tag = sub_tag(tag) if tag is not None else None
+                return Tensor(
+                    dims=tuple(sub_dim(d) for d in dims),
+                    tag=new_tag,
+                    name=name,
+                )
+            case UnaryOp(op, child):
+                return UnaryOp(op, sub_et(child))
+            case BinaryOp(op, lhs, rhs):
+                return BinaryOp(op, sub_et(lhs), sub_et(rhs))
+            case Repeat(dim, child):
+                return Repeat(sub_dim(dim), sub_et(child))
+            case Reduce(op, dim, child):
+                return Reduce(op, sub_dim(dim), sub_et(child))
+            case ParametricReduce(lv, lo, hi, op, body):
+                if lv.name == loop_var.name:
+                    return et  # shadowed by inner binder
+                return ParametricReduce(
+                    lv,
+                    _substitute_loop_var(lo, loop_var, value),
+                    _substitute_loop_var(hi, loop_var, value),
+                    op,
+                    sub_et(body),
+                )
+        return et
+
+    return sub_et(et)
+
+
+def _conjunction_is_infeasible(conj) -> bool:
+    """
+    True when this conjunction of `expr >= 0` constraints has no
+    solutions over the integers — currently only the simple case
+    where some single variable has a lower bound that exceeds its
+    upper bound (after collapsing 1-D bounds). Catches the empty
+    domain that arises when an invariant `sum[N where N < k]`
+    is evaluated at `k=0`.
+    """
+    vars_in_conj = {v for c in conj for v, _ in c.expr.terms}
+    for var in vars_in_conj:
+        lo = None
+        hi = None
+        for c in conj:
+            coeff = _loop_var_coeff(c.expr, var)
+            if coeff == 1:
+                residue = c.expr - to_affine(var)
+                if not residue.terms:
+                    cand = -residue.const
+                    lo = cand if lo is None else max(lo, cand)
+            elif coeff == -1:
+                residue = c.expr + to_affine(var)
+                if not residue.terms:
+                    cand = residue.const
+                    hi = cand if hi is None else min(hi, cand)
+        if lo is not None and hi is not None and lo > hi:
+            return True
+    return False
+
+
+def _domain_is_empty(domain : Domain) -> bool:
+    """Every disjunct is infeasible → domain is empty (no iteration points)."""
+    return all(_conjunction_is_infeasible(c) for c in domain.disjuncts)
+
+
 def _substitute_lv_in_expr(
     expr : "NormalizedExpr",
     loop_var : LoopVariable,
@@ -450,8 +580,10 @@ def _substitute_lv_in_expr(
     Replace every occurrence of `loop_var` inside `expr` with `value`,
     walking the full expression tree (Reduce intervals, nested children,
     etc.). Shadowing by an inner `ParametricReduce` binder is respected.
+    Empty-domain reduces collapse to the op's identity (0 for sum,
+    -inf for max).
     """
-    return make_expr(
+    return div(
         _substitute_lv_in_product(expr.num, loop_var, value),
         _substitute_lv_in_product(expr.den, loop_var, value),
     )
@@ -461,12 +593,45 @@ def _substitute_lv_in_product(
     product : "NormalizedProduct",
     loop_var : LoopVariable,
     value : SymbolicIndex,
-) -> "NormalizedProduct":
-    new_factors : dict[NormalizedFactor, int] = {}
+) -> "NormalizedExpr":
+    """
+    Rebuild the product factor-by-factor via `mul` so that a factor
+    whose substitution collapses to a Constant (e.g. an empty-domain
+    sum-Reduce → 0) propagates through cleanly.
+    """
+    result = NormalizedExpr.of(NormalizedProduct(const=product.const))
     for factor, count in product.factors.items():
-        new_factor = _substitute_lv_in_factor(factor, loop_var, value)
-        new_factors[new_factor] = new_factors.get(new_factor, 0) + count
-    return NormalizedProduct(product.const, FrozenCounter.from_dict(new_factors))
+        sub = _substitute_lv_in_factor_to_expr(factor, loop_var, value)
+        for _ in range(count):
+            result = mul(result, sub)
+    return result
+
+
+def _substitute_lv_in_factor_to_expr(
+    factor : "NormalizedFactor",
+    loop_var : LoopVariable,
+    value : SymbolicIndex,
+) -> "NormalizedExpr":
+    """
+    Like `_substitute_lv_in_factor` but returns a `NormalizedExpr` so
+    the result can be a non-factor (notably: identity-valued Constants
+    when an empty Reduce collapses).
+    """
+    match factor:
+        case NormalizedReduce(dim, op, domain, child):
+            new_domain = simplify_domain(
+                _substitute_lv_in_domain(domain, loop_var, value)
+            )
+            if _domain_is_empty(new_domain):
+                identity = 0.0 if op == "sum" else float("-inf")
+                return NormalizedExpr.of(NormalizedProduct(const=identity))
+            new_child = _substitute_lv_in_expr(child, loop_var, value)
+            return NormalizedExpr.of(
+                NormalizedReduce(dim, op, new_domain, new_child)
+            )
+    # All other factor kinds: substitute via the factor-returning helper
+    # (no identity-collapse needed) and wrap.
+    return NormalizedExpr.of(_substitute_lv_in_factor(factor, loop_var, value))
 
 
 def _substitute_lv_in_domain(
@@ -564,15 +729,177 @@ def _rebuild_reduce_with_extras(
         return make_reduce(dim, op, tuple(merged_intervals), child)
     index = _reduce_index(dim)
     extra_vars = frozenset(v for c in extras for v, _ in c.expr.terms)
+    interval_vars = frozenset(
+        v for (s, e) in merged_intervals
+        for x in (s, e)
+        for (v, _) in to_affine(x).terms
+    )
     disjuncts : set = set()
     for s, e in merged_intervals:
         conj = set(extras)
         conj.add(ge(index, s))
         conj.add(lt(index, e))
         disjuncts.add(frozenset(conj))
-    domain = Domain(frozenset({index}) | extra_vars, frozenset(disjuncts))
+    domain = Domain(
+        frozenset({index}) | extra_vars | interval_vars, frozenset(disjuncts),
+    )
     domain = simplify_domain(domain)
     return make_reduce(dim, op, domain, child)
+
+
+def _max_in_loop_scope(expr : SymbolicIndex) -> int | None:
+    """
+    Upper bound on `expr` using the currently-active `LoopScope` iteration
+    ranges and the natural ranges of any free dim variables (a
+    `LoopVariable` named after a registered `FullDim` ranges over
+    `[0, dim.size)`). Returns `None` when no range is available for some
+    variable — e.g. a free `LoopVariable` that's neither a loop scope nor
+    a dim — or when an endpoint isn't concretely an integer.
+    """
+    aff = to_affine(expr)
+    total = aff.const
+    scopes_by_var = {s.var : s for s in _active_loop_scopes}
+    for v, c in aff.terms:
+        scope = scopes_by_var.get(v)
+        if scope is not None:
+            lo_int = as_int(scope.lo)
+            hi_int = as_int(scope.hi)
+        else:
+            registered = g_dim_registry.get(v.name)
+            if registered is None:
+                return None
+            lo_int, hi_int = 0, registered.size
+        if lo_int is None or hi_int is None:
+            return None
+        # max at `hi - 1` if c > 0, else at `lo`.
+        total += c * ((hi_int - 1) if c > 0 else lo_int)
+    return total
+
+
+def simplify_under_active_loop_scope(expr : "NormalizedExpr") -> "NormalizedExpr":
+    """
+    Re-walk `expr` and drop redundant natural bounds from every
+    `NormalizedReduce`'s domain, using the currently-active loop scopes
+    to prove subsumption. Used by `_fori_loop_with_invariant` to compare
+    a body's output against `invariant[k+1]` under the loop scope's
+    bounds; without this step the unmerged invariant form keeps its
+    natural `n < dim.size` constraint, while the merged body output (its
+    interval already supplies a tighter loop-var bound) doesn't, so they
+    canonicalize differently.
+    """
+    def walk_expr(e : NormalizedExpr) -> NormalizedExpr:
+        new_num = walk_product(e.num)
+        new_den = walk_product(e.den)
+        if new_num is e.num and new_den is e.den:
+            return e
+        return NormalizedExpr(num=new_num, den=new_den)
+
+    def walk_product(p : NormalizedProduct) -> NormalizedProduct:
+        new_factors_items = []
+        changed = False
+        for f, count in p.factors.items():
+            new_f = walk_factor(f)
+            if new_f is not f:
+                changed = True
+            new_factors_items.append((new_f, count))
+        if not changed:
+            return p
+        new_factors = FrozenCounter.from_dict(dict(new_factors_items))
+        return NormalizedProduct(const=p.const, factors=new_factors)
+
+    def walk_factor(f):
+        match f:
+            case NormalizedReduce(dim, op, domain, child):
+                new_child = walk_expr(child)
+                new_domain = _drop_redundant_natural_bounds(domain, dim)
+                if new_domain == domain and new_child is child:
+                    return f
+                return NormalizedReduce(dim, op, new_domain, new_child)
+            case NormalizedSum(terms):
+                new_terms = [walk_product(t) for t in terms]
+                if all(t is o for t, o in zip(new_terms, terms)):
+                    return f
+                return NormalizedSum(frozenset(new_terms))
+            case NormalizedMax(children):
+                new_children = [walk_expr(c) for c in children]
+                if all(c is o for c, o in zip(new_children, children)):
+                    return f
+                return NormalizedMax(frozenset(new_children))
+            case NormalizedExp(child):
+                new_child = walk_expr(child)
+                return f if new_child is child else NormalizedExp(new_child)
+            case NormalizedUnaryOp(op, child):
+                new_child = walk_expr(child)
+                return f if new_child is child else NormalizedUnaryOp(op, new_child)
+            case NormalizedRepeat(dim, child):
+                new_child = walk_expr(child)
+                return f if new_child is child else NormalizedRepeat(dim, new_child)
+            case NormalizedParametricReduce(loop_var, lo, hi, op, body):
+                new_body = walk_expr(body)
+                return f if new_body is body else NormalizedParametricReduce(
+                    loop_var, lo, hi, op, new_body,
+                )
+            case _:
+                return f
+
+    return walk_expr(expr)
+
+
+def _drop_redundant_natural_bounds(
+    domain : Domain, dim : FullDim,
+) -> Domain:
+    """
+    Drop constant bounds on the reduce index that are subsumed by a
+    symbolic bound on the same side, using active `LoopScope`s and free
+    dim variables' natural ranges to bound the symbolic bound's
+    maximum. Constant `idx < C` is dropped when some symbolic `idx < X`
+    has `max(X) ≤ C`; symmetrically for lower bounds. Generalizes the
+    natural-bound drop: lets a loop-var iteration bound `n < BN*k`
+    subsume the `n < dim.size` natural that mask-form parsing pulls in,
+    and lets a cross-variable causal bound `n <= q` subsume both the
+    natural `n < nctx_size` and a post-substitution `n < BN*K` when
+    `qctx_size ≤ min(BN*K, nctx_size)` — which is what makes
+    "skip-tail" rolled causal flash match its softmax-attention spec.
+    """
+    index = _reduce_index(dim)
+    new_disjuncts : set = set()
+    for conj in domain.disjuncts:
+        constraints = list(conj)
+        constant_uppers : list[tuple[int, AffineConstraint]] = []
+        constant_lowers : list[tuple[int, AffineConstraint]] = []
+        symbolic_uppers : list[SymbolicIndex] = []
+        symbolic_lowers : list[SymbolicIndex] = []
+        for c in constraints:
+            coeff = _loop_var_coeff(c.expr, index)
+            if coeff == 1:
+                residue = c.expr - to_affine(index)
+                if not residue.terms:
+                    constant_lowers.append((-residue.const, c))
+                else:
+                    symbolic_lowers.append(-residue)
+            elif coeff == -1:
+                residue = c.expr + to_affine(index)
+                if not residue.terms:
+                    constant_uppers.append((residue.const + 1, c))
+                else:
+                    symbolic_uppers.append(residue + 1)
+        for const_val, const_c in constant_uppers:
+            for sym in symbolic_uppers:
+                mx = _max_in_loop_scope(sym)
+                if mx is not None and mx <= const_val:
+                    if const_c in constraints:
+                        constraints.remove(const_c)
+                    break
+        for const_val, const_c in constant_lowers:
+            for sym in symbolic_lowers:
+                # min(sym) = -max(-sym).
+                neg_max = _max_in_loop_scope(-sym)
+                if neg_max is not None and -neg_max >= const_val:
+                    if const_c in constraints:
+                        constraints.remove(const_c)
+                    break
+        new_disjuncts.add(frozenset(constraints))
+    return Domain(domain.variables, frozenset(new_disjuncts))
 
 
 def _split_reduce_domain(
@@ -589,36 +916,98 @@ def _split_reduce_domain(
     predicate on the reduce dim and other dims). Returns None when the
     domain isn't single-disjunct or doesn't have a clean 1-D bound pair on
     the reduction index.
+
+    Interval-bound priority is `loop-var-symbolic > constant > cross-var-
+    symbolic`. Cross-variable predicates (e.g. `n < q + 1` in causal
+    flash) stay in extras so tiles merge across concrete tile boundaries.
+    Loop-variable iteration bounds (e.g. `n < BN*k` from a `where`-clause
+    that references the active loop var) outrank constants so the
+    accumulating invariant and its current tile share extras and merge
+    via interval-union. A "natural" constant bound (`0` for lower, `dim.size`
+    for upper) is dropped when a loop-var-symbolic takes its direction —
+    it's implied by the reduce's range and would otherwise prevent the
+    merge.
     """
     if len(domain.disjuncts) != 1:
         return None
     conj = next(iter(domain.disjuncts))
     index = _reduce_index(dim)
+    loop_vars = active_loop_vars()
 
-    start = None
-    end = None
+    def _is_loop_var_bound(expr : SymbolicIndex) -> bool:
+        return any(v in loop_vars for v, _ in to_affine(expr).terms)
+
+    constant_lowers : list[SymbolicIndex] = []
+    loop_lowers : list[SymbolicIndex] = []
+    crossvar_lowers : list[SymbolicIndex] = []
+    constant_uppers : list[SymbolicIndex] = []
+    loop_uppers : list[SymbolicIndex] = []
+    crossvar_uppers : list[SymbolicIndex] = []
     extras : list[AffineConstraint] = []
+
     for c in conj:
         coeff = _loop_var_coeff(c.expr, index)
-        # Only treat a constraint as a 1-D bound on the reduction index if its
-        # residue (after subtracting the index term) is a plain constant —
-        # otherwise we'd treat e.g. `nctx <= qctx` as `end = qctx+1`, and the
-        # interval-merge across tiles would never converge because the bound
-        # carries a free variable. Cross-variable constraints go in `extras`.
-        if coeff == 1 and start is None:
+        if coeff == 1:
             residue = c.expr - to_affine(index)
-            if residue.terms:
-                extras.append(c)
-                continue
-            start = -residue
-        elif coeff == -1 and end is None:
+            bound = -residue
+            if not residue.terms:
+                constant_lowers.append(bound)
+            elif _is_loop_var_bound(bound):
+                loop_lowers.append(bound)
+            else:
+                crossvar_lowers.append(bound)
+        elif coeff == -1:
             residue = c.expr + to_affine(index)
-            if residue.terms:
-                extras.append(c)
-                continue
-            end = residue + 1
+            bound = residue + 1
+            if not residue.terms:
+                constant_uppers.append(bound)
+            elif _is_loop_var_bound(bound):
+                loop_uppers.append(bound)
+            else:
+                crossvar_uppers.append(bound)
         else:
             extras.append(c)
+
+    natural_lower = to_affine(0)
+    natural_upper = to_affine(dim.size) if isinstance(dim, FullDim) else None
+
+    def _pick_lower():
+        if loop_lowers:
+            chosen = loop_lowers[0]
+            leftovers : list[SymbolicIndex] = []
+            for b in loop_lowers[1:] + constant_lowers + crossvar_lowers:
+                if b == natural_lower:
+                    continue
+                leftovers.append(b)
+            return chosen, leftovers
+        if constant_lowers:
+            return constant_lowers[0], constant_lowers[1:] + crossvar_lowers
+        if crossvar_lowers:
+            return crossvar_lowers[0], crossvar_lowers[1:]
+        return None, []
+
+    def _pick_upper():
+        if loop_uppers:
+            chosen = loop_uppers[0]
+            leftovers : list[SymbolicIndex] = []
+            for b in loop_uppers[1:] + constant_uppers + crossvar_uppers:
+                if natural_upper is not None and b == natural_upper:
+                    continue
+                leftovers.append(b)
+            return chosen, leftovers
+        if constant_uppers:
+            return constant_uppers[0], constant_uppers[1:] + crossvar_uppers
+        if crossvar_uppers:
+            return crossvar_uppers[0], crossvar_uppers[1:]
+        return None, []
+
+    start, leftover_lowers = _pick_lower()
+    end, leftover_uppers = _pick_upper()
+    for b in leftover_lowers:
+        extras.append(ge(index, b))
+    for b in leftover_uppers:
+        extras.append(lt(index, b))
+
     if start is None or end is None:
         return None
     interval = (_concretize(start), _concretize(end))
@@ -1648,7 +2037,18 @@ def normalize(expr : ExprType) -> NormalizedExpr:
 
 
 def verify_exprs_equivalent(x : ExprType, y : ExprType) -> bool:
-    return normalize(x) == normalize(y)
+    # Bound-subsumption uses the active `LoopScope`s and free dim
+    # natural ranges (from `g_dim_registry`) — both runtime context the
+    # cached `normalize` can't see. Apply post-normalize so a rolled
+    # causal flash that stops at `k = qctx_size/BN` (skipping nctx
+    # tiles past the diagonal) matches its full softmax-attention
+    # spec: `n <= q` subsumes both `n < BN*K` and `n < nctx_size`
+    # when `qctx_size ≤ min(BN*K, nctx_size)`, so both sides
+    # canonicalize to the same `{n ≥ 0, n <= q}`-only form.
+    return (
+        simplify_under_active_loop_scope(normalize(x))
+        == simplify_under_active_loop_scope(normalize(y))
+    )
 
 def verify_dims_equivalent(x : ShapeType, y : ShapeType) -> bool:
     if len(x) != len(y):

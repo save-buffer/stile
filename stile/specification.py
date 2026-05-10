@@ -3,38 +3,67 @@ from .type import _g_tensor_counter
 from .indexing import (
     AffineExpr, LoopVariable, Domain, to_affine,
     domain as _indexing_domain,
-    le, lt, ge, gt, eq, free_vars,
+    le, lt, ge, gt, eq, free_vars, and_domains,
 )
 
-def construct_softmax(child : ExprType, dim : Dim):
-    if False:
-        mx = Repeat(
-            dim=dim_full_dim(dim),
-            child=Reduce(
-                op="max",
-                dim=dim,
-                child=child,
+
+# Free loop variables visible to the affine-predicate parser. Set by
+# `parse_spec_into_type(..., loop_vars=...)` so a spec like
+# `sum[N where N < k](X)` can use `k` as a bound LoopVariable that
+# isn't in `g_dim_registry`. Restored after the parse.
+_g_extra_loop_vars : set[str] = set()
+
+def construct_softmax(
+    child : ExprType,
+    dim : Dim,
+    pred_domain : "Domain | None" = None,
+    body_st : "ShapeType | None" = None,
+):
+    """
+    `exp(X) / Σ_d exp(X)`. When `pred_domain` is given (i.e. `softmax[d
+    where P]`), the mask is applied **multiplicatively to `exp(X)`**, not
+    additively to `X`. The two are algebraically equivalent
+    (`exp(X+Cond(P,0,-inf)) = exp(X)·Cond(P,1,0)`) but the multiplicative
+    form folds cleanly into both numerator and denominator reduce
+    domains, so `softmax[d where P](X)·V → q dhead` canonicalizes to the
+    same form a hand-written `Σ exp(X)·V where P / Σ exp(X) where P`
+    would produce — and that's what a tiled flash-attention kernel ends
+    up computing after rescaling cancels.
+    """
+    exp = UnaryOp(op="exp", child=child)
+    masked_exp : ExprType = exp
+    if pred_domain is not None and body_st is not None:
+        for v in pred_domain.variables:
+            if (
+                v.name not in {dim_name(d) for d in body_st}
+                and v.name not in _g_extra_loop_vars
+            ):
+                raise ValueError(
+                    f"softmax[{dim_name(dim)} where ...] predicate "
+                    f"references dim {v.name!r} not in body shape "
+                    f"{sorted({dim_name(d) for d in body_st})}"
+                )
+        mask = Tensor(
+            dims=tuple(dim_full_dim(d) for d in body_st),
+            tag=TagCond(
+                domain=pred_domain,
+                if_true=Constant(1.0),
+                if_false=Constant(0.0),
             ),
+            name="_mask",
         )
-        centered = BinaryOp(
-            op="-",
-            lhs=child,
-            rhs=mx,
-        )
-    else:
-        centered = child
-    exp = UnaryOp(op="exp", child=centered)
+        masked_exp = BinaryOp(op="*", lhs=exp, rhs=mask)
     sum_exp = Repeat(
         dim=dim_full_dim(dim),
         child=Reduce(
             op="sum",
             dim=dim,
-            child=exp,
+            child=masked_exp,
         ),
     )
     return BinaryOp(
         op="/",
-        lhs=exp,
+        lhs=masked_exp,
         rhs=sum_exp,
     )
 
@@ -139,9 +168,47 @@ def _normalize_dts_for_binary_op(lhs : ShapeType, rhs : ShapeType) -> ShapeType:
         return rhs
     if rhs == tuple():
         return lhs
-    if lhs != rhs:
-        raise ValueError("Invalid spec: mismatching ShapeTypes for binary operation")
-    return lhs
+    if lhs == rhs:
+        return lhs
+    lhs_names = {dim_name(d) for d in lhs}
+    rhs_names = {dim_name(d) for d in rhs}
+    if lhs_names == rhs_names:
+        # Same dims, possibly different order — pick `lhs`'s order.
+        return lhs
+    # Generalized broadcast: output gets the union of dim names. Take
+    # `lhs`'s dims first (preserving order), then any rhs-only dims.
+    lhs_seen : set[str] = set()
+    out : list[Dim] = []
+    for d in lhs:
+        out.append(d)
+        lhs_seen.add(dim_name(d))
+    for d in rhs:
+        if dim_name(d) not in lhs_seen:
+            out.append(d)
+    return tuple(out)
+
+
+def _broadcast_to(et : ExprType, src_st : ShapeType, dst_st : ShapeType) -> ExprType:
+    """Wrap `et` in `Repeat`s so that it matches `dst_st`'s dims. `src_st`
+    must have a subset of `dst_st`'s dim names."""
+    src_names = {dim_name(d) for d in src_st}
+    for d in dst_st:
+        if dim_name(d) not in src_names:
+            et = Repeat(dim=dim_full_dim(d), child=et)
+    return et
+
+
+def _binary_op_with_broadcast(
+    op : str,
+    lhs_st : ShapeType, lhs_et : ExprType,
+    rhs_st : ShapeType, rhs_et : ExprType,
+) -> tuple[ShapeType, ExprType]:
+    out_st = _normalize_dts_for_binary_op(lhs_st, rhs_st)
+    if out_st != lhs_st and lhs_st != tuple():
+        lhs_et = _broadcast_to(lhs_et, lhs_st, out_st)
+    if out_st != rhs_st and rhs_st != tuple():
+        rhs_et = _broadcast_to(rhs_et, rhs_st, out_st)
+    return out_st, BinaryOp(op=op, lhs=lhs_et, rhs=rhs_et)  # ty: ignore
 
 def _parse_number(lex : LexState) -> tuple[ShapeType, ExprType]:
     lex.consume_whitespace()
@@ -303,10 +370,28 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
             lex.expect('(')
             st, et = _parse_paren_expr(lex)
             lex.expect(')')
-            if pred_domain is not None:
-                et = _apply_iteration_restriction(st, et, pred_domain, reduction)
-            reduce_st = tuple(d for d in st if dim_full_dim(d) != dim_full_dim(dim))
             reduce_dim = [d for d in st if dim_full_dim(d) == dim_full_dim(dim)][0]
+            if pred_domain is not None:
+                # When the predicate is a "pure iteration restriction" —
+                # a per-direction affine bound on the reduce dim whose
+                # other free variables don't appear in the body's shape
+                # — lower it as a `Sliced` reduce instead of a
+                # multiplicative mask. This skips the mask-fold round
+                # trip and produces a cleaner reduce domain that
+                # downstream tile-merge composes through. Mask form
+                # survives for cases where the predicate references
+                # body dims (causal flash).
+                slice_bounds = _try_lower_predicate_to_slice(
+                    pred_domain, dim, st,
+                )
+                if slice_bounds is not None:
+                    lo, hi = slice_bounds
+                    reduce_dim = Sliced(dim_full_dim(reduce_dim), lo, hi)
+                else:
+                    et = _apply_iteration_restriction(
+                        st, et, pred_domain, reduction,
+                    )
+            reduce_st = tuple(d for d in st if dim_full_dim(d) != dim_full_dim(dim))
             reduce_et = Reduce(
                 reduction, # ty: ignore
                 reduce_dim,
@@ -333,9 +418,7 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
         st, et = _parse_paren_expr(lex)
         lex.expect(')')
         if unary_op == "softmax":
-            if pred_domain is not None:
-                et = _apply_iteration_restriction(st, et, pred_domain, "softmax")
-            return st, construct_softmax(et, dim_annotation)
+            return st, construct_softmax(et, dim_annotation, pred_domain, st)
 
         return st, UnaryOp(
             op=unary_op, # ty: ignore
@@ -348,11 +431,8 @@ def _parse_term(lex : LexState) -> tuple[ShapeType, ExprType]:
     result_st, result_et = _parse_factor(lex)
     while op := lex.maybe_consume("*", "/"):
         rhs_st, rhs_et = _parse_factor(lex)
-        result_st = _normalize_dts_for_binary_op(result_st, rhs_st)
-        result_et = BinaryOp(
-            op=op, # ty: ignore
-            lhs=result_et,
-            rhs=rhs_et,
+        result_st, result_et = _binary_op_with_broadcast(
+            op, result_st, result_et, rhs_st, rhs_et,
         )
     return result_st, result_et
 
@@ -360,14 +440,30 @@ def _parse_expr(lex : LexState) -> tuple[ShapeType, ExprType]:
     result_st, result_et = _parse_term(lex)
     while not lex.startswith("->") and (op := lex.maybe_consume('+', '-')):
         rhs_st, rhs_et = _parse_term(lex)
-        result_st = _normalize_dts_for_binary_op(result_st, rhs_st)
-        result_et = BinaryOp(
-            op=op, # ty: ignore
-            lhs=result_et,
-            rhs=rhs_et,
+        result_st, result_et = _binary_op_with_broadcast(
+            op, result_st, result_et, rhs_st, rhs_et,
         )
-    
     return result_st, result_et
+
+def _parse_affine_identifier(lex : LexState) -> LoopVariable:
+    """
+    Read an identifier and return it as a `LoopVariable`. Looks up
+    `_g_extra_loop_vars` first (free invariant-style loop vars like
+    `k`), falling back to the dim registry — that way `nctx <= qctx`
+    still resolves dim names while a fori_loop invariant can mention
+    a non-dim `k`.
+    """
+    lex.consume_whitespace()
+    i = 0
+    while i < len(lex.spec) and (lex.spec[i].isalpha() or lex.spec[i].isdigit()):
+        i += 1
+    word = lex.spec[:i]
+    if word and word in _g_extra_loop_vars:
+        lex.spec = lex.spec[i:]
+        return LoopVariable(word)
+    d = _parse_dim_name(lex)
+    return LoopVariable(d.name)
+
 
 def _parse_affine_term(lex : LexState) -> AffineExpr:
     lex.consume_whitespace()
@@ -377,12 +473,12 @@ def _parse_affine_term(lex : LexState) -> AffineExpr:
     if nxt.isdigit():
         coef = _parse_integer(lex)
         if lex.maybe_consume('*'):
-            d = _parse_dim_name(lex)
-            return to_affine(LoopVariable(d.name)) * coef
+            v = _parse_affine_identifier(lex)
+            return to_affine(v) * coef
         return to_affine(coef)
     if nxt.isalpha():
-        d = _parse_dim_name(lex)
-        return to_affine(LoopVariable(d.name))
+        v = _parse_affine_identifier(lex)
+        return to_affine(v)
     raise ValueError(f"Expected integer or dim name in `where`-predicate, got {nxt!r}")
 
 
@@ -410,7 +506,7 @@ def _parse_affine(lex : LexState) -> AffineExpr:
     return result
 
 
-def _parse_predicate(lex : LexState) -> Domain:
+def _parse_atomic_predicate(lex : LexState) -> Domain:
     lhs = _parse_affine(lex)
     relop = lex.maybe_consume("<=", ">=", "==", "<", ">")
     if relop is None:
@@ -432,6 +528,19 @@ def _parse_predicate(lex : LexState) -> Domain:
     return _indexing_domain(variables, constraints)
 
 
+def _parse_predicate(lex : LexState) -> Domain:
+    """
+    A `where`-clause predicate, optionally a conjunction joined by `&&`
+    (or `and`). The result is a single-disjunct `Domain` whose conjunct
+    is the AND of every atomic comparison.
+    """
+    domain = _parse_atomic_predicate(lex)
+    while lex.maybe_consume("&&", "and"):
+        rhs = _parse_atomic_predicate(lex)
+        domain = and_domains(domain, rhs)
+    return domain
+
+
 def _apply_where_mask(
     result_st : ShapeType,
     result_et : ExprType,
@@ -439,7 +548,7 @@ def _apply_where_mask(
 ) -> ExprType:
     dim_names_in_shape = {dim_name(d) for d in result_st}
     for v in pred_domain.variables:
-        if v.name not in dim_names_in_shape:
+        if v.name not in dim_names_in_shape and v.name not in _g_extra_loop_vars:
             raise ValueError(
                 f"`where`-clause references dim {v.name!r} which is not "
                 f"present in the expression's shape {sorted(dim_names_in_shape)}"
@@ -455,6 +564,64 @@ def _apply_where_mask(
         name="_mask",
     )
     return BinaryOp(op="*", lhs=result_et, rhs=mask)
+
+
+def _try_lower_predicate_to_slice(
+    pred_domain : Domain,
+    dim : Dim,
+    body_st : ShapeType,
+) -> tuple[SymbolicIndex, SymbolicIndex] | None:
+    """
+    If `pred_domain` is a "pure iteration restriction" on `dim`, return
+    `(lower, upper)` slice bounds; else None (caller falls back to the
+    multiplicative-mask form).
+
+    Pure iteration restriction means:
+      - Single-conjunct predicate.
+      - Each constraint is a per-direction affine bound on the reduce
+        dim (`coeff = ±1` on the reduce var, no other vars with that
+        dim, simple lower-or-upper).
+      - The bound's residue can reference free variables, but those
+        variables must NOT also appear in `body_st`'s dim names. Body
+        dims would mean the bound varies with the body's iteration
+        domain — a true mask, not a slice.
+      - At most one bound per direction. Multiple bounds would require
+        a symbolic `min`/`max` to pick the tightest, which we don't
+        try to construct.
+    """
+    reduce_var_name = dim_name(dim)
+    reduce_var = LoopVariable(reduce_var_name)
+    body_dim_names = {dim_name(d) for d in body_st}
+    body_dim_names_excl_reduce = body_dim_names - {reduce_var_name}
+    for v in pred_domain.variables:
+        if v.name in body_dim_names_excl_reduce:
+            return None
+    if len(pred_domain.disjuncts) != 1:
+        return None
+    conj = next(iter(pred_domain.disjuncts))
+
+    lower_bounds : list[SymbolicIndex] = []
+    upper_excl_bounds : list[SymbolicIndex] = []
+    for c in conj:
+        aff = c.expr
+        var_coeff = 0
+        for v, co in aff.terms:
+            if v == reduce_var:
+                var_coeff = co
+        if var_coeff not in (1, -1):
+            return None
+        if var_coeff == 1:
+            residue = aff - to_affine(reduce_var)
+            lower_bounds.append(-residue)
+        else:
+            residue = aff + to_affine(reduce_var)
+            upper_excl_bounds.append(residue + to_affine(1))
+    if len(lower_bounds) > 1 or len(upper_excl_bounds) > 1:
+        return None
+
+    lower = lower_bounds[0] if lower_bounds else dim_start(dim)
+    upper = upper_excl_bounds[0] if upper_excl_bounds else dim_end(dim)
+    return (lower, upper)
 
 
 def _apply_iteration_restriction(
@@ -474,7 +641,7 @@ def _apply_iteration_restriction(
     """
     dim_names_in_shape = {dim_name(d) for d in body_st}
     for v in pred_domain.variables:
-        if v.name not in dim_names_in_shape:
+        if v.name not in dim_names_in_shape and v.name not in _g_extra_loop_vars:
             raise ValueError(
                 f"`{op}[d where P]` predicate references dim {v.name!r} "
                 f"not in the body's shape {sorted(dim_names_in_shape)}"
@@ -512,8 +679,17 @@ def _parse_spec(lex : LexState) -> tuple[ShapeType, ExprType]:
         result_et = _apply_where_mask(result_st, result_et, pred_domain)
     return result_st, result_et
 
-def parse_spec_into_type(spec : str) -> Type:
+def parse_spec_into_type(
+    spec : str,
+    *,
+    loop_vars : set[str] | None = None,
+) -> Type:
     """
+    `loop_vars` lists identifier names that should be treated as free
+    `LoopVariable`s during this parse — typically a fori_loop's index
+    variable (`{"k"}`). Without this, those names would fall through
+    to the dim registry and error.
+
     Grammar:
     Spec      -> Expr ('where' Predicate)*
     Predicate -> Affine RELOP Affine
@@ -549,11 +725,15 @@ def parse_spec_into_type(spec : str) -> Type:
     # parses with auto-names starting from `_tensor_1`. The kernel side
     # also starts at 1 after `reset_stile`, so spec-leaf names align
     # with kernel-leaf names by construction order.
-    saved = _g_tensor_counter[0]
+    global _g_extra_loop_vars
+    saved_counter = _g_tensor_counter[0]
     _g_tensor_counter[0] = 0
+    saved_loop_vars = _g_extra_loop_vars
+    _g_extra_loop_vars = saved_loop_vars | (loop_vars or set())
     try:
         lex = LexState(spec)
         st, et = _parse_spec(lex)
         return Type(st, et)
     finally:
-        _g_tensor_counter[0] = saved
+        _g_tensor_counter[0] = saved_counter
+        _g_extra_loop_vars = saved_loop_vars

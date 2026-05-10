@@ -11,7 +11,12 @@ import math
 import stile.type as t
 from ..type import *
 from ..specification import parse_spec_into_type, _parse_predicate, LexState
-from ..verification import verify_types_equivalent, verify_exprs_equivalent
+from ..verification import (
+    verify_types_equivalent, verify_exprs_equivalent,
+    normalize as _normalize, _substitute_lv_in_expr,
+    simplify_under_active_loop_scope as _simplify_under_loop_scope,
+    substitute_loop_var_in_et,
+)
 from ..indexing import evaluate as _eval_index, free_vars as _free_vars, to_affine, LoopVariable
 from .. import LoopScope, _active_loop_scopes
 
@@ -282,7 +287,13 @@ def mask(
         ),
         name="_mask",
     )
-    arr = _build_predicate_array(pred_domain, shape, in_value, out_value)
+    # Inside a symbolic loop-invariant trace the slice offsets reference
+    # an unbound `LoopVariable`; we still need the *type* to flow through
+    # the kernel for verification, but no actual array is materialized.
+    try:
+        arr = _build_predicate_array(pred_domain, shape, in_value, out_value)
+    except ValueError:
+        arr = None
     return TypedJaxArray(arr, Type(shape, mask_et, None))
 
 
@@ -374,29 +385,31 @@ def einsum(x : TypedJaxArray, y : TypedJaxArray, einstr : str) -> TypedJaxArray:
     return TypedJaxArray(einops.einsum(x.arr, y.arr, einstr), new_type)
 
 
-def fori_loop(lower, upper, body_fn, init_val):
+def fori_loop(lower, upper, body_fn, init_val, *, invariant=None):
     """
-    Verification-mode analogue of `jax.lax.fori_loop`. Two paths depending
-    on whether the loop count is known at tracing time:
+    Verification-mode analogue of `jax.lax.fori_loop`. Three paths:
 
-    - **Concrete `lower`/`upper`**: fold `body_fn` over `range(lower, upper)`
-      with concrete integer indices, producing the actual final carry as if
-      the loop had been manually unrolled. The normalizer then canonicalizes
-      the resulting expression; for online-softmax-style bodies it collapses
-      into a closed form that matches the full-sequence spec. Verification
-      cost scales O(N) with the trip count.
+    - **Concrete `lower`/`upper`** (no invariant): fold `body_fn` over
+      `range(lower, upper)` with concrete integer indices.
 
-    - **Symbolic `upper`**: run `body_fn` once with a symbolic `LoopVariable`
-      bound to the iteration index, and wrap the result as a
-      `ParametricReduce` — the rolled-loop reduction primitive. This path
-      currently supports only sum accumulators (`body(i, s) = s + f(i)`),
-      and relies on the normalizer to recognize the pattern via
-      `first_iter - init_val = f(i)`. Verification cost is invariant to the
-      trip count.
+    - **Symbolic `upper`, no invariant**: detect sum (`init=0`) or max
+      (`init=-inf`) accumulators and emit a `ParametricReduce`.
 
-    Signature mirrors `jax.lax.fori_loop(lower, upper, body_fn, init_val)`;
-    same user code lowers to real `jax.lax.fori_loop` at runtime.
+    - **Symbolic `upper` with invariant** (Hoare-style): the user
+      declares what the loop's state should *be* at iteration `k` as
+      a stile spec string referencing the free LoopVariable `k`. For
+      tuple state, pass a tuple of strings matching the state shape.
+      Verifier discharges base case (`init_val == invariant[k=0]`)
+      and inductive step (`body(k, invariant[k]) == invariant[k+1]`);
+      returns a typed value with `et = invariant[k=upper]`. Cost is
+      invariant to the trip count.
+
+    Signature mirrors `jax.lax.fori_loop`; same user code lowers to
+    real `jax.lax.fori_loop` at runtime.
     """
+    if invariant is not None:
+        return _fori_loop_with_invariant(lower, upper, body_fn, init_val, invariant)
+
     lower_i, upper_i = as_int(lower), as_int(upper)
     if lower_i is not None and upper_i is not None:
         carry = init_val
@@ -431,6 +444,103 @@ def fori_loop(lower, upper, body_fn, init_val):
         # after normalization — the outer max(-inf, …) collapses away when
         # `first_iter` is normalized inside the ParametricReduce.
         return _wrap_parametric_reduce(k, lower, upper, "max", first_iter)
+
+
+def _fori_loop_with_invariant(lower, upper, body_fn, init_val, invariant):
+    """
+    Hoare-style verified fori_loop. `invariant` is either a single spec
+    string (scalar state) or a list/tuple of spec strings matching
+    `init_val`'s structure. Discharges base case and inductive step;
+    returns a typed value (or tuple) with `et = invariant[k=upper]`.
+    """
+    is_tuple_state = isinstance(invariant, (tuple, list))
+    inv_strs = list(invariant) if is_tuple_state else [invariant]
+    state_leaves = list(init_val) if is_tuple_state else [init_val]
+    if len(inv_strs) != len(state_leaves):
+        raise ValueError(
+            f"`invariant` has {len(inv_strs)} elements but init_val has "
+            f"{len(state_leaves)}; they must match."
+        )
+
+    inv_types = [
+        parse_spec_into_type(s, loop_vars={"k"}) for s in inv_strs
+    ]
+    k_var = LoopVariable("k")
+
+    # 1. Base case: init_val == invariant[k=0].
+    for inv_t, init_leaf in zip(inv_types, state_leaves):
+        inv_at_0 = _substitute_lv_in_expr(_normalize(inv_t.et), k_var, 0)
+        init_norm = _normalize_state_leaf(init_leaf)
+        if init_norm != inv_at_0:
+            raise AssertionError(
+                f"Loop invariant base case failed: init_val ({init_leaf}) "
+                f"does not normalize to invariant[k=0]."
+            )
+
+    # 2. Inductive step: build a typed state from each invariant evaluated
+    # at symbolic `k`, run the body, check result == invariant[k+1].
+    # LoopScope's name doubles as its `LoopVariable`'s identity — keep it
+    # `"k"` so the verifier's `active_loop_vars()` agrees with the
+    # `LoopVariable("k")` that's free in the parsed invariants.
+    with LoopScope("k", lower, upper):
+        symbolic_state_leaves = [
+            TypedJaxArray(None, inv_t) for inv_t in inv_types
+        ]
+        symbolic_state = (
+            tuple(symbolic_state_leaves) if is_tuple_state
+            else symbolic_state_leaves[0]
+        )
+        next_state = body_fn(k_var, symbolic_state)
+        next_leaves = list(next_state) if is_tuple_state else [next_state]
+        if len(next_leaves) != len(inv_types):
+            raise AssertionError(
+                "Loop body returned a state with a different shape than "
+                "the invariant."
+            )
+        for idx, (inv_t, next_leaf) in enumerate(zip(inv_types, next_leaves)):
+            inv_at_kplus1 = _simplify_under_loop_scope(_substitute_lv_in_expr(
+                _normalize(inv_t.et), k_var, to_affine(k_var) + 1,
+            ))
+            if not isinstance(next_leaf, TypedJaxArray):
+                raise TypeError(
+                    f"Loop body must return TypedJaxArrays for invariant "
+                    f"verification; got {type(next_leaf).__name__}."
+                )
+            next_norm = _simplify_under_loop_scope(_normalize(next_leaf.type.et))
+            if next_norm != inv_at_kplus1:
+                raise AssertionError(
+                    f"Loop invariant inductive step failed at state index {idx}: "
+                    "body(k, invariant[k]) does not normalize to "
+                    "invariant[k+1]."
+                )
+
+    # 3. Return value is invariant evaluated at k = upper, materialized
+    # at the ExprType level so downstream tjax ops can compose normally.
+    final_leaves = []
+    for inv_t in inv_types:
+        et_at_upper = substitute_loop_var_in_et(inv_t.et, k_var, upper)
+        final_leaves.append(
+            TypedJaxArray(None, Type(inv_t.st, et_at_upper, inv_t.dt))
+        )
+    return tuple(final_leaves) if is_tuple_state else final_leaves[0]
+
+
+def _normalize_state_leaf(leaf):
+    """Normalize a state-leaf value (Python scalar, jax.Array, or
+    TypedJaxArray) for comparison against an invariant at k=0."""
+    if isinstance(leaf, TypedJaxArray):
+        return _normalize(leaf.type.et)
+    if isinstance(leaf, (int, float)):
+        return _normalize(t.Constant(float(leaf)))
+    if isinstance(leaf, jax.Array) and leaf.ndim == 0:
+        try:
+            return _normalize(t.Constant(float(leaf.item())))
+        except Exception:
+            pass
+    raise TypeError(
+        f"Cannot normalize state leaf of type {type(leaf).__name__} for "
+        f"invariant base-case verification."
+    )
 
 
 def _init_scalar(init_val):
@@ -583,6 +693,6 @@ def zeros(shape : tuple[FullDim, ...]) -> TypedJaxArray:
     arr = jnp.zeros(jax_shape)
     type = Type(
         st=shape,
-        et=0.0,
+        et=t.Constant(0.0),
     )
     return TypedJaxArray(arr, type)

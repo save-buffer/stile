@@ -119,9 +119,13 @@ def test_scalar_multiply_wrong_factor_rejected_gpu(reset, gpu_compiler_params):
 # primitives. Each test references the specific lowering gap.
 
 @pytest.mark.xfail(
-    reason="Pallas Mosaic-GPU `Lane` lowering doesn't implement "
-    "`dot_general`. Tracked upstream in jax-ml/jax. When it lands, "
-    "remove this marker.",
+    reason="Pallas-GPU's `dot_general` lowering isn't implemented for "
+    "either `Lane` or `Warpgroup` lowering semantics. The supported "
+    "GPU matmul path is the explicit `plgpu.wgmma` (Hopper) / "
+    "`plgpu.tcgen05_mma` (Blackwell) intrinsics with appropriate "
+    "tile/swizzle transforms — see `jax.experimental.pallas.ops.gpu."
+    "blackwell_matmul_mgpu`. Wrapping that with stile typing is a real "
+    "next step; this test pins down the trivial `tjax.einsum` path.",
 )
 def test_matmul_gpu(reset, gpu_compiler_params):
     M, N, K = dim("M", 128), dim("N", 128), dim("K", 128)

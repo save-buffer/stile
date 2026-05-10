@@ -322,10 +322,21 @@ def interval_domain(
     per interval, each expressing `start <= var < end`. The union represents
     the set of positions covered by *any* of the intervals.
     """
+    intervals = list(intervals)
     disjuncts = frozenset(
         _conjunction({ge(var, s), lt(var, e)}) for s, e in intervals
     )
-    return Domain(frozenset({var}), disjuncts)
+    # Include any free LoopVariables that flow in via symbolic interval
+    # bounds — `Domain.variables` must mention every variable referenced
+    # by any constraint, otherwise two domains with the same constraints
+    # but different `variables` sets compare unequal.
+    free_vars = frozenset(
+        v
+        for (s, e) in intervals
+        for x in (s, e)
+        for (v, _) in to_affine(x).terms
+    )
+    return Domain(frozenset({var}) | free_vars, disjuncts)
 
 
 # ---- Analysis -------------------------------------------------------------
@@ -388,3 +399,67 @@ def domain_contains(domain : Domain, bindings : dict[LoopVariable, int]) -> bool
         all(constraint_holds(c, bindings) for c in conjunction)
         for conjunction in domain.disjuncts
     )
+
+
+# --- Rolled loops ---------------------------------------------------------
+
+_active_loop_scopes : list["LoopScope"] = []
+
+
+class LoopScope:
+    """
+    Context manager for a rolled loop. Enters the `with` block once with a
+    symbolic `LoopVariable` bound to its iteration range; the body traces a
+    single parametric instance, and the verifier proves the result holds for
+    every integer value of the loop variable in `[start, end)`.
+    """
+
+    def __init__(self, name : str, start : SymbolicIndex, end : SymbolicIndex):
+        self.var = LoopVariable(name)
+        self.lo = start
+        self.hi = end
+        self.domain = range_domain(self.var, start, end)
+
+    def __enter__(self) -> LoopVariable:
+        _active_loop_scopes.append(self)
+        return self.var
+
+    def __exit__(self, *_exc):
+        popped = _active_loop_scopes.pop()
+        assert popped is self
+
+
+def loop(name : str, start : SymbolicIndex, end : SymbolicIndex) -> LoopScope:
+    """
+    Create a rolled-loop scope. Use as `with stile.loop("i", 0, N) as i: ...`.
+    Inside the block, `i` is a symbolic `LoopVariable` that can participate
+    in affine arithmetic (e.g., `i * tile_size`, `i + 1`) to parameterize
+    slice bounds and iteration structure.
+    """
+    return LoopScope(name, start, end)
+
+
+def active_loop_domain() -> Domain | None:
+    """
+    The intersection of all currently-active `LoopScope` domains, or `None`
+    if no loop is active. Used by the verifier to know what iteration domain
+    a traced expression is parametric over.
+    """
+    if not _active_loop_scopes:
+        return None
+    variables : set[LoopVariable] = set()
+    constraints : set = set()
+    for scope in _active_loop_scopes:
+        variables |= scope.domain.variables
+        constraints |= scope.domain.constraints
+    return Domain(frozenset(variables), frozenset(constraints))
+
+
+def active_loop_vars() -> frozenset[LoopVariable]:
+    """
+    The set of `LoopVariable`s bound by all currently-active `LoopScope`s.
+    Used by the verifier to distinguish symbolic bounds that represent
+    loop iteration restrictions (which should sit in a reduce's interval
+    bound) from cross-variable predicates (which should sit in extras).
+    """
+    return frozenset(s.var for s in _active_loop_scopes)
