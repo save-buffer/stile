@@ -6,6 +6,7 @@ from .type import *
 from .indexing import (
     Domain, AffineConstraint, interval_domain, ge, lt, and_domains,
     simplify_domain, active_loop_vars, _active_loop_scopes,
+    runtime_scalar_max,
 )
 from .frozen_counter import FrozenCounter
 
@@ -152,6 +153,29 @@ class NormalizedParametricReduce:
         if cached is not None:
             return cached
         h = hash((self.loop_var, self.lo, self.hi, self.op, self.body))
+        object.__setattr__(self, '_h', h)
+        return h
+
+
+@dataclass(frozen=True)
+class NormalizedGather:
+    """
+    `source.gather(dim_in_source, idx)` in normalized form. Treated
+    opaquely: two `NormalizedGather`s with equal `source`,
+    `dim_in_source`, and `idx` are structurally equal; the verifier
+    doesn't introspect `idx`'s values. Acts like a `NormalizedTensor`
+    in factor lists — a leaf for the purposes of normalization and
+    dim-variance partitioning.
+    """
+    source : "NormalizedExpr"
+    dim_in_source : FullDim
+    idx : "NormalizedExpr"
+
+    def __hash__(self) -> int:
+        cached = getattr(self, '_h', None)
+        if cached is not None:
+            return cached
+        h = hash((self.source, self.dim_in_source, self.idx))
         object.__setattr__(self, '_h', h)
         return h
 
@@ -626,6 +650,22 @@ def _substitute_lv_in_factor_to_expr(
                 identity = 0.0 if op == "sum" else float("-inf")
                 return NormalizedExpr.of(NormalizedProduct(const=identity))
             new_child = _substitute_lv_in_expr(child, loop_var, value)
+            # Inner reduce-of-identity collapses through: `sum_d 0 = 0`
+            # and `max_d -inf = -inf`. Without this, a nested empty
+            # reduce (whose substitution returned a const-identity
+            # `NormalizedExpr`) leaves the outer reduce wrapping that
+            # constant — structurally distinct from a bare `0` even
+            # though they're algebraically equal.
+            if (
+                not new_child.num.factors
+                and not new_child.den.factors
+                and new_child.den.const == 1.0
+            ):
+                c = new_child.num.const
+                if (op == "sum" and c == 0.0) or (
+                    op == "max" and c == float("-inf")
+                ):
+                    return new_child
             return NormalizedExpr.of(
                 NormalizedReduce(dim, op, new_domain, new_child)
             )
@@ -692,6 +732,12 @@ def _substitute_lv_in_factor(
                 return NormalizedParametricReduce(inner_var, new_lo, new_hi, op, body)
             new_body = _substitute_lv_in_expr(body, loop_var, value)
             return NormalizedParametricReduce(inner_var, new_lo, new_hi, op, new_body)
+        case NormalizedGather(source, dim_in_source, idx):
+            return NormalizedGather(
+                source=_substitute_lv_in_expr(source, loop_var, value),
+                dim_in_source=dim_in_source,
+                idx=_substitute_lv_in_expr(idx, loop_var, value),
+            )
 
 def _as_single_factor(product : "NormalizedProduct") -> "NormalizedFactor | None":
     """If `product` is exactly one factor with multiplicity one and const=1, return it."""
@@ -766,9 +812,13 @@ def _max_in_loop_scope(expr : SymbolicIndex) -> int | None:
             hi_int = as_int(scope.hi)
         else:
             registered = g_dim_registry.get(v.name)
-            if registered is None:
-                return None
-            lo_int, hi_int = 0, registered.size
+            if registered is not None:
+                lo_int, hi_int = 0, registered.size
+            else:
+                rs_max = runtime_scalar_max(v.name)
+                if rs_max is None:
+                    return None
+                lo_int, hi_int = 0, rs_max
         if lo_int is None or hi_int is None:
             return None
         # max at `hi - 1` if c > 0, else at `lo`.
@@ -1014,6 +1064,53 @@ def _split_reduce_domain(
     return frozenset({interval}), frozenset(extras)
 
 
+def _pull_common_outer_reduce(
+    terms : list["NormalizedProduct"],
+) -> list["NormalizedProduct"]:
+    """
+    Sum-linearity for reduces: `Reduce(d, A) + Reduce(d, B) = Reduce(d, A + B)`.
+    When two terms in a sum are bare sum-Reduces over the same dim and
+    domain but with different children, pull the outer Reduce out so
+    the children can subsequently tile-merge inside it via
+    `_merge_sum_reduces`. This unlocks the multi-dim tile-walk pattern
+    `sum_D(sum_n_tile_a(X)) + sum_D(sum_n_tile_b(X))` → `sum_D(sum_n_full(X))`,
+    which doesn't reach `_merge_sum_reduces` directly because the outer
+    `D`-reduce hides the inner tile structure from grouping by child.
+    Only fires for `const == 1.0`, single-factor terms — multi-factor
+    products would require shared "other factors" we don't try to
+    intersect here.
+    """
+    groups : dict[tuple, list["NormalizedExpr"]] = {}
+    others : list[NormalizedProduct] = []
+    for t in terms:
+        if t.const != 1.0 or len(t.factors) != 1:
+            others.append(t)
+            continue
+        single = _as_single_factor(
+            NormalizedProduct(const=1.0, factors=t.factors),
+        )
+        if isinstance(single, NormalizedReduce) and single.op == "sum":
+            key = (single.dim, single.op, single.domain)
+            groups.setdefault(key, []).append(single.child)
+            continue
+        others.append(t)
+
+    pulled : list[NormalizedProduct] = []
+    for (dim, op, domain), children in groups.items():
+        if len(children) == 1:
+            r = NormalizedReduce(dim, op, domain, children[0])
+        else:
+            combined = children[0]
+            for c in children[1:]:
+                combined = add(combined, c)
+            r = NormalizedReduce(dim, op, domain, combined)
+        pulled.append(NormalizedProduct(
+            const=1.0,
+            factors=FrozenCounter.from_iterable([r]),
+        ))
+    return others + pulled
+
+
 def _merge_sum_reduces(terms : list["NormalizedProduct"]) -> list["NormalizedProduct"]:
     """
     Combine `const * sum-Reduce(...)` terms that share const, dim, child,
@@ -1241,6 +1338,7 @@ def make_sum(terms) -> "NormalizedProduct":
         if t.const == float("-inf") and not t.factors:
             return NormalizedProduct(const=float("-inf"))
 
+    flat = _pull_common_outer_reduce(flat)
     flat = _merge_sum_reduces(flat)
     flat = _absorb_sum_boundaries(flat)
 
@@ -1276,7 +1374,7 @@ def make_sum(terms) -> "NormalizedProduct":
         ]),
     )
 
-NormalizedFactor = NormalizedTensor | NormalizedExp | NormalizedUnaryOp | NormalizedSum | NormalizedMax | NormalizedRepeat | NormalizedReduce | NormalizedParametricReduce
+NormalizedFactor = NormalizedTensor | NormalizedExp | NormalizedUnaryOp | NormalizedSum | NormalizedMax | NormalizedRepeat | NormalizedReduce | NormalizedParametricReduce | NormalizedGather
 # NormalizedTagTree is defined after NormalizedExpr is declared (below).
 
 @dataclass(frozen=True)
@@ -1796,6 +1894,16 @@ def varies_with_dim(e : NormalizedFactor | NormalizedProduct | NormalizedExpr, d
             if d == dim:
                 return False
             return varies_with_dim(child, dim)
+        case NormalizedGather(source, dim_in_source, idx):
+            # The source's `dim_in_source` is *replaced* in the output —
+            # the gather no longer varies along it (varies along `idx`'s
+            # dims instead). Any other dim of source flows through;
+            # `idx`'s own dims contribute.
+            if dim == dim_in_source:
+                return False
+            return varies_with_dim(source, dim) or varies_with_dim(idx, dim)
+        case NormalizedParametricReduce(_, _, _, _, body):
+            return varies_with_dim(body, dim)
         case NormalizedProduct(_, factors):
             return any(varies_with_dim(f, dim) for f in factors)
         case NormalizedExpr(num, den):
@@ -1866,6 +1974,14 @@ def strip_repeats_from_factor(factor : NormalizedFactor, dim : FullDim) -> Norma
             return NormalizedExpr.of(
                 make_reduce(d, op, domain, strip_repeats_from_expr(child, dim))
             )
+        case NormalizedGather(source, dim_in_source, idx):
+            return NormalizedExpr.of(NormalizedGather(
+                source=strip_repeats_from_expr(source, dim),
+                dim_in_source=dim_in_source,
+                idx=strip_repeats_from_expr(idx, dim),
+            ))
+        case NormalizedParametricReduce(_, _, _, _, _):
+            return NormalizedExpr.of(factor)
 
 def _strip_product_keeping_product(product : NormalizedProduct, dim : FullDim) -> NormalizedProduct:
     """Shallow strip that preserves the NormalizedProduct type. Used for sum-children,
@@ -1981,6 +2097,12 @@ def reduce(dim : FullDim, op : ReduceOpType, interval : tuple[SymbolicIndex, Sym
     else:
         final_domain = base_domain
 
+    if isinstance(final_domain, Domain) and _domain_is_empty(final_domain):
+        # Empty iteration range: sum-reduce → 0 (annihilates), max-reduce
+        # → -inf (identity). Skip the wrap so a `sum[d in ∅]` doesn't
+        # survive as a structurally non-zero NormalizedReduce.
+        identity = 0.0 if op == "sum" else float("-inf")
+        return NormalizedExpr.of(NormalizedProduct(const=identity))
     reduction = make_reduce(
         dim=dim_full_dim(dim),
         op=op,
@@ -2034,6 +2156,12 @@ def normalize(expr : ExprType) -> NormalizedExpr:
             )
         case ParametricReduce(loop_var, lo, hi, op, body):
             return make_parametric_reduce(loop_var, lo, hi, op, normalize(body))
+        case Gather(source, dim_in_source, idx):
+            return NormalizedExpr.of(NormalizedGather(
+                source=normalize(source),
+                dim_in_source=dim_in_source,
+                idx=normalize(idx),
+            ))
 
 
 def verify_exprs_equivalent(x : ExprType, y : ExprType) -> bool:

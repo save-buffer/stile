@@ -10,6 +10,7 @@ from ._core import (
     zeros,
     fori_loop,
     mask,
+    runtime_index,
 )
 
 from . import random

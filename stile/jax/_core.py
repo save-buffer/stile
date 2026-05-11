@@ -144,6 +144,19 @@ class TypedJaxArray:
     def max(self, dim : Dim) -> "TypedJaxArray":
         return self.reduce("max", dim)
 
+    def gather(self, dim : FullDim, idx : "TypedJaxArray") -> "TypedJaxArray":
+        """
+        Index into `self` along `dim` using runtime integer tensor
+        `idx`. Output shape replaces `dim` with `idx`'s sole dim.
+        """
+        new_type = self.type.gather(dim, idx.type)
+        if self.arr is None or idx.arr is None:
+            return TypedJaxArray(None, new_type)
+        axis = next(
+            i for i, d in enumerate(self.type.st) if dim_name(d) == dim_name(dim)
+        )
+        return TypedJaxArray(jnp.take(self.arr, idx.arr, axis=axis), new_type)
+
     def __add__(self, other) -> "TypedJaxArray":
         return _binary_op_helper(self, other, "+")
 
@@ -462,8 +475,20 @@ def _fori_loop_with_invariant(lower, upper, body_fn, init_val, invariant):
             f"{len(state_leaves)}; they must match."
         )
 
+    # Each entry is either a spec string (parsed with `k` plus any
+    # free `LoopVariable`s in the loop bounds as free vars) or a
+    # pre-built `Type` whose `et` already references those vars
+    # directly. Pre-built types let invariants incorporate `Gather`
+    # and other ExprTypes the surface spec language doesn't have
+    # syntax for yet. Extracting free vars from `lower`/`upper` lets
+    # the loop range itself be symbolic — e.g. a runtime
+    # `n_used_pages` for paged-decode early-exit.
+    bound_free_vars = (_free_vars(lower) | _free_vars(upper))
+    loop_vars_for_spec = {"k"} | {v.name for v in bound_free_vars}
     inv_types = [
-        parse_spec_into_type(s, loop_vars={"k"}) for s in inv_strs
+        s if isinstance(s, Type)
+        else parse_spec_into_type(s, loop_vars=loop_vars_for_spec)
+        for s in inv_strs
     ]
     k_var = LoopVariable("k")
 
@@ -695,4 +720,30 @@ def zeros(shape : tuple[FullDim, ...]) -> TypedJaxArray:
         st=shape,
         et=t.Constant(0.0),
     )
+    return TypedJaxArray(arr, type)
+
+
+def runtime_index(
+    name : str,
+    dim : FullDim,
+    *,
+    values_in : FullDim | None = None,
+    arr : "jnp.ndarray | None" = None,
+) -> TypedJaxArray:
+    """
+    A 1-d integer-valued tensor named `name`, of shape `(dim,)`, used
+    as a runtime index into another tensor's `values_in` dim via
+    `source.gather(values_in, idx)`. `values_in` is recorded for
+    documentation / future property-aware simplifications but isn't
+    enforced — the verifier treats the gather opaquely. If `arr` is
+    omitted, a default identity-like array is generated; supply a real
+    `arr` for runtime correctness.
+    """
+    type = Type(
+        st=(dim,),
+        et=t.Tensor(dims=(dim,), name=name),
+    )
+    if arr is None:
+        size = as_int(dim_size(dim))
+        arr = jnp.arange(size) if size is not None else None
     return TypedJaxArray(arr, type)

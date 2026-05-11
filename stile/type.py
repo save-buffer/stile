@@ -232,7 +232,32 @@ class ParametricReduce:
     op : ReduceOpType
     body : "ExprType"
 
-ExprType = Constant | Tensor | UnaryOp | BinaryOp | Repeat | Reduce | ParametricReduce
+
+@dataclass(frozen=True)
+class Gather:
+    """
+    `source.gather(dim_in_source, idx)`: read `source` at positions
+    given by 1-d integer tensor `idx`. The output shape replaces
+    `dim_in_source` with `idx`'s sole dim. Opaque to the verifier: two
+    `Gather`s with the same `source`, `dim_in_source`, and `idx` are
+    equal; otherwise structurally distinct.
+
+    The slice info for a kernel that processes the gathered tensor
+    tile-by-tile lives in the *enclosing* `Reduce`/`Repeat`'s `Sliced`
+    dim, not in this node — so `K_pool.gather(idx).slice(M, lo, hi)`
+    and `K_pool.gather(idx.slice(M, lo, hi))` produce the same
+    `Gather` ExprType (their slice info ends up identically in the
+    output type's shape, propagating through any subsequent reduce or
+    binary op).
+    """
+    source : "ExprType"
+    dim_in_source : FullDim
+    idx : "ExprType"
+
+ExprType = (
+    Constant | Tensor | UnaryOp | BinaryOp | Repeat
+    | Reduce | ParametricReduce | Gather
+)
 
 TagTree = ExprType | TagCond
 
@@ -335,6 +360,33 @@ class Type:
 
     def max(self, dim : Dim) -> "Type":
         return self.reduce("max", dim)
+
+    def gather(self, dim : FullDim, idx : "Type") -> "Type":
+        """
+        `self.gather(dim, idx)`: replace `dim` in `self`'s shape with
+        `idx`'s sole dim. `idx` is a single-dim integer-valued tensor;
+        values are interpreted as positions along `dim`. If `idx`'s
+        shape carries a `Sliced` wrapper, that wrapping survives into
+        the output's shape (so a tile-walked kernel can slice the idx
+        per-iteration and the surrounding `Reduce` picks up the
+        slice's bounds).
+        """
+        if len(idx.st) != 1:
+            raise ValueError(
+                f"gather expects a 1-d index tensor; got shape={idx.st}"
+            )
+        idx_dim = idx.st[0]
+        new_st = tuple(idx_dim if dim_name(d) == dim_name(dim) else d for d in self.st)
+        if not any(dim_name(d) == dim_name(dim) for d in self.st):
+            raise ValueError(
+                f"gather dim {dim_name(dim)!r} not in shape "
+                f"{[dim_name(d) for d in self.st]}"
+            )
+        return Type(
+            new_st,
+            Gather(source=self.et, dim_in_source=dim_full_dim(dim), idx=idx.et),
+            self.dt,
+        )
 
     def __add__(self, other) -> "Type":
         return type_from_binary_op(self, other, "+")

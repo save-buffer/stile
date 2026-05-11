@@ -229,10 +229,20 @@ def _parse_integer(lex : LexState) -> int:
     lex.spec = lex.spec[i:]
     return result
 
+def _is_ident_start(c : str) -> bool:
+    return c.isalpha() or c == "_"
+
+
+def _is_ident_cont(c : str) -> bool:
+    return c.isalpha() or c.isdigit() or c == "_"
+
+
 def _parse_dim_name(lex : LexState) -> FullDim:
     lex.consume_whitespace()
-    i = 0
-    while i < len(lex.spec) and lex.spec[i].isalpha():
+    if not lex.spec or not _is_ident_start(lex.spec[0]):
+        raise ValueError(f"Expected dim name at {lex.spec[:20]!r}")
+    i = 1
+    while i < len(lex.spec) and _is_ident_cont(lex.spec[i]):
         i += 1
 
     dim_name = lex.spec[:i]
@@ -264,9 +274,9 @@ def _parse_shape(lex : LexState) -> ShapeType:
     dims = []
     # Stop when the upcoming identifier isn't a registered dim — otherwise
     # trailing keywords (`where`, …) would be swallowed as dim names.
-    while (nxt := lex.peek()) is not None and nxt.isalpha():
-        i = 0
-        while i < len(lex.spec) and (lex.spec[i].isalpha() or lex.spec[i].isdigit()):
+    while (nxt := lex.peek()) is not None and _is_ident_start(nxt):
+        i = 1
+        while i < len(lex.spec) and _is_ident_cont(lex.spec[i]):
             i += 1
         word = lex.spec[:i]
         if word not in g_dim_registry:
@@ -403,6 +413,36 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
             st, et = _parse_contraction(lex, reduction=reduction) # ty: ignore
             lex.expect(')')
             return st, et
+    elif lex.maybe_consume("gather"):
+        # gather[dim_in_source](source_expr, idx_expr)
+        # The result's shape replaces `dim_in_source` (which must appear
+        # in source's shape) with `idx`'s sole dim.
+        lex.expect('[')
+        dim_in_source = _parse_dim(lex)
+        lex.expect(']')
+        lex.expect('(')
+        source_st, source_et = _parse_spec(lex)
+        lex.expect(',')
+        idx_st, idx_et = _parse_spec(lex)
+        lex.expect(')')
+        if len(idx_st) != 1:
+            raise ValueError(
+                f"gather index must be 1-d; got shape={idx_st}"
+            )
+        if not any(dim_name(d) == dim_name(dim_in_source) for d in source_st):
+            raise ValueError(
+                f"gather dim {dim_name(dim_in_source)!r} not in source "
+                f"shape {[dim_name(d) for d in source_st]}"
+            )
+        out_st = tuple(
+            idx_st[0] if dim_name(d) == dim_name(dim_in_source) else d
+            for d in source_st
+        )
+        return out_st, Gather(
+            source=source_et,
+            dim_in_source=dim_full_dim(dim_in_source),
+            idx=idx_et,
+        )
     elif unary_op := lex.maybe_consume("exp", "sin", "cos", "sqrt", "softmax"):
         pred_domain = None
         if lex.maybe_consume('['):
@@ -454,11 +494,14 @@ def _parse_affine_identifier(lex : LexState) -> LoopVariable:
     a non-dim `k`.
     """
     lex.consume_whitespace()
-    i = 0
-    while i < len(lex.spec) and (lex.spec[i].isalpha() or lex.spec[i].isdigit()):
+    if not lex.spec or not _is_ident_start(lex.spec[0]):
+        d = _parse_dim_name(lex)
+        return LoopVariable(d.name)
+    i = 1
+    while i < len(lex.spec) and _is_ident_cont(lex.spec[i]):
         i += 1
     word = lex.spec[:i]
-    if word and word in _g_extra_loop_vars:
+    if word in _g_extra_loop_vars:
         lex.spec = lex.spec[i:]
         return LoopVariable(word)
     d = _parse_dim_name(lex)

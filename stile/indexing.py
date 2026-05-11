@@ -90,7 +90,62 @@ class AffineExpr:
     __rmul__ = __mul__
 
 
-SymbolicIndex = AffineExpr | LoopVariable | int
+_g_runtime_scalars : dict[str, "RuntimeScalar"] = {}
+
+
+class RuntimeScalar:
+    """
+    A runtime-known integer in `[0, max_value)`, declared symbolically by
+    name. Used wherever a `SymbolicIndex` is expected — most importantly
+    as a `fori_loop` upper bound for paged-decode-style early-exit. The
+    verifier consults its bound during natural-range subsumption so a
+    kernel iterating up to `n_used_pages` matches a spec whose `where`-
+    clause restricts to `< n_used_pages`, without the verifier ever
+    needing the concrete runtime value.
+
+    Pattern mirrors `FullDim`: self-registers by name so any equal-named
+    `LoopVariable` reaching the verifier resolves back to the declared
+    bound. Two `RuntimeScalar`s with the same name must agree on
+    `max_value`. `reset_stile()` clears the registry.
+    """
+
+    def __init__(self, name : str, max_value : int):
+        existing = _g_runtime_scalars.get(name)
+        if existing is not None and existing.max_value != max_value:
+            raise ValueError(
+                f"Conflicting RuntimeScalar {name!r}: existing "
+                f"max_value={existing.max_value}, new={max_value}"
+            )
+        self.name = name
+        self.max_value = max_value
+        self.var = LoopVariable(name)
+        _g_runtime_scalars[name] = self
+
+    def __add__(self, other) -> "AffineExpr":
+        return to_affine(self) + to_affine(other)
+
+    def __radd__(self, other) -> "AffineExpr":
+        return to_affine(other) + to_affine(self)
+
+    def __sub__(self, other) -> "AffineExpr":
+        return to_affine(self) - to_affine(other)
+
+    def __mul__(self, k : int) -> "AffineExpr":
+        return to_affine(self) * k
+
+    __rmul__ = __mul__
+
+
+def runtime_scalar_max(name : str) -> int | None:
+    """Bound declared for the named `RuntimeScalar`, or `None` if it
+    wasn't declared. Verifier calls this during natural-range
+    subsumption when a free `LoopVariable` isn't in any active
+    `LoopScope` nor `g_dim_registry`."""
+    rs = _g_runtime_scalars.get(name)
+    return rs.max_value if rs is not None else None
+
+
+SymbolicIndex = AffineExpr | LoopVariable | RuntimeScalar | int
 
 
 def to_affine(x : SymbolicIndex) -> AffineExpr:
@@ -101,6 +156,8 @@ def to_affine(x : SymbolicIndex) -> AffineExpr:
         return x
     if isinstance(x, LoopVariable):
         return AffineExpr(0, frozenset({(x, 1)}))
+    if isinstance(x, RuntimeScalar):
+        return AffineExpr(0, frozenset({(x.var, 1)}))
     if isinstance(x, int):
         return AffineExpr(x, frozenset())
     raise TypeError(f"Not a SymbolicIndex: {type(x).__name__}")

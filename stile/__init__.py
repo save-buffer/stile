@@ -7,6 +7,7 @@ from .type import (
 from .indexing import (
     LoopVariable, AffineExpr, SymbolicIndex, Domain, range_domain,
     LoopScope, loop, active_loop_domain, _active_loop_scopes,
+    RuntimeScalar, _g_runtime_scalars,
 )
 
 def dim(name : str, size : int) -> FullDim:
@@ -22,6 +23,7 @@ def expr_simplifies(
 def reset_stile():
     g_dim_registry.clear()
     _active_loop_scopes.clear()
+    _g_runtime_scalars.clear()
     _reset_tensor_counter()
 
 
