@@ -15,7 +15,7 @@ from .indexing import (
     declare_tensor_boundary, tensor_boundary, resolve_symbolic_index,
     _g_tensor_boundaries,
 )
-from .jax._core import _g_runtime_arrs
+from .tracing import _g_runtime_arrs
 
 def dim(name : str, size : int) -> FullDim:
     return FullDim(name, size)
