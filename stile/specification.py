@@ -86,6 +86,24 @@ class LexState:
                 return a
         return None
 
+    def maybe_consume_keyword(self, *args) -> str | None:
+        """Like `maybe_consume` but requires a non-identifier boundary
+        after the match. Use for keywords (`exp`, `sum`, `gather`, …)
+        so an identifier like `expert_id` doesn't get partially
+        consumed as `exp` + the rest left dangling."""
+        self.consume_whitespace()
+        for a in args:
+            if self.spec.startswith(a):
+                end = len(a)
+                if end >= len(self.spec) or not (
+                    self.spec[end].isalpha()
+                    or self.spec[end].isdigit()
+                    or self.spec[end] == "_"
+                ):
+                    self.spec = self.spec[end:]
+                    return a
+        return None
+
     def startswith(self, s):
         return self.spec.startswith(s)
 
@@ -370,11 +388,11 @@ def _parse_primary(lex : LexState) -> tuple[ShapeType, ExprType]:
     raise ValueError("Parenthesized expression, tensor, or number expected")
 
 def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
-    if reduction := lex.maybe_consume("sum", "max"):
+    if reduction := lex.maybe_consume_keyword("sum", "max"):
         if lex.maybe_consume('['):
             dim = _parse_dim(lex)
             pred_domain = None
-            if lex.maybe_consume("where"):
+            if lex.maybe_consume_keyword("where"):
                 pred_domain = _parse_predicate(lex)
             lex.expect(']')
             lex.expect('(')
@@ -413,7 +431,7 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
             st, et = _parse_contraction(lex, reduction=reduction) # ty: ignore
             lex.expect(')')
             return st, et
-    elif lex.maybe_consume("gather"):
+    elif lex.maybe_consume_keyword("gather"):
         # gather[dim_in_source](source_expr, idx_expr)
         # The result's shape replaces `dim_in_source` (which must appear
         # in source's shape) with `idx`'s sole dim.
@@ -443,14 +461,47 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
             dim_in_source=dim_full_dim(dim_in_source),
             idx=idx_et,
         )
-    elif unary_op := lex.maybe_consume("exp", "sin", "cos", "sqrt", "softmax"):
+    elif lex.maybe_consume_keyword("scatter"):
+        # scatter[dim_in_dest](source_expr, idx_expr)
+        # Dual of gather: source has idx's dim in its shape; the result
+        # replaces that dim with `dim_in_dest`. Positions of the output
+        # not addressed by `idx` are zero.
+        lex.expect('[')
+        dim_in_dest = _parse_dim(lex)
+        lex.expect(']')
+        lex.expect('(')
+        source_st, source_et = _parse_spec(lex)
+        lex.expect(',')
+        idx_st, idx_et = _parse_spec(lex)
+        lex.expect(')')
+        if len(idx_st) != 1:
+            raise ValueError(
+                f"scatter index must be 1-d; got shape={idx_st}"
+            )
+        idx_dim = idx_st[0]
+        if not any(dim_name(d) == dim_name(idx_dim) for d in source_st):
+            raise ValueError(
+                f"scatter source must have idx's dim "
+                f"{dim_name(idx_dim)!r} in shape "
+                f"{[dim_name(d) for d in source_st]}"
+            )
+        out_st = tuple(
+            dim_in_dest if dim_name(d) == dim_name(idx_dim) else d
+            for d in source_st
+        )
+        return out_st, Scatter(
+            source=source_et,
+            dim_in_dest=dim_full_dim(dim_in_dest),
+            idx=idx_et,
+        )
+    elif unary_op := lex.maybe_consume_keyword("exp", "sin", "cos", "sqrt", "softmax"):
         pred_domain = None
         if lex.maybe_consume('['):
             if unary_op != "softmax":
                 raise ValueError("Dimension annotation only makes sense for softmax")
 
             dim_annotation = _parse_dim(lex)
-            if lex.maybe_consume("where"):
+            if lex.maybe_consume_keyword("where"):
                 pred_domain = _parse_predicate(lex)
             lex.expect(']')
 
@@ -578,7 +629,7 @@ def _parse_predicate(lex : LexState) -> Domain:
     is the AND of every atomic comparison.
     """
     domain = _parse_atomic_predicate(lex)
-    while lex.maybe_consume("&&", "and"):
+    while (lex.maybe_consume("&&") or lex.maybe_consume_keyword("and")):
         rhs = _parse_atomic_predicate(lex)
         domain = and_domains(domain, rhs)
     return domain
@@ -717,7 +768,7 @@ def _apply_iteration_restriction(
 
 def _parse_spec(lex : LexState) -> tuple[ShapeType, ExprType]:
     result_st, result_et = _parse_expr(lex)
-    while lex.maybe_consume("where"):
+    while lex.maybe_consume_keyword("where"):
         pred_domain = _parse_predicate(lex)
         result_et = _apply_where_mask(result_st, result_et, pred_domain)
     return result_st, result_et

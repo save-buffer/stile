@@ -6,7 +6,8 @@ from .type import *
 from .indexing import (
     Domain, AffineConstraint, interval_domain, ge, lt, and_domains,
     simplify_domain, active_loop_vars, _active_loop_scopes,
-    runtime_scalar_max,
+    runtime_scalar_max, index_has_property, paired_index_for_offsets,
+    resolve_symbolic_index,
 )
 from .frozen_counter import FrozenCounter
 
@@ -176,6 +177,25 @@ class NormalizedGather:
         if cached is not None:
             return cached
         h = hash((self.source, self.dim_in_source, self.idx))
+        object.__setattr__(self, '_h', h)
+        return h
+
+
+@dataclass(frozen=True)
+class NormalizedScatter:
+    """
+    `source.scatter(dim_in_dest, idx)` in normalized form. Dual of
+    `NormalizedGather`. Same opaque-leaf treatment.
+    """
+    source : "NormalizedExpr"
+    dim_in_dest : FullDim
+    idx : "NormalizedExpr"
+
+    def __hash__(self) -> int:
+        cached = getattr(self, '_h', None)
+        if cached is not None:
+            return cached
+        h = hash((self.source, self.dim_in_dest, self.idx))
         object.__setattr__(self, '_h', h)
         return h
 
@@ -451,6 +471,30 @@ def _try_collapse_tiled_reduce(
     )
 
 
+def _substitute_in_symint(
+    atom : "LoopVariable",
+    loop_var : "LoopVariable",
+    value : SymbolicIndex,
+) -> "LoopVariable":
+    """
+    If `atom.source` contains `loop_var` inside its `position` field,
+    return a new `SymbolicInt` with the position recursively
+    substituted. Otherwise return `atom` unchanged. This is what lets
+    a `tensor_element("offsets", g)` substitution flow through
+    `_substitute_loop_var`: without this, the `source` field is
+    opaque to substitution and `te(offsets, g)` stays untouched even
+    when we substitute `g → k` outside of it.
+    """
+    from .indexing import SymbolicInt
+    if atom.source is None:
+        return atom
+    tensor_name, position = atom.source
+    new_position = _substitute_loop_var(position, loop_var, value)
+    if new_position == position:
+        return atom
+    return SymbolicInt(name=atom.name, source=(tensor_name, new_position))
+
+
 def _substitute_loop_var(
     expr : SymbolicIndex,
     loop_var : LoopVariable,
@@ -464,7 +508,11 @@ def _substitute_loop_var(
         if v == loop_var:
             result = result + value_aff * c
         else:
-            result = result + c * v
+            # If `v` is a `tensor_element` atom whose `position` field
+            # references `loop_var`, push the substitution into the
+            # source. Otherwise `v` flows through unchanged.
+            new_v = _substitute_in_symint(v, loop_var, value)
+            result = result + c * new_v
     return result
 
 
@@ -669,6 +717,21 @@ def _substitute_lv_in_factor_to_expr(
             return NormalizedExpr.of(
                 NormalizedReduce(dim, op, new_domain, new_child)
             )
+        case NormalizedParametricReduce(inner_var, lo, hi, op, body):
+            # Route ParametricReduce substitution through
+            # `make_parametric_reduce`, which collapses the empty range
+            # `lo == hi` → identity. Without this, a `fori_loop`
+            # invariant of the form
+            # `ParametricReduce(g, 0, k, sum, ...)` doesn't normalize
+            # to `0` at the base case `k = 0`.
+            new_lo = _substitute_loop_var(lo, loop_var, value)
+            new_hi = _substitute_loop_var(hi, loop_var, value)
+            if inner_var == loop_var:
+                return NormalizedExpr.of(NormalizedParametricReduce(
+                    inner_var, new_lo, new_hi, op, body,
+                ))
+            new_body = _substitute_lv_in_expr(body, loop_var, value)
+            return make_parametric_reduce(inner_var, new_lo, new_hi, op, new_body)
     # All other factor kinds: substitute via the factor-returning helper
     # (no identity-collapse needed) and wrap.
     return NormalizedExpr.of(_substitute_lv_in_factor(factor, loop_var, value))
@@ -736,6 +799,12 @@ def _substitute_lv_in_factor(
             return NormalizedGather(
                 source=_substitute_lv_in_expr(source, loop_var, value),
                 dim_in_source=dim_in_source,
+                idx=_substitute_lv_in_expr(idx, loop_var, value),
+            )
+        case NormalizedScatter(source, dim_in_dest, idx):
+            return NormalizedScatter(
+                source=_substitute_lv_in_expr(source, loop_var, value),
+                dim_in_dest=dim_in_dest,
                 idx=_substitute_lv_in_expr(idx, loop_var, value),
             )
 
@@ -889,6 +958,18 @@ def simplify_under_active_loop_scope(expr : "NormalizedExpr") -> "NormalizedExpr
                 return f if new_body is body else NormalizedParametricReduce(
                     loop_var, lo, hi, op, new_body,
                 )
+            case NormalizedGather(source, dim_in_source, idx):
+                new_source = walk_expr(source)
+                new_idx = walk_expr(idx)
+                if new_source is source and new_idx is idx:
+                    return f
+                return NormalizedGather(new_source, dim_in_source, new_idx)
+            case NormalizedScatter(source, dim_in_dest, idx):
+                new_source = walk_expr(source)
+                new_idx = walk_expr(idx)
+                if new_source is source and new_idx is idx:
+                    return f
+                return NormalizedScatter(new_source, dim_in_dest, new_idx)
             case _:
                 return f
 
@@ -1374,7 +1455,7 @@ def make_sum(terms) -> "NormalizedProduct":
         ]),
     )
 
-NormalizedFactor = NormalizedTensor | NormalizedExp | NormalizedUnaryOp | NormalizedSum | NormalizedMax | NormalizedRepeat | NormalizedReduce | NormalizedParametricReduce | NormalizedGather
+NormalizedFactor = NormalizedTensor | NormalizedExp | NormalizedUnaryOp | NormalizedSum | NormalizedMax | NormalizedRepeat | NormalizedReduce | NormalizedParametricReduce | NormalizedGather | NormalizedScatter
 # NormalizedTagTree is defined after NormalizedExpr is declared (below).
 
 @dataclass(frozen=True)
@@ -1902,6 +1983,14 @@ def varies_with_dim(e : NormalizedFactor | NormalizedProduct | NormalizedExpr, d
             if dim == dim_in_source:
                 return False
             return varies_with_dim(source, dim) or varies_with_dim(idx, dim)
+        case NormalizedScatter(source, dim_in_dest, idx):
+            # Dual of gather: source's idx-dim is replaced by `dim_in_dest`
+            # in the output. Output varies along `dim_in_dest` (a fresh
+            # dim from the scatter's perspective) and along source's
+            # other dims; idx's dim is consumed.
+            if dim == dim_in_dest:
+                return True
+            return varies_with_dim(source, dim) or varies_with_dim(idx, dim)
         case NormalizedParametricReduce(_, _, _, _, body):
             return varies_with_dim(body, dim)
         case NormalizedProduct(_, factors):
@@ -1980,6 +2069,12 @@ def strip_repeats_from_factor(factor : NormalizedFactor, dim : FullDim) -> Norma
                 dim_in_source=dim_in_source,
                 idx=strip_repeats_from_expr(idx, dim),
             ))
+        case NormalizedScatter(source, dim_in_dest, idx):
+            return NormalizedExpr.of(NormalizedScatter(
+                source=strip_repeats_from_expr(source, dim),
+                dim_in_dest=dim_in_dest,
+                idx=strip_repeats_from_expr(idx, dim),
+            ))
         case NormalizedParametricReduce(_, _, _, _, _):
             return NormalizedExpr.of(factor)
 
@@ -2042,10 +2137,59 @@ def _extract_tagged_body(
 
 
 def reduce(dim : FullDim, op : ReduceOpType, interval : tuple[SymbolicIndex, SymbolicIndex], child : NormalizedExpr):
+    # Block-constant rewrite: if this reduce is over a block-bounded
+    # slice `[offsets[g], offsets[g+1])` and an index paired with
+    # `offsets` appears as a gather idx in the body, the gather is
+    # `g`-everywhere on the block — replace it with `W[g]` (a
+    # singleton slice of the gather's source). This is what unlocks
+    # fused MoE: `gather(W, eid_sorted)` inside a per-expert block
+    # collapses to `W[g]`, so the kernel's per-expert `W[g] @ X_block`
+    # form matches its per-token-gather spec.
+    block = _detect_block_interval(interval)
+    if block is not None:
+        offsets_name, g_pos = block
+        paired = paired_index_for_offsets(offsets_name)
+        if paired is not None:
+            # The substitution may produce a body in which the gather
+            # has been replaced by a `NormalizedReduce` over the
+            # gather's source dim — the gather's contribution to the
+            # body's shape is gone, and the new reduce is independent
+            # of `dim`, so it'll hoist out cleanly below.
+            child = _substitute_gather_with_block_constant(
+                child, paired, dim, g_pos,
+            )
+
     num, den = child.num, child.den
 
     varying_num, invariant_num = partition_by_dim_variance(dim, num)
     varying_den, invariant_den = partition_by_dim_variance(dim, den)
+
+    # Gather-through-reduce: if every varying factor is a Gather with the
+    # SAME `(dim_in_source, idx)` and the reduce dim doesn't intersect
+    # the gather's output dim (`varies_with_dim(idx, dim)` is False),
+    # factor the common gather out:
+    #   Reduce(d, op, gather(A, π) · gather(B, π)) → gather(Reduce(d, op, A · B), π)
+    # This is what makes sort-based MoE collapse: after `argsort=π`,
+    # both `X_sorted` and `W_per_sorted` are gathers with idx `π`, so a
+    # `Reduce(d_in, sum, ...)` over them lifts `π` out, leaving the
+    # per-token spec inside, which the surrounding `scatter(_, π)`
+    # then unwraps via the permutation round-trip.
+    factored = _try_factor_common_gather(varying_num, dim, op)
+    if factored is not None and not varying_den and num.const == 1.0:
+        gather_dim, gather_idx, inner_body = factored
+        invariant_num_expr = strip_repeats_from_product(
+            NormalizedProduct(const=num.const, factors=invariant_num), dim,
+        )
+        invariant_den_expr = strip_repeats_from_product(
+            NormalizedProduct(const=1.0, factors=invariant_den), dim,
+        )
+        inner = reduce(dim, op, interval, inner_body)
+        gathered = NormalizedExpr.of(NormalizedGather(
+            source=inner,
+            dim_in_source=gather_dim,
+            idx=gather_idx,
+        ))
+        return div(mul(invariant_num_expr, gathered), invariant_den_expr)
 
     # Hoist invariant factors out of the reduce. Once hoisted, any Repeat(dim, ...)
     # inside them is redundant since the enclosing shape no longer has dim.
@@ -2129,6 +2273,273 @@ def _normalize_tag(tag : TagTree) -> NormalizedTagTree:
     return normalize(tag)
 
 
+def _as_tensor_element(idx : SymbolicIndex) -> "LoopVariable | None":
+    """
+    If `idx` is exactly a single `SymbolicInt` with a `source` field
+    (i.e. created via `tensor_element`), return that atom. Else `None`.
+    Used by the block-constant rewrite to detect when a slice bound
+    came from `offsets[g]`-style tensor indexing.
+    """
+    aff = to_affine(idx)
+    if aff.const != 0 or len(aff.terms) != 1:
+        return None
+    (var, coeff), = aff.terms
+    if coeff != 1 or var.source is None:
+        return None
+    return var
+
+
+def _detect_block_interval(
+    interval : tuple[SymbolicIndex, SymbolicIndex],
+) -> "tuple[str, SymbolicIndex] | None":
+    """
+    If `interval` is `(tensor_element(T, g), tensor_element(T, g+1))`
+    for some tensor `T` and position `g`, return `(T, g)`. Else `None`.
+    The position `g` is returned as a `SymbolicIndex` (may be a free
+    `SymbolicInt`, an `AffineExpr`, etc.).
+    """
+    lo, hi = interval
+    lo_te = _as_tensor_element(lo)
+    hi_te = _as_tensor_element(hi)
+    if lo_te is None or hi_te is None:
+        return None
+    lo_tensor, lo_pos = lo_te.source
+    hi_tensor, hi_pos = hi_te.source
+    if lo_tensor != hi_tensor:
+        return None
+    # hi's position must be lo's position + 1.
+    if to_affine(hi_pos) != to_affine(lo_pos) + 1:
+        return None
+    return lo_tensor, lo_pos
+
+
+def _substitute_gather_with_block_constant(
+    expr : "NormalizedExpr",
+    idx_name : str,
+    n_groups_dim : FullDim,
+    g : SymbolicIndex,
+) -> "NormalizedExpr":
+    """
+    Walk `expr` and replace each `NormalizedGather` whose idx is the
+    bare tensor named `idx_name` with the singleton slice of the
+    gather's source at position `g`:
+      `gather(W, n_groups_dim, idx_name) → Reduce(n_groups_dim, sum,
+      [g, g+1), W)`.
+    The shape changes — the gather's idx-shape dim is replaced by the
+    reduce-to-singleton — but inside the block-bounded slice the
+    values agree (idx==g on the block, so gather picks W[g]
+    everywhere). The shape change is absorbed by the surrounding
+    block-bounded Reduce: the now-`n_tokens`-invariant `W[g]` hoists
+    out cleanly. The gather's `dim_in_source` is what gets reduced;
+    we use the gather's recorded `dim_in_source` from its
+    NormalizedGather node, not the caller-supplied `n_groups_dim`,
+    in case different gathers in the same expression use different
+    source dims.
+    """
+    def walk_factor(f):
+        if isinstance(f, NormalizedGather):
+            idx_atom = None
+            if f.idx.num.const == 1.0 and not f.idx.den.factors and f.idx.den.const == 1.0:
+                inner = _as_single_factor(f.idx.num)
+                if isinstance(inner, NormalizedTensor) and inner.tag is None:
+                    idx_atom = inner
+            if idx_atom is not None and idx_atom.name == idx_name:
+                # Build the singleton slice: Reduce(dim_in_source, sum,
+                # [g, g+1), source). After this single-element reduce
+                # the result has the same shape as W minus dim_in_source —
+                # the per-token output dim of the gather is gone, which
+                # is fine because the surrounding block reduces over it.
+                index = _reduce_index(f.dim_in_source)
+                domain = interval_domain(
+                    index, [(g, to_affine(g) + 1)],
+                )
+                return NormalizedReduce(
+                    f.dim_in_source, "sum",
+                    simplify_domain(domain),
+                    f.source,
+                )
+        return f
+    return _walk_expr_replacing_factors(expr, walk_factor)
+
+
+def _walk_expr_replacing_factors(
+    expr : "NormalizedExpr",
+    walk : "Callable[[NormalizedFactor], NormalizedFactor]",
+) -> "NormalizedExpr":
+    """
+    Rebuild `expr` with `walk` applied to every factor in num/den,
+    recursing into nested `NormalizedExpr` children (Reduce/Repeat/
+    Exp/UnaryOp/Sum/Max/etc.). `walk` returns `f` unchanged to skip,
+    or a new factor to substitute. Recursion happens after a no-op
+    `walk` — so a substituting walker that returns a new factor for
+    `f` doesn't also rewrite inside the new factor.
+    """
+    def walk_factor(f):
+        new_f = walk(f)
+        if new_f is not f:
+            return new_f
+        match f:
+            case NormalizedReduce(dim, op, domain, child):
+                new_child = walk_expr(child)
+                if new_child is child:
+                    return f
+                return NormalizedReduce(dim, op, domain, new_child)
+            case NormalizedRepeat(dims, child):
+                new_child = walk_expr(child)
+                if new_child is child:
+                    return f
+                return NormalizedRepeat(dims, new_child)
+            case NormalizedExp(child):
+                new_child = walk_expr(child)
+                if new_child is child:
+                    return f
+                return NormalizedExp(new_child)
+            case NormalizedUnaryOp(op, child):
+                new_child = walk_expr(child)
+                if new_child is child:
+                    return f
+                return NormalizedUnaryOp(op, new_child)
+            case NormalizedSum(children):
+                new_children = [walk_product(c) for c in children]
+                if all(nc is c for nc, c in zip(new_children, children)):
+                    return f
+                return NormalizedSum(frozenset(new_children))
+            case NormalizedMax(children):
+                new_children = [walk_expr(c) for c in children]
+                if all(nc is c for nc, c in zip(new_children, children)):
+                    return f
+                return NormalizedMax(frozenset(new_children))
+            case NormalizedGather(source, dim_in_source, idx):
+                new_source = walk_expr(source)
+                new_idx = walk_expr(idx)
+                if new_source is source and new_idx is idx:
+                    return f
+                return NormalizedGather(new_source, dim_in_source, new_idx)
+            case NormalizedScatter(source, dim_in_dest, idx):
+                new_source = walk_expr(source)
+                new_idx = walk_expr(idx)
+                if new_source is source and new_idx is idx:
+                    return f
+                return NormalizedScatter(new_source, dim_in_dest, new_idx)
+            case NormalizedParametricReduce(loop_var, lo, hi, op, body):
+                new_body = walk_expr(body)
+                if new_body is body:
+                    return f
+                return NormalizedParametricReduce(loop_var, lo, hi, op, new_body)
+            case _:
+                return f
+
+    def walk_product(p):
+        items = []
+        changed = False
+        for f, count in p.factors.items():
+            new_f = walk_factor(f)
+            items.append((new_f, count))
+            if new_f is not f:
+                changed = True
+        if not changed:
+            return p
+        return NormalizedProduct(
+            const=p.const,
+            factors=FrozenCounter.from_dict(dict(items)),
+        )
+
+    def walk_expr(e):
+        new_num = walk_product(e.num)
+        new_den = walk_product(e.den)
+        if new_num is e.num and new_den is e.den:
+            return e
+        return make_expr(new_num, new_den)
+
+    return walk_expr(expr)
+
+
+def _try_factor_common_gather(
+    varying_factors : "FrozenCounter[NormalizedFactor]",
+    reduce_dim : FullDim,
+    op : ReduceOpType,
+) -> "tuple[FullDim, NormalizedExpr, NormalizedExpr] | None":
+    """
+    If every factor is a `NormalizedGather` sharing the same
+    `(dim_in_source, idx)` and `reduce_dim` isn't in the gather's
+    output dims (`idx` doesn't vary with `reduce_dim`), return
+    `(dim_in_source, idx, inner_body)` for the gather-through-reduce
+    rewrite. `inner_body` is the product of the gathers' sources,
+    which becomes the body of the post-rewrite reduce. Returns `None`
+    otherwise.
+    """
+    if not varying_factors:
+        return None
+    common_dim_in_source : FullDim | None = None
+    common_idx : "NormalizedExpr | None" = None
+    for f in varying_factors:
+        if not isinstance(f, NormalizedGather):
+            return None
+        if common_dim_in_source is None:
+            common_dim_in_source = f.dim_in_source
+            common_idx = f.idx
+        elif (
+            f.dim_in_source != common_dim_in_source or f.idx != common_idx
+        ):
+            return None
+    assert common_idx is not None and common_dim_in_source is not None
+    if varies_with_dim(common_idx, reduce_dim):
+        # `reduce_dim` is part of the gather's output (in idx's shape);
+        # can't factor the gather out — the reduce *is* over the
+        # gathered dim.
+        return None
+    inner_body = NormalizedExpr.of(NormalizedProduct(const=1.0))
+    for f, count in varying_factors.items():
+        for _ in range(count):
+            inner_body = mul(inner_body, f.source)
+    return common_dim_in_source, common_idx, inner_body
+
+
+def _as_gather_factor(expr : "NormalizedExpr") -> "NormalizedGather | None":
+    """If `expr` is exactly one `NormalizedGather` factor (no const, no
+    other factors, no denominator), return it. Used by Scatter's
+    round-trip rewrite to recognize a wrapped Gather."""
+    if (
+        expr.num.const != 1.0
+        or expr.den.factors
+        or expr.den.const != 1.0
+    ):
+        return None
+    factor = _as_single_factor(expr.num)
+    return factor if isinstance(factor, NormalizedGather) else None
+
+
+def _as_scatter_factor(expr : "NormalizedExpr") -> "NormalizedScatter | None":
+    """Mirror of `_as_gather_factor` for `NormalizedScatter`."""
+    if (
+        expr.num.const != 1.0
+        or expr.den.factors
+        or expr.den.const != 1.0
+    ):
+        return None
+    factor = _as_single_factor(expr.num)
+    return factor if isinstance(factor, NormalizedScatter) else None
+
+
+def _idx_has_property(norm_idx : "NormalizedExpr", prop : str) -> bool:
+    """True iff `norm_idx` is exactly a bare `NormalizedTensor` whose
+    name has been declared with `prop` via `runtime_index(...,
+    permutation=True)` or similar. Sliced indices and other
+    transformations don't carry the property forward — only the bare
+    declared tensor counts (a sliced permutation isn't necessarily a
+    permutation of the whole)."""
+    if (
+        norm_idx.num.const != 1.0
+        or norm_idx.den.factors
+        or norm_idx.den.const != 1.0
+    ):
+        return False
+    factor = _as_single_factor(norm_idx.num)
+    if not isinstance(factor, NormalizedTensor) or factor.tag is not None:
+        return False
+    return index_has_property(factor.name, prop)
+
+
 @functools.cache
 def normalize(expr : ExprType) -> NormalizedExpr:
     match expr:
@@ -2157,10 +2568,66 @@ def normalize(expr : ExprType) -> NormalizedExpr:
         case ParametricReduce(loop_var, lo, hi, op, body):
             return make_parametric_reduce(loop_var, lo, hi, op, normalize(body))
         case Gather(source, dim_in_source, idx):
+            norm_source = normalize(source)
+            norm_idx = normalize(idx)
+            # Permutation round-trip: `gather(scatter(Y, dim, perm), dim, perm) = Y`
+            # when `perm` is a permutation. The scatter populated each
+            # position of its output exactly once via `perm`; reading
+            # back through `gather` with the same `perm` lands at the
+            # same positions, recovering `Y`.
+            inner = _as_scatter_factor(norm_source)
+            if (
+                inner is not None
+                and inner.dim_in_dest == dim_in_source
+                and inner.idx == norm_idx
+                and _idx_has_property(norm_idx, "permutation")
+            ):
+                return inner.source
+            # Gather-of-gather hoist: `gather(B, dim_B, gather(C, dim_C, π))`
+            # = `gather(gather(B, dim_B, C), dim_C, π)`. The outer `π`
+            # gets lifted out of the inner indexing — same values,
+            # different factorization. This is the rewrite that makes
+            # sort-based MoE verifiable: after argsort `π`,
+            # `gather(W, gather(eid, π))` canonicalizes to
+            # `gather(gather(W, eid), π)`, so the surrounding einsum
+            # sees `π` as a single uniform outer indexing on every
+            # n_tokens-shaped factor.
+            inner_gather = _as_gather_factor(norm_idx)
+            if (
+                inner_gather is not None
+                and inner_gather.dim_in_source != dim_in_source
+            ):
+                return NormalizedExpr.of(NormalizedGather(
+                    source=NormalizedExpr.of(NormalizedGather(
+                        source=norm_source,
+                        dim_in_source=dim_in_source,
+                        idx=inner_gather.source,
+                    )),
+                    dim_in_source=inner_gather.dim_in_source,
+                    idx=inner_gather.idx,
+                ))
             return NormalizedExpr.of(NormalizedGather(
-                source=normalize(source),
+                source=norm_source,
                 dim_in_source=dim_in_source,
-                idx=normalize(idx),
+                idx=norm_idx,
+            ))
+        case Scatter(source, dim_in_dest, idx):
+            norm_source = normalize(source)
+            norm_idx = normalize(idx)
+            # Dual round-trip: `scatter(gather(Y, dim, perm), dim, perm) = Y`
+            # when `perm` is a permutation.
+            inner = _as_gather_factor(norm_source)
+            if (
+                inner is not None
+                and inner.dim_in_source == dim_in_dest
+                and inner.idx == norm_idx
+                and _idx_has_property(norm_idx, "permutation")
+            ):
+                return inner.source
+            return NormalizedExpr.of(NormalizedScatter(
+                source=norm_source,
+                dim_in_dest=dim_in_dest,
+                idx=norm_idx,
             ))
 
 

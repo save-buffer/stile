@@ -12,12 +12,17 @@ import stile.type as t
 from ..type import *
 from ..specification import parse_spec_into_type, _parse_predicate, LexState
 from ..verification import (
-    verify_types_equivalent, verify_exprs_equivalent,
+    verify_types_equivalent, verify_exprs_equivalent, verify_dims_equivalent,
     normalize as _normalize, _substitute_lv_in_expr,
     simplify_under_active_loop_scope as _simplify_under_loop_scope,
     substitute_loop_var_in_et,
 )
-from ..indexing import evaluate as _eval_index, free_vars as _free_vars, to_affine, LoopVariable
+from ..indexing import (
+    evaluate as _eval_index, free_vars as _free_vars, to_affine, LoopVariable,
+    SymbolicInt, AffineExpr,
+    declare_index_properties, declare_block_pairing, tensor_element,
+    declare_tensor_boundary, resolve_symbolic_index,
+)
 from .. import LoopScope, _active_loop_scopes
 
 import einops
@@ -29,6 +34,54 @@ import einops
 # the kernel — `_pid_<i>` resolves to `pl.program_id(i)`. Outside a
 # binding context, symbolic offsets stay an error.
 _loop_var_resolver : dict = {}
+
+
+# Module-level registry of runtime index/tensor name → JAX array.
+# `runtime_index` registers under the index's name so per-iter helpers
+# (e.g. `_resolve_te_to_int`) can look up `offsets[g]` as a concrete
+# Python int when both the array and `g` are concrete, enabling the
+# carry-pattern runtime path: `assign`'s `at[].set()` write fires even
+# when bounds came from a `tensor_element` lookup.
+_g_runtime_arrs : dict = {}
+
+
+def _resolve_te_to_int(x : "SymbolicIndex") -> "int | None":
+    """
+    Resolve a `tensor_element(name, position)` atom to a concrete
+    Python int when (a) `position` is concrete, and (b) the named
+    tensor has a registered runtime `arr`. Accepts either a bare
+    `SymbolicInt` atom or an `AffineExpr` of the form `0 + 1 *
+    te(...)` (which is what `dim_start`/`dim_end` produce when they
+    add the slice offset to a base of `0`). Returns `None` otherwise —
+    callers fall back to `as_int` for non-`tensor_element` cases.
+    """
+    if isinstance(x, AffineExpr):
+        if x.const != 0 or len(x.terms) != 1:
+            return None
+        (atom, coeff), = x.terms
+        if coeff != 1:
+            return None
+        x = atom
+    if not isinstance(x, SymbolicInt) or x.source is None:
+        return None
+    tensor_name, position = x.source
+    pos_int = as_int(position)
+    if pos_int is None:
+        return None
+    arr = _g_runtime_arrs.get(tensor_name)
+    if arr is None:
+        return None
+    return int(arr[pos_int])
+
+
+def _bound_as_int(x : "SymbolicIndex") -> "int | None":
+    """`as_int` plus `tensor_element` resolution. Used by `assign` to
+    decide whether a slice bound can be materialized to a Python int
+    for the runtime `at[].set()` write."""
+    v = as_int(x)
+    if v is not None:
+        return v
+    return _resolve_te_to_int(x)
 
 
 class loop_var_binding:
@@ -144,6 +197,38 @@ class TypedJaxArray:
     def max(self, dim : Dim) -> "TypedJaxArray":
         return self.reduce("max", dim)
 
+    def block_at(
+        self,
+        dim : FullDim,
+        offsets : "TypedJaxArray",
+        g : "SymbolicIndex",
+    ) -> "TypedJaxArray":
+        """
+        Slice `self` along `dim` to the block `[offsets[g], offsets[g+1])`.
+        Wraps `self.slice(dim, tensor_element(offsets, g),
+        tensor_element(offsets, g+1))` — the slice bounds are
+        `SymbolicInt`s carrying the `(tensor_name, position)` source,
+        which the verifier reads to recognize "this slice is exactly
+        block g of an offsets tensor" and apply the block-constant
+        rewrite to any `gather` of the paired index in the body.
+        """
+        offsets_name = offsets.type.et.name
+        start = tensor_element(offsets_name, to_affine(g))
+        end = tensor_element(offsets_name, to_affine(g) + 1)
+        new_type = self.type.slice(dim, start, end)
+        new_arr = None
+        s_int = _bound_as_int(start)
+        e_int = _bound_as_int(end)
+        if self.arr is not None and s_int is not None and e_int is not None:
+            axis = next(
+                i for i, d in enumerate(self.type.st)
+                if dim_name(d) == dim_name(dim)
+            )
+            slc = [slice(None)] * len(self.type.st)
+            slc[axis] = slice(s_int, e_int)
+            new_arr = self.arr[tuple(slc)]
+        return TypedJaxArray(new_arr, new_type)
+
     def gather(self, dim : FullDim, idx : "TypedJaxArray") -> "TypedJaxArray":
         """
         Index into `self` along `dim` using runtime integer tensor
@@ -156,6 +241,34 @@ class TypedJaxArray:
             i for i, d in enumerate(self.type.st) if dim_name(d) == dim_name(dim)
         )
         return TypedJaxArray(jnp.take(self.arr, idx.arr, axis=axis), new_type)
+
+    def scatter(self, dim : FullDim, idx : "TypedJaxArray") -> "TypedJaxArray":
+        """
+        Dual of `gather`: write `self` into a zero-initialized output
+        whose `dim` axis is populated at positions given by `idx`. The
+        output's shape replaces `self`'s `idx`-dim with `dim`. Other
+        positions of the output (those not addressed by any `idx[m]`)
+        are zero.
+        """
+        new_type = self.type.scatter(dim, idx.type)
+        if self.arr is None or idx.arr is None:
+            return TypedJaxArray(None, new_type)
+        idx_dim_name = dim_name(idx.type.st[0])
+        axis = next(
+            i for i, d in enumerate(self.type.st)
+            if dim_name(d) == idx_dim_name
+        )
+        out_shape = list(self.arr.shape)
+        out_shape[axis] = as_int(dim_size(dim))
+        result = jnp.zeros(tuple(out_shape), dtype=self.arr.dtype)
+        # Move the scatter axis to position 0 for `at[].add()` semantics.
+        moved = jnp.moveaxis(self.arr, axis, 0)
+        out_moved = jnp.zeros(
+            (as_int(dim_size(dim)),) + moved.shape[1:], dtype=self.arr.dtype,
+        )
+        out_moved = out_moved.at[idx.arr].add(moved)
+        result = jnp.moveaxis(out_moved, 0, axis)
+        return TypedJaxArray(result, new_type)
 
     def __add__(self, other) -> "TypedJaxArray":
         return _binary_op_helper(self, other, "+")
@@ -607,10 +720,7 @@ class TypedResult:
         ]] = []
 
     def assign(self, result : TypedJaxArray):
-        if not verify_types_equivalent(
-                self.expected_type,
-                result.type,
-        ):
+        if not _verify_assign_against_spec(self.expected_type, result.type):
             raise ValueError(
                 "Attempted to assign a tensor that does not match the spec! "
                 f"Expected: {self.expected_type.et}, actual: {result.type.et}"
@@ -623,48 +733,220 @@ class TypedResult:
         self._assigned.append((per_dim_bounds, scopes_snapshot))
 
         # Only copy data when the bounds and the source array are concrete.
+        # Bounds that came from `tensor_element(offsets, g)` resolve via the
+        # registered runtime array when both `g` and `offsets`'s arr are
+        # concrete — that's the path the carry pattern relies on.
+        concrete_bounds = tuple(
+            (_bound_as_int(s), _bound_as_int(e)) for s, e in per_dim_bounds
+        )
         all_concrete_bounds = all(
-            as_int(s) is not None and as_int(e) is not None
-            for s, e in per_dim_bounds
+            s is not None and e is not None for s, e in concrete_bounds
         )
         if result.arr is not None and all_concrete_bounds:
-            slice_expr = tuple(slice(as_int(s), as_int(e)) for s, e in per_dim_bounds)
+            slice_expr = tuple(slice(s, e) for s, e in concrete_bounds)
             self.arr = self.arr.at[slice_expr].set(result.arr)
+
+    def write_block(self, tile : TypedJaxArray) -> "TypedResult":
+        """
+        Carry-pattern analog of `assign`: verifies the tile against the
+        spec restricted to the tile's slice, records its bounds for
+        coverage, and returns `self` so the `TypedResult` can be
+        threaded as the `fori_loop` carry. The tile's own type already
+        encodes the block (via `Sliced` dims from `block_at`), so no
+        explicit (dim, offsets, g) args are needed.
+        """
+        self.assign(tile)
+        return self
 
     def done(self):
         """
-        Verify that the recorded `assign` calls exactly tile the full output
-        shape along every dimension — no gaps, no overlaps. Symbolic bounds
-        (from assigns inside a rolled loop) are unrolled over the recorded
-        loop scopes to produce concrete intervals before the contiguity
-        check.
+        Verify that the recorded `assign` calls exactly tile the full
+        output shape along every dimension — no gaps, no overlaps.
+
+        Concrete bounds (from assigns in a static-bound fori_loop) are
+        unrolled into integer intervals and a sorted-cursor sweep
+        verifies coverage. Symbolic bounds (from assigns whose slice
+        bounds are `tensor_element`-derived, e.g. `offsets[g]` inside a
+        per-expert fori_loop) stay symbolic; their adjacency is checked
+        structurally between successive unrolled iterations, and their
+        first-start / last-end are checked against `tensor_boundary`
+        declarations to confirm coverage of the full dim.
         """
         for dim_idx, d in enumerate(self.expected_type.st):
             full_size = as_int(dim_size(d))
             if full_size is None:
                 continue
-            intervals : list[tuple[int, int]] = []
+            unrolled : list[tuple[SymbolicIndex, SymbolicIndex]] = []
             for bounds, scopes in self._assigned:
                 s, e = bounds[dim_idx]
-                intervals.extend(_unroll_interval(s, e, scopes))
-            if not intervals:
+                unrolled.extend(_unroll_interval_symbolic(s, e, scopes))
+            if not unrolled:
                 continue
-            # Dedupe: repeat assigns with identical bounds (common for dims
-            # that aren't tiled — every tile covers the full extent) are fine.
-            intervals = sorted(set(intervals))
-            cursor = 0
-            for s, e in intervals:
-                if s != cursor:
-                    raise ValueError(
-                        f"Dimension {dim_name(d)!r} has a gap or overlap: "
-                        f"cursor at {cursor}, next interval starts at {s}"
-                    )
-                cursor = e
-            if cursor != full_size:
+            self._verify_coverage(d, unrolled, full_size)
+
+    def _verify_coverage(
+        self,
+        d : "Dim",
+        intervals : "list[tuple[SymbolicIndex, SymbolicIndex]]",
+        full_size : int,
+    ) -> None:
+        """Sort-and-sweep coverage check that accepts symbolic
+        `(start, end)` pairs. Pure-int intervals get the original
+        cursor sweep; mixed sets are normalized by resolving
+        `tensor_element` bounds against declared boundaries, then
+        either concretized fully or checked symbolically: adjacent
+        intervals must satisfy `prev.end == next.start`
+        structurally, and the chain must start at `0` and end at
+        `full_size`."""
+        # Dedupe: repeat assigns with identical bounds (common for dims
+        # that aren't tiled — every tile covers the full extent) are fine.
+        intervals = list({(s, e): None for s, e in intervals}.keys())
+        # Resolve boundary substitutions and concretize where possible.
+        resolved = [
+            (resolve_symbolic_index(s), resolve_symbolic_index(e))
+            for s, e in intervals
+        ]
+        # Sort by start. Use as_int for sortable key; symbolic starts
+        # sort by their `repr` so the order is deterministic.
+        def sort_key(iv):
+            s_int = as_int(iv[0])
+            return (0, s_int) if s_int is not None else (1, repr(iv[0]))
+        resolved.sort(key=sort_key)
+        # Sweep: each interval's start must equal the prior end (or 0
+        # for the first), and the last interval's end must equal full_size.
+        cursor : "SymbolicIndex" = 0
+        for s, e in resolved:
+            if not _symbolic_equal(s, cursor):
                 raise ValueError(
-                    f"Dimension {dim_name(d)!r} only covered up to {cursor} "
-                    f"of {full_size}"
+                    f"Dimension {dim_name(d)!r} has a gap or overlap: "
+                    f"cursor at {cursor}, next interval starts at {s}"
                 )
+            cursor = e
+        if not _symbolic_equal(cursor, full_size):
+            raise ValueError(
+                f"Dimension {dim_name(d)!r} only covered up to {cursor} "
+                f"of {full_size}"
+            )
+
+
+def _verify_assign_against_spec(spec_type : Type, tile_type : Type) -> bool:
+    """
+    Verify a `TypedResult.assign` call: the assigned tile's type must
+    match the spec, but where the tile carries `Sliced` dims (i.e. it's
+    a per-block slice of the eventual output), the comparison happens
+    *within the slice*. The block-constant rewrite and any other
+    slice-aware normalizations only fire under a `Reduce` carrying the
+    slice in its `dim` field, so we wrap both sides in an auxiliary
+    `Reduce(Sliced(...), sum, ...)` for each sliced dim of the tile.
+    The sum is a carrier, not a real reduction — both sides get the
+    same wrap, so if their bodies are equivalent under the slice
+    context, the wrapped expressions are too.
+
+    For dims of the tile that are *not* sliced (i.e. shared with the
+    spec at full extent), no wrap is needed; raw ET equality suffices.
+    """
+    if not verify_dims_equivalent(spec_type.st, tile_type.st):
+        return False
+    spec_et = spec_type.et
+    tile_et = tile_type.et
+    for d in tile_type.st:
+        if isinstance(d, Sliced):
+            full = dim_full_dim(d)
+            spec_et = t.Reduce(op="sum", dim=d, child=spec_et)
+            tile_et = t.Reduce(op="sum", dim=d, child=tile_et)
+    return verify_exprs_equivalent(spec_et, tile_et)
+
+
+def _symbolic_equal(a : SymbolicIndex, b : SymbolicIndex) -> bool:
+    """
+    Structural equality on `SymbolicIndex`. Resolves `tensor_element`
+    atoms against declared boundaries first so that, e.g.,
+    `te("offsets", 0)` and `0` compare equal when `offsets[0]` is
+    declared `0`.
+    """
+    return to_affine(resolve_symbolic_index(a)) == to_affine(
+        resolve_symbolic_index(b)
+    )
+
+
+def _substitute_bindings(
+    aff : AffineExpr, bindings : dict,
+) -> SymbolicIndex:
+    """
+    Substitute `bindings` (loop var → concrete int) into an
+    `AffineExpr`. Walks each term; for tensor-element atoms whose
+    position references a bound loop var, the substitution recurses
+    into the position field so e.g. `tensor_element("offsets", g)`
+    becomes `tensor_element("offsets", 5)` when `g` is bound to 5.
+    Result is a `SymbolicIndex` — may still be symbolic if there are
+    unbound atoms.
+    """
+    result : SymbolicIndex = aff.const
+    for v, c in aff.terms:
+        if v in bindings:
+            result = to_affine(result) + bindings[v] * c
+            continue
+        # If `v` has a `source` whose position references a bound var,
+        # produce a new tensor_element atom with the position
+        # substituted.
+        if v.source is not None:
+            tensor_name, position = v.source
+            new_position = _substitute_bindings(to_affine(position), bindings)
+            new_v = SymbolicInt(
+                name=v.name,
+                source=(tensor_name, to_affine(new_position)),
+            )
+            result = to_affine(result) + c * new_v
+            continue
+        result = to_affine(result) + c * v
+    return result
+
+
+def _unroll_interval_symbolic(
+    start : SymbolicIndex,
+    end : SymbolicIndex,
+    scopes : tuple[LoopScope, ...],
+) -> list[tuple[SymbolicIndex, SymbolicIndex]]:
+    """
+    Like `_unroll_interval` but keeps results symbolic. For each
+    relevant loop scope, substitutes the loop var with each integer
+    value in its range, producing one `(start, end)` per binding.
+    `tensor_element` atoms with the loop var nested inside their
+    position field get the substitution pushed down via
+    `_substitute_bindings`. Unbound symbolic atoms (e.g.
+    `tensor_element` lookups with no nested loop var, or `te` at a
+    bound position whose value isn't declared) survive — they're
+    resolved later by `_verify_coverage` via boundary declarations.
+    """
+    start_aff, end_aff = to_affine(start), to_affine(end)
+    relevant_vars = _free_vars(start_aff) | _free_vars(end_aff)
+    relevant_scopes = [s for s in scopes if s.var in relevant_vars]
+
+    if not relevant_scopes:
+        return [(start, end)]
+
+    bindings_list : list[dict] = [{}]
+    for scope in relevant_scopes:
+        lo, hi = as_int(scope.lo), as_int(scope.hi)
+        if lo is None or hi is None:
+            # Symbolic loop bound — can't enumerate. Keep one symbolic
+            # interval; coverage check will inspect it via boundaries.
+            return [(start, end)]
+        expanded = []
+        for bindings in bindings_list:
+            for k in range(lo, hi):
+                extended = dict(bindings)
+                extended[scope.var] = k
+                expanded.append(extended)
+        bindings_list = expanded
+
+    out : list[tuple[SymbolicIndex, SymbolicIndex]] = []
+    for b in bindings_list:
+        out.append((
+            _substitute_bindings(start_aff, b),
+            _substitute_bindings(end_aff, b),
+        ))
+    return out
 
 
 def _unroll_interval(
@@ -729,6 +1011,10 @@ def runtime_index(
     *,
     values_in : FullDim | None = None,
     arr : "jnp.ndarray | None" = None,
+    permutation : bool = False,
+    partition : bool = False,
+    block_sorted_paired_with : str | None = None,
+    boundary_values : "dict[int, int] | None" = None,
 ) -> TypedJaxArray:
     """
     A 1-d integer-valued tensor named `name`, of shape `(dim,)`, used
@@ -738,7 +1024,28 @@ def runtime_index(
     enforced — the verifier treats the gather opaquely. If `arr` is
     omitted, a default identity-like array is generated; supply a real
     `arr` for runtime correctness.
+
+    `permutation=True` declares the index is a bijection from `dim` to
+    `values_in` — same size, every value in `[0, values_in.size)`
+    hit exactly once. Unlocks the round-trip rewrite
+    `scatter(gather(Y, perm), perm) = Y`.
+
+    `partition=True` declares each input maps to exactly one value in
+    `[0, values_in.size)` (a function, not necessarily injective).
+    Unlocks the partition-sum collapse for MoE-style kernels.
     """
+    props = []
+    if permutation:
+        props.append("permutation")
+    if partition:
+        props.append("partition")
+    if props:
+        declare_index_properties(name, *props)
+    if block_sorted_paired_with is not None:
+        declare_block_pairing(block_sorted_paired_with, name)
+    if boundary_values is not None:
+        for position, value in boundary_values.items():
+            declare_tensor_boundary(name, position, value)
     type = Type(
         st=(dim,),
         et=t.Tensor(dims=(dim,), name=name),
@@ -746,4 +1053,6 @@ def runtime_index(
     if arr is None:
         size = as_int(dim_size(dim))
         arr = jnp.arange(size) if size is not None else None
+    if arr is not None:
+        _g_runtime_arrs[name] = arr
     return TypedJaxArray(arr, type)

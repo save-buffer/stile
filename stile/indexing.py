@@ -22,14 +22,27 @@ from typing import Iterable
 
 
 @dataclass(frozen=True)
-class LoopVariable:
+class SymbolicInt:
     """
-    Identity of a symbolic integer loop variable. Two LoopVariables are equal
-    iff their names match, so within a single scope give each variable a
-    distinct name. Bounds and other per-variable constraints live in a
-    `Domain`, not here.
+    A symbolic integer atom — the unit out of which `AffineExpr`s are
+    built. Identity is structural: two `SymbolicInt`s are equal iff
+    their `name` and `source` both match.
+
+    `source`, when set, encodes that the atom represents a runtime
+    tensor-element lookup: the pair `(tensor_name, position)` means
+    "the value of `tensor_name` at `position`" (e.g. `offsets[g]`).
+    Two `tensor_element` lookups at the same position produce
+    field-equal `SymbolicInt`s automatically — no string-synthesis
+    needed. Bare atoms (reduce indices, free invariant vars, loop
+    binders) have `source=None`.
+
+    Non-identity metadata (declared min/max bounds, etc.) lives in the
+    `_g_symint_metadata` side registry, looked up via
+    `symint_info(atom)`. Bounds are advisory and don't affect
+    equality; sources do.
     """
     name : str
+    source : "tuple[str, AffineExpr] | None" = None
 
     def __add__(self, other) -> "AffineExpr": return to_affine(self) + other
     def __radd__(self, other) -> "AffineExpr": return to_affine(other) + to_affine(self)
@@ -40,6 +53,12 @@ class LoopVariable:
     def __neg__(self) -> "AffineExpr": return -to_affine(self)
 
 
+# Backward-compat alias — pre-rename, this was the only name for the
+# atom and is still used by a lot of code and tests. Now just an alias
+# for `SymbolicInt`. Can be removed once all call sites migrate.
+LoopVariable = SymbolicInt
+
+
 @dataclass(frozen=True)
 class AffineExpr:
     """
@@ -48,7 +67,7 @@ class AffineExpr:
     give the algebraic equivalence relation.
     """
     const : int
-    terms : frozenset[tuple[LoopVariable, int]]
+    terms : frozenset[tuple[SymbolicInt, int]]
 
     def __post_init__(self):
         for _, c in self.terms:
@@ -57,7 +76,7 @@ class AffineExpr:
     def __add__(self, other) -> "AffineExpr":
         other = to_affine(other)
         new_const = self.const + other.const
-        merged : dict[LoopVariable, int] = {v : c for v, c in self.terms}
+        merged : dict[SymbolicInt, int] = {v : c for v, c in self.terms}
         for v, c in other.terms:
             merged[v] = merged.get(v, 0) + c
         new_terms = frozenset((v, c) for v, c in merged.items() if c != 0)
@@ -90,62 +109,252 @@ class AffineExpr:
     __rmul__ = __mul__
 
 
-_g_runtime_scalars : dict[str, "RuntimeScalar"] = {}
-
-
-class RuntimeScalar:
+@dataclass(frozen=True)
+class SymInfo:
     """
-    A runtime-known integer in `[0, max_value)`, declared symbolically by
-    name. Used wherever a `SymbolicIndex` is expected — most importantly
-    as a `fori_loop` upper bound for paged-decode-style early-exit. The
-    verifier consults its bound during natural-range subsumption so a
-    kernel iterating up to `n_used_pages` matches a spec whose `where`-
-    clause restricts to `< n_used_pages`, without the verifier ever
-    needing the concrete runtime value.
+    Declared *non-identity* metadata for a `SymbolicInt`, looked up via
+    `symint_info(atom)`. Currently just bounds; future kinds
+    (monotonicity, parity, …) slot in as new optional fields.
 
-    Pattern mirrors `FullDim`: self-registers by name so any equal-named
-    `LoopVariable` reaching the verifier resolves back to the declared
-    bound. Two `RuntimeScalar`s with the same name must agree on
-    `max_value`. `reset_stile()` clears the registry.
+    Identity-bearing metadata (specifically `source` — "this atom IS
+    the value of `tensor[position]`") lives on the `SymbolicInt`
+    itself, not here, because it discriminates between distinct atoms.
+    Bounds, by contrast, are advisory and don't change which atom
+    you're talking about.
     """
+    min : int | None = None
+    max : int | None = None
 
-    def __init__(self, name : str, max_value : int):
-        existing = _g_runtime_scalars.get(name)
-        if existing is not None and existing.max_value != max_value:
+
+# Bounds-and-such for SymbolicInts, keyed by the atom itself (full
+# identity — name + source — so two distinct atoms with the same
+# `name` but different `source`s don't share a registry slot).
+_g_symint_metadata : dict["SymbolicInt", SymInfo] = {}
+
+
+def symint_info(atom : "SymbolicInt") -> SymInfo | None:
+    """
+    Declared metadata for `atom`, or `None` if no factory has registered any.
+    """
+    return _g_symint_metadata.get(atom)
+
+
+def _register_symint(atom : "SymbolicInt", info : SymInfo) -> None:
+    """
+    Add `info` to the registry for `atom`. If already declared, fields
+    must be field-by-field compatible: each is either equal or one of
+    (existing, new) is `None`.
+    """
+    existing = _g_symint_metadata.get(atom)
+    if existing is None:
+        _g_symint_metadata[atom] = info
+        return
+    merged_kwargs : dict = {}
+    for field_name in ("min", "max"):
+        a = getattr(existing, field_name)
+        b = getattr(info, field_name)
+        if a is None:
+            merged_kwargs[field_name] = b
+        elif b is None or a == b:
+            merged_kwargs[field_name] = a
+        else:
             raise ValueError(
-                f"Conflicting RuntimeScalar {name!r}: existing "
-                f"max_value={existing.max_value}, new={max_value}"
+                f"Conflicting {field_name} for SymbolicInt {atom!r}: "
+                f"existing={a}, new={b}"
             )
-        self.name = name
-        self.max_value = max_value
-        self.var = LoopVariable(name)
-        _g_runtime_scalars[name] = self
-
-    def __add__(self, other) -> "AffineExpr":
-        return to_affine(self) + to_affine(other)
-
-    def __radd__(self, other) -> "AffineExpr":
-        return to_affine(other) + to_affine(self)
-
-    def __sub__(self, other) -> "AffineExpr":
-        return to_affine(self) - to_affine(other)
-
-    def __mul__(self, k : int) -> "AffineExpr":
-        return to_affine(self) * k
-
-    __rmul__ = __mul__
+    _g_symint_metadata[atom] = SymInfo(**merged_kwargs)
 
 
-def runtime_scalar_max(name : str) -> int | None:
-    """Bound declared for the named `RuntimeScalar`, or `None` if it
-    wasn't declared. Verifier calls this during natural-range
-    subsumption when a free `LoopVariable` isn't in any active
-    `LoopScope` nor `g_dim_registry`."""
-    rs = _g_runtime_scalars.get(name)
-    return rs.max_value if rs is not None else None
+def runtime_scalar(name : str, max_value : int, min_value : int = 0) -> SymbolicInt:
+    """
+    A runtime-known integer in `[min_value, max_value)`. Returns a
+    bare `SymbolicInt(name)` (no `source`) and registers its bounds
+    in `_g_symint_metadata` so the verifier reads them during
+    natural-range subsumption. Use as a `fori_loop` upper bound or
+    anywhere a `SymbolicIndex` is expected.
+    """
+    atom = SymbolicInt(name)
+    _register_symint(atom, SymInfo(min=min_value, max=max_value))
+    return atom
 
 
-SymbolicIndex = AffineExpr | LoopVariable | RuntimeScalar | int
+def runtime_scalar_max(atom_or_name) -> int | None:
+    """
+    Upper bound declared for the atom, or `None` if undeclared.
+    Verifier calls this during natural-range subsumption when a free
+    `SymbolicInt` isn't in any active `LoopScope` nor
+    `g_dim_registry`. Accepts either a `SymbolicInt` or a bare name
+    string (for the bare-atom case where source is `None` — keeps
+    old call sites that pass `v.name` working).
+    """
+    if isinstance(atom_or_name, str):
+        atom = SymbolicInt(atom_or_name)
+    else:
+        atom = atom_or_name
+    info = _g_symint_metadata.get(atom)
+    return info.max if info is not None else None
+
+
+def tensor_element(tensor_name : str, position) -> SymbolicInt:
+    """
+    A `SymbolicInt` representing the runtime value of `tensor_name`'s
+    element at `position` (e.g. `offsets[g]`). The atom carries
+    `source=(tensor_name, position)` as part of its identity, so two
+    lookups at the same position yield field-equal atoms and two
+    lookups at different positions yield distinct atoms — no string-
+    synthesis needed. The verifier's block-constant rewrite reads
+    `atom.source` to recognize when a slice is bounded by
+    `(offsets[g], offsets[g+1])`.
+    """
+    pos_aff = to_affine(position)
+    return SymbolicInt(name=tensor_name, source=(tensor_name, pos_aff))
+
+
+# Backward-compat shim — pre-refactor, `RuntimeScalar` was a class.
+# Now it's just `runtime_scalar(...)` returning a `SymbolicInt`.
+def RuntimeScalar(name : str, max_value : int) -> SymbolicInt:
+    return runtime_scalar(name, max_value)
+
+
+# Legacy registry name — empty; kept so `reset_stile()`'s old
+# `_g_runtime_scalars.clear()` line still works. Drop with the
+# `RuntimeScalar` shim.
+_g_runtime_scalars : dict[str, SymbolicInt] = {}
+
+
+# --- Index properties -----------------------------------------------------
+# A runtime index tensor (e.g. `page_table`, `expert_id`) can carry
+# declared algebraic properties — currently `"permutation"` (bijection
+# from input dim to values_in dim) and `"partition"` (each input mapped
+# to exactly one value in values_in). The verifier reads these during
+# property-driven rewrites: e.g. `scatter(gather(Y, perm), perm) = Y`
+# when `perm` is a permutation. Properties are name-keyed because the
+# user holds the typed-tensor handle but the verifier sees the bare
+# `NormalizedTensor` by name. `reset_stile()` clears the registry.
+_g_index_properties : dict[str, frozenset[str]] = {}
+
+def declare_index_properties(name : str, *properties : str) -> None:
+    """Register `properties` on the runtime-index tensor named `name`.
+    Recognized: `"permutation"`, `"partition"`. Idempotent for the same
+    set; conflicting later calls raise."""
+    new = frozenset(properties)
+    existing = _g_index_properties.get(name)
+    if existing is not None and existing != new:
+        raise ValueError(
+            f"Conflicting properties for index {name!r}: existing "
+            f"{set(existing)}, new {set(new)}"
+        )
+    _g_index_properties[name] = new
+
+
+def index_has_property(name : str, prop : str) -> bool:
+    """True iff the named runtime index has been declared with `prop`."""
+    return prop in _g_index_properties.get(name, frozenset())
+
+
+# Pairing between a block-sorted index and its offsets tensor. When
+# `eid_sorted` is declared paired with `offsets`, the verifier knows:
+# for every block `g`, positions `[offsets[g], offsets[g+1])` of
+# `eid_sorted` all equal `g`. This is what powers the block-constant
+# rewrite: a `gather(W, eid_sorted)` inside a slice bounded by
+# `(offsets[g], offsets[g+1])` collapses to `W[g]`.
+_g_block_pairings : dict[str, str] = {}  # offsets_name → paired_idx_name
+
+
+def declare_block_pairing(offsets_name : str, paired_idx_name : str) -> None:
+    """
+    Register that `paired_idx_name` is block-sorted with respect to
+    `offsets_name`: positions `[offsets_name[g], offsets_name[g+1])` of
+    the paired index all hold value `g`.
+    """
+    existing = _g_block_pairings.get(offsets_name)
+    if existing is not None and existing != paired_idx_name:
+        raise ValueError(
+            f"Conflicting block pairing for offsets {offsets_name!r}: "
+            f"existing paired with {existing!r}, new {paired_idx_name!r}"
+        )
+    _g_block_pairings[offsets_name] = paired_idx_name
+
+
+def paired_index_for_offsets(offsets_name : str) -> str | None:
+    """
+    Name of the block-sorted index paired with `offsets_name`, or `None`
+    if no pairing is declared. Used by the block-constant rewrite to
+    recognize that a slice bounded by `(offsets[g], offsets[g+1])` lies
+    within a single block of the paired index.
+    """
+    return _g_block_pairings.get(offsets_name)
+
+
+# Boundary declarations for tensors used as offsets. A boundary
+# declaration says: `tensor_name[position] == concrete_value` for one
+# specific position. Used by `TypedResult.done()` to resolve symbolic
+# slice bounds at the loop's first/last iteration into concrete values
+# for coverage checking. E.g. declaring `offsets[0] == 0` and
+# `offsets[n_experts] == n_tokens` lets `done()` verify that a
+# fori_loop over experts produces blocks that tile `[0, n_tokens)`.
+_g_tensor_boundaries : dict[tuple[str, int], int] = {}
+
+
+def declare_tensor_boundary(
+    tensor_name : str, position : int, value : int,
+) -> None:
+    """
+    Declare that `tensor_name[position]` equals `value` (a compile-time
+    int). The verifier uses this to substitute `tensor_element(tensor,
+    position)` with `value` during coverage checks. Idempotent for the
+    same `(position, value)`; conflicting declarations raise.
+    """
+    key = (tensor_name, position)
+    existing = _g_tensor_boundaries.get(key)
+    if existing is not None and existing != value:
+        raise ValueError(
+            f"Conflicting boundary declaration for {tensor_name}[{position}]: "
+            f"existing={existing}, new={value}"
+        )
+    _g_tensor_boundaries[key] = value
+
+
+def tensor_boundary(tensor_name : str, position : int) -> int | None:
+    """
+    Declared boundary value for `tensor_name[position]`, or `None` if
+    undeclared.
+    """
+    return _g_tensor_boundaries.get((tensor_name, position))
+
+
+def resolve_symbolic_index(idx) -> "SymbolicIndex":
+    """
+    Walk `idx` and replace any `tensor_element` atom whose
+    `(tensor_name, position)` is a declared boundary with the declared
+    integer value. Returns the resolved `SymbolicIndex`; concrete ints
+    are returned as plain ints. Used by `TypedResult.done()` to
+    materialize boundary slice bounds for coverage checking — the
+    user-friendly version of "evaluate `offsets[0]` to `0` knowing the
+    declaration".
+    """
+    aff = to_affine(idx)
+    result_const = aff.const
+    new_terms : dict[SymbolicInt, int] = {}
+    for v, c in aff.terms:
+        if v.source is not None:
+            tensor_name, position = v.source
+            pos_aff = to_affine(position)
+            if not pos_aff.terms:
+                pos_int = pos_aff.const
+                boundary = tensor_boundary(tensor_name, pos_int)
+                if boundary is not None:
+                    result_const += c * boundary
+                    continue
+        # No boundary substitution — keep this term.
+        new_terms[v] = new_terms.get(v, 0) + c
+    return AffineExpr(
+        result_const,
+        frozenset((v, c) for v, c in new_terms.items() if c != 0),
+    )
+
+
+SymbolicIndex = AffineExpr | SymbolicInt | int
 
 
 def to_affine(x : SymbolicIndex) -> AffineExpr:
@@ -154,10 +363,8 @@ def to_affine(x : SymbolicIndex) -> AffineExpr:
     """
     if isinstance(x, AffineExpr):
         return x
-    if isinstance(x, LoopVariable):
+    if isinstance(x, SymbolicInt):
         return AffineExpr(0, frozenset({(x, 1)}))
-    if isinstance(x, RuntimeScalar):
-        return AffineExpr(0, frozenset({(x.var, 1)}))
     if isinstance(x, int):
         return AffineExpr(x, frozenset())
     raise TypeError(f"Not a SymbolicIndex: {type(x).__name__}")

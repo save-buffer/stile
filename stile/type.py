@@ -254,9 +254,28 @@ class Gather:
     dim_in_source : FullDim
     idx : "ExprType"
 
+
+@dataclass(frozen=True)
+class Scatter:
+    """
+    `source.scatter(dim_in_dest, idx)`: dual of `Gather`. The output
+    shape replaces source's `idx`-dim with `dim_in_dest`; element
+    `output[..., idx[m], ...]` receives `source[..., m, ...]`. Positions
+    of the output not covered by any value of `idx` are zero. Opaque
+    to the verifier: two `Scatter`s with the same `source`,
+    `dim_in_dest`, and `idx` are equal; otherwise structurally
+    distinct.
+
+    Same slice-propagation story as `Gather` — the `Sliced` dim of any
+    surrounding `Reduce`/`Repeat` flows in through the type's shape.
+    """
+    source : "ExprType"
+    dim_in_dest : FullDim
+    idx : "ExprType"
+
 ExprType = (
     Constant | Tensor | UnaryOp | BinaryOp | Repeat
-    | Reduce | ParametricReduce | Gather
+    | Reduce | ParametricReduce | Gather | Scatter
 )
 
 TagTree = ExprType | TagCond
@@ -385,6 +404,33 @@ class Type:
         return Type(
             new_st,
             Gather(source=self.et, dim_in_source=dim_full_dim(dim), idx=idx.et),
+            self.dt,
+        )
+
+    def scatter(self, dim : FullDim, idx : "Type") -> "Type":
+        """
+        `self.scatter(dim, idx)`: dual of `gather`. `self` has `idx`'s
+        sole dim in its shape; the result replaces that dim with `dim`.
+        Element `result[..., idx[m], ...] = self[..., m, ...]`; other
+        positions of `result` are zero.
+        """
+        if len(idx.st) != 1:
+            raise ValueError(
+                f"scatter expects a 1-d index tensor; got shape={idx.st}"
+            )
+        idx_dim = idx.st[0]
+        if not any(dim_name(d) == dim_name(idx_dim) for d in self.st):
+            raise ValueError(
+                f"scatter source must have idx's dim "
+                f"{dim_name(idx_dim)!r} in shape "
+                f"{[dim_name(d) for d in self.st]}"
+            )
+        new_st = tuple(
+            dim if dim_name(d) == dim_name(idx_dim) else d for d in self.st
+        )
+        return Type(
+            new_st,
+            Scatter(source=self.et, dim_in_dest=dim_full_dim(dim), idx=idx.et),
             self.dt,
         )
 

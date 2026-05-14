@@ -64,6 +64,11 @@ def test_gather_tile_sum_invariant(reset):
         K_tile = K_logical.slice(N_log, k * BN, (k + 1) * BN)
         return acc + K_tile.sum(N_log).sum(D)
 
+    result = tjax.TypedResult(
+        "sum[D](sum[N_log]("
+        "gather[N_phys](K_pool:N_phys D, page_table:N_log)"
+        ")) -> "
+    )
     final = tjax.fori_loop(
         0, N_log.size // BN, body, init_val=0.0,
         invariant=(
@@ -72,6 +77,5 @@ def test_gather_tile_sum_invariant(reset):
             f"))"
         ),
     )
-
-    expected_total = K_logical.sum(N_log).sum(D)
-    assert verify_exprs_equivalent(final.type.et, expected_total.type.et)
+    result.assign(final)
+    result.done()

@@ -5,10 +5,17 @@ from .type import (
     _reset_tensor_counter,
 )
 from .indexing import (
-    LoopVariable, AffineExpr, SymbolicIndex, Domain, range_domain,
+    SymbolicInt, LoopVariable, AffineExpr, SymbolicIndex, Domain, range_domain,
     LoopScope, loop, active_loop_domain, _active_loop_scopes,
-    RuntimeScalar, _g_runtime_scalars,
+    RuntimeScalar, runtime_scalar, _g_runtime_scalars,
+    SymInfo, symint_info, _g_symint_metadata,
+    tensor_element,
+    declare_index_properties, index_has_property, _g_index_properties,
+    declare_block_pairing, paired_index_for_offsets, _g_block_pairings,
+    declare_tensor_boundary, tensor_boundary, resolve_symbolic_index,
+    _g_tensor_boundaries,
 )
+from .jax._core import _g_runtime_arrs
 
 def dim(name : str, size : int) -> FullDim:
     return FullDim(name, size)
@@ -24,6 +31,11 @@ def reset_stile():
     g_dim_registry.clear()
     _active_loop_scopes.clear()
     _g_runtime_scalars.clear()
+    _g_symint_metadata.clear()
+    _g_index_properties.clear()
+    _g_block_pairings.clear()
+    _g_tensor_boundaries.clear()
+    _g_runtime_arrs.clear()
     _reset_tensor_counter()
 
 
