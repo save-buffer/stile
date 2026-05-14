@@ -9,8 +9,10 @@ from ._core import (
     einsum,
     zeros,
     fori_loop,
+    jit,
     mask,
     runtime_index,
 )
+from ..indexing import runtime_scalar
 
 from . import random

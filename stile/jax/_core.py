@@ -6,6 +6,8 @@ except ImportError:
         "JAX support requires the jax extra: pip install stile[jax]"
     ) from None
 
+import functools
+import inspect
 import math
 
 import stile.type as t
@@ -22,9 +24,10 @@ from ..indexing import (
     SymbolicInt, AffineExpr,
     declare_index_properties, declare_block_pairing, tensor_element,
     declare_tensor_boundary, resolve_symbolic_index,
+    runtime_scalar_max,
 )
 from ..tracing import (
-    CoverageTracker, _g_runtime_arrs, _bound_as_int,
+    CoverageTracker, _g_runtime_arrs, _bound_as_int, _bound_runtime,
 )
 from .. import LoopScope, _active_loop_scopes
 
@@ -90,18 +93,60 @@ class TypedJaxArray:
         self.arr = arr
         self.type = type
 
+    # JAX pytree registration: the `arr` is the leaf (so jax.lax.fori_loop
+    # and friends can thread the array through their traced graph), the
+    # `type` is aux data (Python-static, must match across iterations).
+    # Since each tjax op derives its output type deterministically from
+    # input types, a verified loop body — whose carry-type is a fixed
+    # point — produces matching aux on every iteration.
+    def tree_flatten(self):
+        return (self.arr,), self.type
+
+    @classmethod
+    def tree_unflatten(cls, type_, children):
+        (arr,) = children
+        return cls(arr, type_)
+
     def slice(self, dim : FullDim, start : SymbolicIndex, end : SymbolicIndex) -> "TypedJaxArray":
         new_type = self.type.slice(dim, start, end)
-        start_i, end_i = as_int(start), as_int(end)
-        if self.arr is None or start_i is None or end_i is None:
+        if self.arr is None:
             return TypedJaxArray(None, new_type)
-        slice_expr = []
+        start_rt = _bound_runtime(start)
+        end_rt = _bound_runtime(end)
+        if start_rt is None or end_rt is None:
+            return TypedJaxArray(None, new_type)
+        # Concrete Python ints — fast indexing path.
+        if isinstance(start_rt, int) and isinstance(end_rt, int):
+            slice_expr = []
+            for d in self.type.st:
+                if dim_contains(d, dim):
+                    slice_expr.append(slice(start_rt, end_rt))
+                else:
+                    slice_expr.append(slice(None))
+            return TypedJaxArray(self.arr[tuple(slice_expr)], new_type)
+        # Tracer path: jax.lax.dynamic_slice needs a tracer start but a
+        # static slice size. The size = end - start must reduce to a
+        # concrete int after symbolic cancellation (the typical
+        # `k*BN`/`(k+1)*BN` shape does — terms cancel, const remains).
+        size_aff = to_affine(end) - to_affine(start)
+        if size_aff.terms:
+            raise ValueError(
+                f"Slice with tracer bounds requires a statically-known "
+                f"slice size; got bounds ({start}, {end}) with non-constant "
+                f"difference {size_aff}."
+            )
+        slice_size = size_aff.const
+        starts = []
+        sizes = []
         for d in self.type.st:
             if dim_contains(d, dim):
-                slice_expr.append(slice(start_i, end_i))
+                starts.append(start_rt)
+                sizes.append(slice_size)
             else:
-                slice_expr.append(slice(None))
-        return TypedJaxArray(self.arr[tuple(slice_expr)], new_type)
+                starts.append(0)
+                sizes.append(as_int(dim_size(d)))
+        new_arr = jax.lax.dynamic_slice(self.arr, tuple(starts), tuple(sizes))
+        return TypedJaxArray(new_arr, new_type)
 
     def repeat(self, dim : Dim) -> "TypedJaxArray":
         new_type = self.type.repeat(dim)
@@ -273,6 +318,13 @@ class TypedJaxArray:
             self.type.et,
         )
         assert are_equivalent
+
+
+jax.tree_util.register_pytree_node(
+    TypedJaxArray,
+    TypedJaxArray.tree_flatten,
+    TypedJaxArray.tree_unflatten,
+)
 
 
 def _build_predicate_array(
@@ -490,6 +542,22 @@ def fori_loop(lower, upper, body_fn, init_val, *, invariant=None):
     Signature mirrors `jax.lax.fori_loop`; same user code lowers to
     real `jax.lax.fori_loop` at runtime.
     """
+    # Tracer dispatch first: if either bound is a jax tracer (typical
+    # under `tjax.jit`'s jax-traced execution with a `RuntimeScalar`
+    # bound to a jax value), defer to `jax.lax.fori_loop`. Verification
+    # already happened on the symbolic pass — this is pure execution,
+    # so we skip the invariant check (the invariant kwarg, if any, was
+    # discharged earlier).
+    lower_rt = _bound_runtime(lower)
+    upper_rt = _bound_runtime(upper)
+    if (
+        lower_rt is not None and upper_rt is not None
+        and (
+            isinstance(lower_rt, jax.Array) or isinstance(upper_rt, jax.Array)
+        )
+    ):
+        return _fori_loop_jax_traced(lower_rt, upper_rt, body_fn, init_val)
+
     if invariant is not None:
         return _fori_loop_with_invariant(lower, upper, body_fn, init_val, invariant)
 
@@ -527,6 +595,185 @@ def fori_loop(lower, upper, body_fn, init_val, *, invariant=None):
         # after normalization — the outer max(-inf, …) collapses away when
         # `first_iter` is normalized inside the ParametricReduce.
         return _wrap_parametric_reduce(k, lower, upper, "max", first_iter)
+
+
+def _fori_loop_jax_traced(lower, upper, body_fn, init_val):
+    """
+    Execute `body_fn` via `jax.lax.fori_loop` when one of the bounds is
+    a jax tracer (typically because `tjax.jit` is running the user
+    function under `jax.jit` with a `RuntimeScalar` bound to a jax
+    value). The loop variable `i` is wrapped in a
+    `SymbolicInt(runtime_value=i)` so tjax ops inside the body see the
+    same atom shape they would during symbolic verification — their
+    `_bound_runtime` lookups then resolve to the tracer, taking the
+    `jax.lax.dynamic_slice`-style execution paths.
+
+    Only jax arrays flow through `jax.lax.fori_loop`'s carry — types
+    are stripped on the way in and re-applied on the way out, holding
+    the input type fixed across iterations. The body's *computed*
+    output type would otherwise grow per iter (each iteration adds
+    another layer of `BinaryOp` etc. to the carry's `et`), which
+    `jax.lax.fori_loop` would reject as a pytree-aux mismatch.
+    Verification has already proved the carry is a fixed point of the
+    body via the invariant, so dropping the per-iter type is safe.
+
+    Init values that arrive as Python scalars (or unshaped jax scalars)
+    are broadcast to the carry's actual shape, which we discover by
+    running the body once symbolically — `tjax.maximum(-jnp.inf,
+    tile_max)` etc. produces a `(qctx,)`-shaped output where the init
+    was `()`, and `jax.lax.fori_loop` rejects shape mismatches between
+    input and output of the body.
+
+    Verification is *not* run on this path — it happened once already,
+    on `tjax.jit`'s first call. This pass is purely for runtime
+    execution.
+    """
+    iter_var_name = f"__fori_i_{len(_active_loop_scopes)}__"
+    is_tuple = isinstance(init_val, tuple)
+    init_leaves = list(init_val) if is_tuple else [init_val]
+
+    # Discover the carry's shape by running the body once symbolically
+    # (arr=None everywhere), using a free SymbolicInt for the iter var.
+    # The output types tell us each leaf's expected shape — we use that
+    # to broadcast scalar init values for the real run.
+    sym_state_leaves = [
+        TypedJaxArray(None, leaf.type) if isinstance(leaf, TypedJaxArray)
+        else leaf
+        for leaf in init_leaves
+    ]
+    sym_state = tuple(sym_state_leaves) if is_tuple else sym_state_leaves[0]
+    i_sym_probe = SymbolicInt(name=iter_var_name)
+    sym_result = body_fn(i_sym_probe, sym_state)
+    sym_result_leaves = list(sym_result) if is_tuple else [sym_result]
+
+    init_types = []
+    init_arrs = []
+    for leaf, sym_leaf in zip(init_leaves, sym_result_leaves):
+        if isinstance(sym_leaf, TypedJaxArray):
+            target_type = sym_leaf.type
+            target_shape = tuple(as_int(dim_size(d)) for d in target_type.st)
+        else:
+            target_type = None
+            target_shape = ()
+        init_types.append(target_type)
+        if isinstance(leaf, TypedJaxArray):
+            arr = leaf.arr
+        else:
+            arr = jnp.asarray(leaf)
+        if arr.shape != target_shape:
+            arr = jnp.broadcast_to(arr, target_shape)
+        init_arrs.append(arr)
+
+    def jax_body(i, carry_arrs):
+        i_sym = SymbolicInt(name=iter_var_name, runtime_value=i)
+        wrapped = [
+            TypedJaxArray(arr, t_) if t_ is not None else arr
+            for arr, t_ in zip(carry_arrs, init_types)
+        ]
+        state = tuple(wrapped) if is_tuple else wrapped[0]
+        new_state = body_fn(i_sym, state)
+        new_leaves = list(new_state) if is_tuple else [new_state]
+        return tuple(
+            leaf.arr if isinstance(leaf, TypedJaxArray) else jnp.asarray(leaf)
+            for leaf in new_leaves
+        )
+
+    final_arrs = jax.lax.fori_loop(lower, upper, jax_body, tuple(init_arrs))
+    final_leaves = [
+        TypedJaxArray(arr, t_) if t_ is not None else arr
+        for arr, t_ in zip(final_arrs, init_types)
+    ]
+    return tuple(final_leaves) if is_tuple else final_leaves[0]
+
+
+def jit(spec : str):
+    """
+    Verify-once, run-many decorator. Takes a spec string for the
+    function's return value: on the first call, the function is run
+    symbolically (any kwarg whose name matches a declared
+    `runtime_scalar` is substituted with a bare `SymbolicInt`) and the
+    returned `TypedJaxArray`'s type is checked against `spec`. If the
+    types are equivalent, the function is `jax.jit`-compiled for fast
+    execution on subsequent calls — each call re-binds the scalar
+    kwargs as `SymbolicInt(name, runtime_value=tracer)` so the body's
+    tjax ops resolve them to live tracers via `_bound_runtime`.
+
+    Per-tile verification (`TypedResult.assign`/`done`,
+    `fori_loop(..., invariant=...)`, `assert_equivalent`) still
+    happens *inside* the function — the decorator's spec verification
+    catches the kernel's whole-function output type, and the
+    in-function checks handle the structural pieces that compose to
+    it. Both halves are required for full verification, just like
+    `TypedResult.done()` is required after `assign` calls.
+
+    Cache key: the set of `RuntimeScalar`-named kwargs. Each distinct
+    set re-verifies (analogous to `jax.jit` re-tracing on different
+    abstract input signatures).
+    """
+    def decorate(fn):
+        sig = inspect.signature(fn)
+        cache = {}
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            bound = sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+
+            # Any kwarg whose NAME matches a declared `runtime_scalar`
+            # is a RuntimeScalar-typed arg — we swap it for a
+            # `SymbolicInt` at verification time and re-wrap it with
+            # `runtime_value=tracer` at execution time.
+            scalar_names = tuple(sorted(
+                name for name in bound.arguments
+                if runtime_scalar_max(name) is not None
+            ))
+            sig_key = scalar_names
+
+            if sig_key not in cache:
+                # Verification pass: run with symbolic scalars.
+                verify_args = dict(bound.arguments)
+                for name in scalar_names:
+                    verify_args[name] = SymbolicInt(name)
+                result = fn(**verify_args)
+                if not isinstance(result, TypedJaxArray):
+                    raise TypeError(
+                        f"@tjax.jit'd function must return a TypedJaxArray "
+                        f"to verify against its spec; got {type(result).__name__}."
+                    )
+                expected = parse_spec_into_type(
+                    spec, loop_vars=set(scalar_names),
+                )
+                if not verify_exprs_equivalent(result.type.et, expected.et):
+                    raise AssertionError(
+                        f"@tjax.jit return type does not match spec.\n"
+                        f"  spec: {expected.et}\n"
+                        f"  actual: {result.type.et}"
+                    )
+
+                # Compile a jax.jit wrapper that re-injects each scalar
+                # as `SymbolicInt(name, runtime_value=tracer)`.
+                def jit_body(tensor_kwargs, scalar_kwargs):
+                    runtime_args = dict(tensor_kwargs)
+                    for name, tracer in scalar_kwargs.items():
+                        runtime_args[name] = SymbolicInt(
+                            name, runtime_value=tracer,
+                        )
+                    return fn(**runtime_args)
+
+                cache[sig_key] = jax.jit(jit_body)
+
+            compiled = cache[sig_key]
+            scalar_kwargs = {
+                name: bound.arguments[name] for name in scalar_names
+            }
+            tensor_kwargs = {
+                name: val for name, val in bound.arguments.items()
+                if name not in scalar_names
+            }
+            return compiled(tensor_kwargs, scalar_kwargs)
+
+        return wrapper
+    return decorate
 
 
 def _fori_loop_with_invariant(lower, upper, body_fn, init_val, invariant):

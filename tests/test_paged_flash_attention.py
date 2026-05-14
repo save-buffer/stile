@@ -97,15 +97,19 @@ def test_causal_paged_flash_attention_via_invariant(reset):
 
 
 def test_paged_flash_attention_dynamic_n_used_pages(reset):
-    """Decode-style paged attention with a runtime-known number of
-    used pages: the loop's upper bound is a free `LoopVariable`
-    (`n_used_pages`), not a constant. `_fori_loop_with_invariant`
-    auto-extracts free vars from the loop bounds and adds them to the
-    spec parser's `loop_vars`, so `n_used_pages` parses as a
-    symbolic identifier in the invariant and the final-comparison
-    spec. Kernel and spec both reference `n_used_pages` by name —
-    structural equality holds without the verifier ever needing its
-    concrete value, which is the whole point of early-exit decode."""
+    """
+    Decode-style paged attention with a runtime-known number of used
+    pages: the loop's upper bound is a `RuntimeScalar`, not a
+    constant. Wired via `@tjax.jit(spec=...)` — the decorator runs
+    the function once with `n_used_pages` as a bare `SymbolicInt` to
+    discharge the invariant + spec match (verifier never needs the
+    concrete value, which is the whole point of early-exit decode),
+    then `jax.jit`-compiles a wrapper that re-binds the kwarg as a
+    tracer for actual execution. The body's `tjax.fori_loop` lowers
+    to `jax.lax.fori_loop` once the upper bound is a tracer.
+    Numerically compared to a reference attention restricted to the
+    first `n_used_pages * BN` logical positions.
+    """
     dhead = dim("dhead", 4)
     qctx = dim("qctx", 1)
     N_phys = dim("N_phys", 32)
@@ -121,29 +125,7 @@ def test_paged_flash_attention_dynamic_n_used_pages(reset):
     # `[0, BN * n_used_pages)` interval is subsumed by the spec's
     # natural `[0, N_log.size)` bound. Declaring the max here lets the
     # verifier's natural-range subsumption prove that.
-    n_used_pages = RuntimeScalar("n_used_pages", max_value=N_log.size // BN + 1)
-
-    def body(k, state):
-        m, l, o = state
-        page_tile = page_table.slice(N_log, k * BN, (k + 1) * BN)
-        k_tile = K_pool.gather(N_phys, page_tile)
-        v_tile = V_pool.gather(N_phys, page_tile)
-        qk_tile = tjax.einsum(
-            Q, k_tile, "qctx dhead, N_log dhead -> N_log qctx",
-        )
-        tile_max = qk_tile.max(N_log)
-        new_max = tjax.maximum(m, tile_max)
-        logits = tjax.exp(qk_tile - new_max.repeat(qk_tile.type.st[0]))
-        tile_l = logits.sum(N_log)
-        new_l = tjax.exp(m - new_max) * l + tile_l
-        v_proj = tjax.einsum(
-            logits, v_tile, "N_log qctx, N_log dhead -> qctx dhead",
-        )
-        new_o = (
-            tjax.exp(m - new_max).repeat(dhead).rearrange(qctx, dhead) * o
-            + v_proj
-        )
-        return (new_max, new_l, new_o)
+    tjax.runtime_scalar("n_used_pages", max_value=N_log.size // BN + 1)
 
     qk = (
         "(Q:qctx dhead, "
@@ -156,20 +138,61 @@ def test_paged_flash_attention_dynamic_n_used_pages(reset):
     l_inv = f"sum[N_log where {pred}](exp({qk} - {m_inv}))"
     o_inv = f"sum[N_log where {pred}](exp({qk} - {m_inv}) * {v_log})"
 
-    init_o = tjax.zeros((qctx, dhead))
-    m_final, l_final, o_final = tjax.fori_loop(
-        0, n_used_pages, body,
-        init_val=(-jnp.inf, 0.0, init_o),
-        invariant=(m_inv, l_inv, o_inv),
+    @tjax.jit(
+        spec=f"(softmax[N_log where N_log < {BN} * n_used_pages]({qk}), "
+             f"{v_log} -> qctx dhead) -> "
+    )
+    def decode(Q, K_pool, V_pool, page_table, n_used_pages):
+        def body(k, state):
+            m, l, o = state
+            page_tile = page_table.slice(N_log, k * BN, (k + 1) * BN)
+            k_tile = K_pool.gather(N_phys, page_tile)
+            v_tile = V_pool.gather(N_phys, page_tile)
+            qk_tile = tjax.einsum(
+                Q, k_tile, "qctx dhead, N_log dhead -> N_log qctx",
+            )
+            tile_max = qk_tile.max(N_log)
+            new_max = tjax.maximum(m, tile_max)
+            logits = tjax.exp(qk_tile - new_max.repeat(qk_tile.type.st[0]))
+            tile_l = logits.sum(N_log)
+            new_l = tjax.exp(m - new_max) * l + tile_l
+            v_proj = tjax.einsum(
+                logits, v_tile, "N_log qctx, N_log dhead -> qctx dhead",
+            )
+            new_o = (
+                tjax.exp(m - new_max).repeat(dhead).rearrange(qctx, dhead) * o
+                + v_proj
+            )
+            return (new_max, new_l, new_o)
+
+        init_o = tjax.zeros((qctx, dhead))
+        _, l_final, o_final = tjax.fori_loop(
+            0, n_used_pages, body,
+            init_val=(-jnp.inf, 0.0, init_o),
+            invariant=(m_inv, l_inv, o_inv),
+        )
+        return o_final / l_final.repeat(dhead).rearrange(qctx, dhead)
+
+    # Run with a concrete `n_used_pages = 3`. Verification fires on the
+    # first call; subsequent calls would hit the cached jit-compiled
+    # version.
+    n_used = 3
+    result = decode(
+        Q=Q, K_pool=K_pool, V_pool=V_pool,
+        page_table=page_table, n_used_pages=n_used,
     )
 
-    final_attn = o_final / l_final.repeat(dhead).rearrange(qctx, dhead)
-    expected = parse_spec_into_type(
-        f"(softmax[N_log where N_log < {BN} * n_used_pages]({qk}), "
-        f"{v_log} -> qctx dhead) -> ",
-        loop_vars={"n_used_pages"},
-    )
-    assert verify_exprs_equivalent(final_attn.type.et, expected.et)
+    # Reference: standard softmax attention over the first n_used*BN
+    # logical positions (the rest of the KV cache is unused).
+    K_log = K_pool.arr[page_table.arr]
+    V_log = V_pool.arr[page_table.arr]
+    used = n_used * BN
+    qk_full = jnp.einsum("qd,nd->qn", Q.arr, K_log[:used])
+    qk_full = qk_full - jnp.max(qk_full, axis=-1, keepdims=True)
+    weights = jnp.exp(qk_full)
+    weights = weights / jnp.sum(weights, axis=-1, keepdims=True)
+    expected = jnp.einsum("qn,nd->qd", weights, V_log[:used])
+    assert jnp.allclose(result.arr, expected, atol=1e-5)
 
 
 def test_paged_flash_attention_via_invariant(reset):

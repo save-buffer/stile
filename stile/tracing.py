@@ -82,6 +82,60 @@ def _bound_as_int(x : SymbolicIndex) -> "int | None":
     return _resolve_te_to_int(x)
 
 
+def _bound_runtime(x : SymbolicIndex):
+    """
+    Resolve a `SymbolicIndex` to one of:
+      - a Python `int` (purely concrete; tjax ops take their fast path),
+      - a jax-array-like value (a `jax.Array` or tracer; tjax ops dispatch
+        to `jax.lax.dynamic_slice` / `jax.lax.fori_loop` / etc.),
+      - `None` (purely symbolic; tjax ops fall back to building only the
+        symbolic type, no runtime array).
+
+    Used by every tjax op that branches on whether its bounds are
+    concrete. The three-way split is what makes `tjax.jit` work: at
+    verification time everything's `None`; at `jax.jit`-traced execution
+    time everything's a tracer; at plain-Python execution time everything's
+    a Python int. The op chooses its execution path from the resolver's
+    answer.
+    """
+    # Already a Python int.
+    if isinstance(x, int) and not isinstance(x, bool):
+        return x
+    # Bare SymbolicInt with a runtime-bound value (tracer or int).
+    if isinstance(x, SymbolicInt):
+        if x.runtime_value is not None:
+            return x.runtime_value
+        # Try tensor-element resolution via _g_runtime_arrs (when the source
+        # is `tensor_element(name, pos)` with pos concrete + arr registered).
+        return _resolve_te_to_int(x)
+    # AffineExpr: compose runtime values term-by-term. If every term has a
+    # Python-int runtime, the result is a Python int. If any term is a
+    # jax tracer, the result is a jax expression. If any term is unbound,
+    # the whole thing is unbound.
+    if isinstance(x, AffineExpr):
+        # Try the all-Python-int fast path first.
+        as_int_val = as_int(x)
+        if as_int_val is not None:
+            return as_int_val
+        # Now check tensor-element resolution for atoms with a source.
+        te_val = _resolve_te_to_int(x)
+        if te_val is not None:
+            return te_val
+        # Mixed / tracer case: build the runtime value by summing terms.
+        result = x.const
+        has_tracer = False
+        for atom, coeff in x.terms:
+            atom_rt = _bound_runtime(atom)
+            if atom_rt is None:
+                return None
+            if not isinstance(atom_rt, int):
+                has_tracer = True
+            result = result + coeff * atom_rt
+        return result if (has_tracer or isinstance(result, int)) else None
+    # Anything else (e.g., a raw jax tracer passed directly): pass through.
+    return x
+
+
 def _symbolic_equal(a : SymbolicIndex, b : SymbolicIndex) -> bool:
     """
     Structural equality on `SymbolicIndex`. Resolves `tensor_element`

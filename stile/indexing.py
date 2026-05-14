@@ -17,7 +17,7 @@ Operator overloads on `LoopVariable` and `AffineExpr` make ordinary Python
 arithmetic produce `AffineExpr`s: `2 * i + 5`, `i - j`, `-(i)` all work.
 Scalar multiplication requires a compile-time `int`.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable
 
 
@@ -40,9 +40,18 @@ class SymbolicInt:
     `_g_symint_metadata` side registry, looked up via
     `symint_info(atom)`. Bounds are advisory and don't affect
     equality; sources do.
+
+    `runtime_value` is the execution-mode binding: a Python int or a
+    jax tracer carrying this atom's concrete value during a
+    `tjax.jit`-traced execution. Excluded from equality and hashing —
+    two SymbolicInts with the same `name`/`source` are the same atom
+    to the verifier whether or not one carries a tracer. tjax ops
+    check this field via `_bound_runtime` to decide between the
+    symbolic, concrete-int, and jax-tracer execution paths.
     """
     name : str
     source : "tuple[str, AffineExpr] | None" = None
+    runtime_value : object = field(default=None, compare=False, hash=False, repr=False)
 
     def __add__(self, other) -> "AffineExpr": return to_affine(self) + other
     def __radd__(self, other) -> "AffineExpr": return to_affine(other) + to_affine(self)

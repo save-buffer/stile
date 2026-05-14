@@ -8,6 +8,7 @@ rewrite: inside a slice bounded by `(offsets[g], offsets[g+1])`, a
 `eid_sorted` holds value `g` everywhere on that block.
 """
 import jax
+import jax.numpy as jnp
 import pytest
 
 import stile.jax as tjax
@@ -132,8 +133,6 @@ def test_fused_moe_write_block_carry(reset):
     populated array against the spec evaluated end-to-end on the same
     inputs.
     """
-    import jax.numpy as jnp
-
     n_tokens = dim("n_tokens", 16)
     d_in = dim("d_in", 4)
     d_out = dim("d_out", 8)
@@ -185,8 +184,106 @@ def test_fused_moe_write_block_carry(reset):
     assert jnp.allclose(output.arr, expected_arr, atol=1e-5)
 
 
+def test_fused_moe_top_k(reset):
+    """
+    Top-k routed MoE: each token is dispatched to `top_k` experts
+    (here, k=2). The trick is that *nothing about the verifier
+    machinery changes* — we just partition a different space. Instead
+    of `n_tokens` tokens each going to one expert, we have
+    `n_slots = n_tokens * top_k` "assignment slots" each going to one
+    expert. Flatten and sort the slots by expert id; the per-expert
+    blocks are now over slot indices, not token indices, and the same
+    block-constant rewrite / coverage check apply.
+
+    The kernel produces a slot-space intermediate (verified per-tile
+    against a slot-space spec via `TypedResult.write_block`). Outside
+    the loop a `scatter` collapses slots back to tokens, summing
+    contributions for the same token across its `top_k` chosen
+    experts. Numerically compared to a direct top-k einsum.
+    """
+    n_tokens = dim("n_tokens", 8)
+    top_k = 2
+    n_slots = dim("n_slots", 16)  # = n_tokens.size * top_k.
+    d_in = dim("d_in", 4)
+    d_out = dim("d_out", 8)
+    n_experts = dim("n_experts", 4)
+    n_offsets = dim("n_offsets", 5)
+
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(0), 3)
+    X = tjax.random.normal(k1, n_tokens, d_in, name="X")
+    W = tjax.random.normal(k2, n_experts, d_in, d_out, name="W")
+
+    # Random top-k routing per token, then flatten + sort by expert id.
+    eid_2d = jax.random.randint(k3, (n_tokens.size, top_k), 0, n_experts.size)
+    eid_flat = eid_2d.flatten()
+    token_id_flat = jnp.repeat(jnp.arange(n_tokens.size), top_k)
+    perm = jnp.argsort(eid_flat)
+    eid_sorted_values = eid_flat[perm]
+    token_id_sorted_values = token_id_flat[perm]
+    # Offsets: where each expert's block starts in the sorted slot list.
+    offsets_values = jnp.concatenate([
+        jnp.searchsorted(eid_sorted_values, jnp.arange(n_experts.size)),
+        jnp.array([n_slots.size]),
+    ])
+
+    offsets = tjax.runtime_index(
+        "offsets", n_offsets, values_in=n_slots,
+        boundary_values={0: 0, n_experts.size: n_slots.size},
+        arr=offsets_values,
+    )
+    tjax.runtime_index(
+        "eid_sorted", n_slots, values_in=n_experts,
+        block_sorted_paired_with="offsets",
+        arr=eid_sorted_values,
+    )
+    token_id_sorted = tjax.runtime_index(
+        "token_id_sorted", n_slots, values_in=n_tokens,
+        arr=token_id_sorted_values,
+    )
+
+    # Slot-space spec: per slot `s`, contribution is `X[token_id_sorted[s]]
+    # @ W[eid_sorted[s]]`. Same shape as the kernel's per-tile output —
+    # `TypedResult.write_block` verifies each tile against this and the
+    # block-constant rewrite collapses `gather(W, eid_sorted)` to `W[g]`
+    # inside each block.
+    L = tjax.TypedResult(
+        "(gather[n_experts](W:n_experts d_in d_out, eid_sorted:n_slots), "
+        "gather[n_tokens](X:n_tokens d_in, token_id_sorted:n_slots) "
+        "-> n_slots d_out) -> n_slots d_out"
+    )
+
+    def body(g, output):
+        ts_block = token_id_sorted.block_at(n_slots, offsets, g)
+        X_block = X.gather(n_tokens, ts_block)
+        W_g = W.slice(n_experts, g, to_affine(g) + 1).sum(n_experts)
+        Y_block = tjax.einsum(
+            X_block, W_g,
+            "n_slots d_in, d_in d_out -> n_slots d_out",
+        )
+        return output.write_block(Y_block)
+
+    slot_output = tjax.fori_loop(0, n_experts.size, body, init_val=L)
+    slot_output.done()
+
+    # Scatter the slot-space output back to token-space, summing the
+    # `top_k` contributions per token. `scatter`'s runtime uses
+    # `at[].add()`, so collisions accumulate exactly like the spec.
+    slot_output_typed = tjax.TypedJaxArray(
+        slot_output.arr, slot_output.expected_type,
+    )
+    final = slot_output_typed.scatter(n_tokens, token_id_sorted)
+
+    # Numerical check against the unsorted top-k spec:
+    # `output[i, d] = sum_{j} sum_{d_in} X[i, d_in] * W[eid_2d[i, j], d_in, d]`.
+    expected = jnp.einsum(
+        "nd,nkde->nke", X.arr, W.arr[eid_2d],
+    ).sum(axis=1)
+    assert jnp.allclose(final.arr, expected, atol=1e-5)
+
+
 def test_fused_moe_fori_loop_scalar(reset):
-    """The full fused-MoE loop, scalar accumulation. fori_loop over
+    """
+    The full fused-MoE loop, scalar accumulation. fori_loop over
     experts, each iter slices `X_sorted` to the expert's block via
     `block_at`, matmuls with `W[g]` (loaded once per expert), and
     contributes its block's scalar to the running total. The
@@ -196,7 +293,8 @@ def test_fused_moe_fori_loop_scalar(reset):
     `ParametricReduce` over the same body. The block-constant
     rewrite stitches the inductive step together: the per-iter body
     uses `W[g]`, the spec form uses `gather(W, eid_sorted)`, and
-    within each block they collapse to the same expression."""
+    within each block they collapse to the same expression.
+    """
     n_tokens = dim("n_tokens", 16)
     d_in = dim("d_in", 4)
     d_out = dim("d_out", 8)

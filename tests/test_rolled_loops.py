@@ -20,6 +20,29 @@ def reset():
     reset_stile()
 
 
+def _causal_flash_attention_jnp(q, k, v):
+    """
+    Causal softmax attention reference for the decode-shaped layout
+    where the `qctx` queries are the *last* `qctx_size` positions of a
+    longer `nctx`-length sequence. Query `q` attends to keys at
+    absolute positions `[0, nctx_size - qctx_size + q]` — i.e. the
+    causal mask is `k <= nctx_size - qctx_size + q`. With
+    `qctx_size == nctx_size` this reduces to the usual `k <= q`.
+    """
+    qctx_size = q.shape[0]
+    nctx_size = k.shape[0]
+    dhead = q.shape[-1]
+    offset = nctx_size - qctx_size
+    qk = jnp.einsum("qd,nd->qn", q, k) / jnp.sqrt(dhead)
+    q_idx = jnp.arange(qctx_size)[:, None]
+    k_idx = jnp.arange(nctx_size)[None, :]
+    qk = jnp.where(k_idx <= q_idx + offset, qk, -jnp.inf)
+    qk = qk - jnp.max(qk, axis=-1, keepdims=True)
+    logits = jnp.exp(qk)
+    softmax = logits / jnp.sum(logits, axis=-1, keepdims=True)
+    return jnp.einsum("qn,nd->qd", softmax, v)
+
+
 def test_rolled_tiling_covers_output(reset):
     """
     A rolled loop that tiles the M dimension in strides of 8 over [0, 32)
@@ -79,27 +102,39 @@ def test_rolled_tiling_overlap_is_caught(reset):
 
 def test_flash_attention_rolled_outer(reset):
     """
-    Outer qctx loop rolled via `tjax.fori_loop`; inner nctx loop unrolled.
-    Each qctx tile is independent (no accumulator across iterations), so
-    this roll is fully verifiable: the body's output type matches the spec
-    parametrically, and `done()` checks that the symbolic `iq*32`/`iq*32+32`
-    bounds tile the full qctx dimension as `iq` ranges over `[0, 4)`.
+    Decode-shaped causal flash attention with the outer qctx loop
+    rolled via `tjax.fori_loop` and the inner nctx loop unrolled.
+    Each qctx tile is independent (no accumulator across iterations),
+    so the roll is fully verifiable: the body's output type matches
+    the per-tile causal spec parametrically, and `done()` checks the
+    symbolic bounds tile the full qctx dimension. Shapes are
+    rectangular (`nctx >> qctx`) to mirror the realistic decode case
+    where a handful of new query positions attend to a long KV cache;
+    the causal mask uses `nctx <= qctx + offset` with `offset =
+    nctx - qctx` so the qctx positions sit at the end of the
+    sequence. Numerically verified against a reference causal
+    attention.
     """
     key = jax.random.PRNGKey(0)
     k1, k2, k3 = jax.random.split(key, 3)
-    dhead, qctx, nctx = dim('dhead', 16), dim('qctx', 128), dim('nctx', 512)
+    dhead, qctx, nctx = dim("dhead", 16), dim("qctx", 16), dim("nctx", 128)
 
     Q = tjax.random.normal(k1, qctx, dhead)
     K = tjax.random.normal(k2, nctx, dhead)
     V = tjax.random.normal(k3, nctx, dhead)
 
+    # qctx queries sit at absolute positions `[nctx - qctx, nctx)`.
+    # Causal mask: query at local position `q` sees keys at `[0, q + offset]`.
+    offset = nctx.size - qctx.size
+
     L = tjax.TypedResult(
-        "(softmax[nctx]((qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)), "
-        "nctx dhead -> qctx dhead)"
+        f"(softmax[nctx where nctx <= qctx + {offset}]"
+        f"((qctx dhead, nctx dhead -> qctx nctx) / sqrt({dhead.size})), "
+        f"nctx dhead -> qctx dhead)"
     )
 
-    qctx_tile_size = 32
-    nctx_tile_size = 32
+    qctx_tile_size = 8
+    nctx_tile_size = 16
     n_qctx_tiles = qctx.size // qctx_tile_size
 
     def body(iq, _carry):
@@ -115,6 +150,9 @@ def test_flash_attention_rolled_outer(reset):
             qk_tile = tjax.einsum(
                 q_tile, k_tile, "qctx dhead, nctx dhead -> nctx qctx",
             ) / jnp.sqrt(dhead.size)
+            qk_tile = qk_tile + tjax.mask(
+                qk_tile.type.st, f"nctx <= qctx + {offset}", 0.0, -jnp.inf,
+            )
             tile_max = qk_tile.max(nctx)
             logits = tjax.exp(qk_tile - tile_max.repeat(qk_tile.type.st[0]))
 
@@ -151,30 +189,39 @@ def test_flash_attention_rolled_outer(reset):
     tjax.fori_loop(0, n_qctx_tiles, body, None)
     L.done()
 
+    expected = _causal_flash_attention_jnp(Q.arr, K.arr, V.arr)
+    assert jnp.allclose(L.arr, expected, atol=1e-5)
+
 
 def test_flash_attention_rolled_inner(reset):
     """
-    Inner nctx loop rolled via `tjax.fori_loop` — the paged-attention shape.
-    `fori_loop` folds the body over `range(n_tiles)` during verification,
-    producing the full accumulated carry; the normalizer collapses the
-    unfolded expression and verifies the final `o` against the full
-    attention spec.
+    Decode-shaped causal flash attention with the inner nctx loop
+    rolled via `tjax.fori_loop` (the paged-attention shape) and the
+    outer qctx loop unrolled. `fori_loop` folds the body over the
+    iteration range during verification, producing the full
+    accumulated carry; the normalizer collapses the unfolded
+    expression and verifies the final `o` against the per-tile causal
+    spec. Same rectangular shape and offset as the outer-rolled test.
+    Numerically verified against a reference causal attention.
     """
     key = jax.random.PRNGKey(0)
     k1, k2, k3 = jax.random.split(key, 3)
-    dhead, qctx, nctx = dim('dhead', 16), dim('qctx', 128), dim('nctx', 512)
+    dhead, qctx, nctx = dim("dhead", 16), dim("qctx", 16), dim("nctx", 128)
 
     Q = tjax.random.normal(k1, qctx, dhead)
     K = tjax.random.normal(k2, nctx, dhead)
     V = tjax.random.normal(k3, nctx, dhead)
 
+    offset = nctx.size - qctx.size
+
     L = tjax.TypedResult(
-        "(softmax[nctx]((qctx dhead, nctx dhead -> qctx nctx) / sqrt(16)), "
-        "nctx dhead -> qctx dhead)"
+        f"(softmax[nctx where nctx <= qctx + {offset}]"
+        f"((qctx dhead, nctx dhead -> qctx nctx) / sqrt({dhead.size})), "
+        f"nctx dhead -> qctx dhead)"
     )
 
-    qctx_tile_size = 32
-    nctx_tile_size = 32
+    qctx_tile_size = 8
+    nctx_tile_size = 16
     n_nctx_tiles = nctx.size // nctx_tile_size
 
     for iqctx in range(0, qctx.size, qctx_tile_size):
@@ -188,6 +235,9 @@ def test_flash_attention_rolled_inner(reset):
             qk_tile = tjax.einsum(
                 q_tile, k_tile, "qctx dhead, nctx dhead -> nctx qctx",
             ) / jnp.sqrt(dhead.size)
+            qk_tile = qk_tile + tjax.mask(
+                qk_tile.type.st, f"nctx <= qctx + {offset}", 0.0, -jnp.inf,
+            )
             tile_max = qk_tile.max(nctx)
             logits = tjax.exp(qk_tile - tile_max.repeat(qk_tile.type.st[0]))
 
@@ -222,3 +272,6 @@ def test_flash_attention_rolled_inner(reset):
         L.assign(o)
 
     L.done()
+
+    expected = _causal_flash_attention_jnp(Q.arr, K.arr, V.arr)
+    assert jnp.allclose(L.arr, expected, atol=1e-5)
