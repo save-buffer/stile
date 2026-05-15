@@ -583,7 +583,7 @@ def cos(x : Type) -> Type:
     return Type(new_dim_type, new_expr_type, x.dt)
 
 def sqrt(x : Type) -> Type:
-    new_dim_type = x.st,
+    new_dim_type = x.st
     new_expr_type = UnaryOp(
         op="sqrt",
         child=x.et,

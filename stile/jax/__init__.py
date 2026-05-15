@@ -5,6 +5,7 @@ from ._core import (
     sin,
     cos,
     sqrt,
+    sigmoid,
     maximum,
     einsum,
     zeros,
@@ -12,6 +13,7 @@ from ._core import (
     jit,
     mask,
     runtime_index,
+    tensor,
 )
 from ..indexing import runtime_scalar
 

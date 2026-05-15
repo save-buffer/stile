@@ -494,7 +494,7 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
             dim_in_dest=dim_full_dim(dim_in_dest),
             idx=idx_et,
         )
-    elif unary_op := lex.maybe_consume_keyword("exp", "sin", "cos", "sqrt", "softmax"):
+    elif unary_op := lex.maybe_consume_keyword("exp", "sin", "cos", "sqrt", "sigmoid", "softmax"):
         pred_domain = None
         if lex.maybe_consume('['):
             if unary_op != "softmax":
@@ -510,6 +510,15 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
         lex.expect(')')
         if unary_op == "softmax":
             return st, construct_softmax(et, dim_annotation, pred_domain, st)
+        if unary_op == "sigmoid":
+            # `1 / (1 + exp(-x))` — same desugar that `tjax.sigmoid` uses.
+            neg_x = BinaryOp(op="-", lhs=Constant(0.0), rhs=et)
+            denom = BinaryOp(
+                op="+",
+                lhs=Constant(1.0),
+                rhs=UnaryOp(op="exp", child=neg_x),
+            )
+            return st, BinaryOp(op="/", lhs=Constant(1.0), rhs=denom)
 
         return st, UnaryOp(
             op=unary_op, # ty: ignore
@@ -812,7 +821,7 @@ def parse_spec_into_type(
     DIM       -> DimName | DimName '[' Integer ']'
     DimName   -> [A-Z][a-z0-9]*
     Number    -> [0-9]+ ('.' [0-9]+)?
-    UNARY_FN  -> 'exp' | 'sin' | 'cos' | 'sqrt' | 'softmax'
+    UNARY_FN  -> 'exp' | 'sin' | 'cos' | 'sqrt' | 'sigmoid' | 'softmax'
     REDUCE_OP -> 'sum' | 'max'
     """
     # Save / reset / restore the tensor-naming counter so each spec

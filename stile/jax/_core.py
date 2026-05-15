@@ -509,6 +509,10 @@ def cos(x : TypedJaxArray) -> TypedJaxArray:
     return _apply_unary(x, t.cos(x.type), jnp.cos)
 
 
+def sigmoid(x : TypedJaxArray) -> TypedJaxArray:
+    return 1.0 / (1.0 + exp(0.0 - x))
+
+
 def sqrt(x):
     """`tjax.sqrt` — eager on Python scalars, JAX-traced on TypedJaxArrays.
     Lets `tjax.sqrt(dhead.size)` (a Python int) return a concrete float
@@ -979,6 +983,23 @@ def zeros(shape : tuple[FullDim, ...]) -> TypedJaxArray:
         st=shape,
         et=t.Constant(0.0),
     )
+    return TypedJaxArray(arr, type)
+
+
+def tensor(
+    arr : "jnp.ndarray",
+    *shape : FullDim,
+    name : str,
+) -> TypedJaxArray:
+    """
+    Wrap a precomputed jax array as a named TypedJaxArray with the
+    given stile shape. Verifier sees the tensor's name as a leaf
+    (opaque); kernel + spec referring to the same name match
+    structurally. Use for precomputed constants like RoPE sign masks,
+    attention biases, etc.
+    """
+    full_dims = tuple(dim_full_dim(d) for d in shape)
+    type = Type(st=full_dims, et=t.Tensor(dims=full_dims, name=name))
     return TypedJaxArray(arr, type)
 
 
