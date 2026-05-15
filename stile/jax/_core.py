@@ -42,6 +42,15 @@ import einops
 _loop_var_resolver : dict = {}
 
 
+# Set by `tjax.jit`'s jax.jit-traced body wrapper; positive when we're
+# inside a tjax.jit-traced execution. tjax.fori_loop reads this to decide
+# whether to dispatch to jax.lax.fori_loop even when bounds are Python
+# ints — under @tjax.jit, the body's TypedResult/invariant verification
+# already fired on the symbolic pass and this pass is purely for
+# numerical execution.
+_g_jit_trace_depth = [0]
+
+
 
 
 class loop_var_binding:
@@ -65,21 +74,27 @@ def _resolve_to_runtime(symbolic, var_resolver):
     """Convert a `SymbolicIndex` (int / `LoopVariable` / `AffineExpr`)
     to a runtime value — a Python int when fully concrete, a `jnp`
     expression involving the resolver's bound jax-side values otherwise.
-    Errors if a `LoopVariable` is encountered that the resolver doesn't
-    cover."""
+    Errors if a `LoopVariable` is encountered that neither the resolver
+    nor the atom's `runtime_value` field covers."""
     s_int = as_int(symbolic)
     if s_int is not None:
         return s_int
     aff = to_affine(symbolic)
     result = aff.const
     for var, coeff in aff.terms:
-        if var.name not in var_resolver:
-            raise ValueError(
-                f"Cannot resolve symbolic LoopVariable {var.name!r} to "
-                f"a runtime value. Bind it via `loop_var_binding` or "
-                f"use a concrete slice offset."
-            )
-        result = result + coeff * var_resolver[var.name]
+        if var.name in var_resolver:
+            result = result + coeff * var_resolver[var.name]
+            continue
+        # Fallback: a `SymbolicInt` bound via `tjax.jit`'s tracer
+        # injection carries its runtime value directly on the atom.
+        if var.runtime_value is not None:
+            result = result + coeff * var.runtime_value
+            continue
+        raise ValueError(
+            f"Cannot resolve symbolic LoopVariable {var.name!r} to "
+            f"a runtime value. Bind it via `loop_var_binding` or "
+            f"use a concrete slice offset."
+        )
     return result
 
 
@@ -542,20 +557,31 @@ def fori_loop(lower, upper, body_fn, init_val, *, invariant=None):
     Signature mirrors `jax.lax.fori_loop`; same user code lowers to
     real `jax.lax.fori_loop` at runtime.
     """
-    # Tracer dispatch first: if either bound is a jax tracer (typical
-    # under `tjax.jit`'s jax-traced execution with a `RuntimeScalar`
-    # bound to a jax value), defer to `jax.lax.fori_loop`. Verification
-    # already happened on the symbolic pass — this is pure execution,
-    # so we skip the invariant check (the invariant kwarg, if any, was
-    # discharged earlier).
+    # Tracer dispatch first: when we're inside a jax-traced execution
+    # (typically under `tjax.jit`'s jit-compiled wrapper), defer to
+    # `jax.lax.fori_loop`. Two ways this can happen — either a bound
+    # is itself a jax tracer (e.g. a `RuntimeScalar` kwarg bound to a
+    # jax value), or the carry leaves are tracers (the tensor inputs
+    # are jax-traced but the loop bounds are plain Python ints). Both
+    # mean: verification already happened on the symbolic pass — this
+    # is pure execution, skip the invariant re-check.
     lower_rt = _bound_runtime(lower)
     upper_rt = _bound_runtime(upper)
-    if (
+    bounds_are_tracers = (
         lower_rt is not None and upper_rt is not None
         and (
             isinstance(lower_rt, jax.Array) or isinstance(upper_rt, jax.Array)
         )
+    )
+    if (
+        bounds_are_tracers
+        or _carry_has_tracer(init_val)
+        or _g_jit_trace_depth[0] > 0
     ):
+        if lower_rt is None or not isinstance(lower_rt, (int, jax.Array)):
+            lower_rt = as_int(lower)
+        if upper_rt is None or not isinstance(upper_rt, (int, jax.Array)):
+            upper_rt = as_int(upper)
         return _fori_loop_jax_traced(lower_rt, upper_rt, body_fn, init_val)
 
     if invariant is not None:
@@ -595,6 +621,21 @@ def fori_loop(lower, upper, body_fn, init_val, *, invariant=None):
         # after normalization — the outer max(-inf, …) collapses away when
         # `first_iter` is normalized inside the ParametricReduce.
         return _wrap_parametric_reduce(k, lower, upper, "max", first_iter)
+
+
+def _carry_has_tracer(init_val) -> bool:
+    """
+    True if any leaf of `init_val` carries a jax tracer (rather than a
+    concrete jax array or Python value). Tells `fori_loop` that we're
+    inside a jax-traced execution — the loop should run via
+    `jax.lax.fori_loop`, not the symbolic verification path.
+    """
+    leaves = init_val if isinstance(init_val, tuple) else (init_val,)
+    for leaf in leaves:
+        arr = leaf.arr if isinstance(leaf, TypedJaxArray) else leaf
+        if isinstance(arr, jax.core.Tracer):
+            return True
+    return False
 
 
 def _fori_loop_jax_traced(lower, upper, body_fn, init_val):
@@ -751,14 +792,21 @@ def jit(spec : str):
                     )
 
                 # Compile a jax.jit wrapper that re-injects each scalar
-                # as `SymbolicInt(name, runtime_value=tracer)`.
+                # as `SymbolicInt(name, runtime_value=tracer)` and marks
+                # the trace as a tjax.jit-execution pass — so
+                # tjax.fori_loop and friends know to run via jax.lax
+                # primitives instead of re-running verification.
                 def jit_body(tensor_kwargs, scalar_kwargs):
                     runtime_args = dict(tensor_kwargs)
                     for name, tracer in scalar_kwargs.items():
                         runtime_args[name] = SymbolicInt(
                             name, runtime_value=tracer,
                         )
-                    return fn(**runtime_args)
+                    _g_jit_trace_depth[0] += 1
+                    try:
+                        return fn(**runtime_args)
+                    finally:
+                        _g_jit_trace_depth[0] -= 1
 
                 cache[sig_key] = jax.jit(jit_body)
 

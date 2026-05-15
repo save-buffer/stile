@@ -165,11 +165,32 @@ def test_online_softmax_aggregates_invariant(reset):
     assert verify_exprs_equivalent(l_final.type.et, l_expected.et)
 
 
+def _softmax_jnp(qk, *, axis=-1):
+    qk = qk - jnp.max(qk, axis=axis, keepdims=True)
+    e = jnp.exp(qk)
+    return e / jnp.sum(e, axis=axis, keepdims=True)
+
+
+def _causal_attention_jnp(Q, K, V):
+    """Reference causal softmax attention (no scaling). qctx_size ==
+    nctx_size for the local tests; mask is `k_idx <= q_idx`."""
+    qctx_size = Q.shape[0]
+    nctx_size = K.shape[0]
+    qk = jnp.einsum("qd,nd->qn", Q, K)
+    q_idx = jnp.arange(qctx_size)[:, None]
+    k_idx = jnp.arange(nctx_size)[None, :]
+    qk = jnp.where(k_idx <= q_idx, qk, -jnp.inf)
+    return jnp.einsum("qn,nd->qd", _softmax_jnp(qk), V)
+
+
 def test_tiled_attention_qkv_via_invariant(reset):
-    """Plain (non-softmax) QKV-style einsum, walked tile-by-tile in
-    nctx via `fori_loop`. Single-state invariant
-    `Σ_n_in_[0,BN*k) (Q · K[n]) * V[n]` exercises slice-form reduce
-    inside a contraction with a body of shape `(qctx, dhead)`."""
+    """
+    Plain (non-softmax) QKV-style einsum walked tile-by-tile in nctx
+    via `@tjax.jit`-wrapped `fori_loop` with an invariant. Single-state
+    invariant `Σ_n_in_[0,BN*k) (Q · K[n]) * V[n]` exercises slice-form
+    reduce inside a contraction with a body of shape `(qctx, dhead)`.
+    Numerically compared to a direct `Q @ K^T @ V`-style einsum.
+    """
     dhead, qctx, nctx = dim("dhead", 4), dim("qctx", 2), dim("nctx", 8)
     BN = 4
     k1, k2, k3 = jax.random.split(jax.random.PRNGKey(0), 3)
@@ -177,42 +198,52 @@ def test_tiled_attention_qkv_via_invariant(reset):
     K = tjax.random.normal(k2, nctx, dhead, name="K")
     V = tjax.random.normal(k3, nctx, dhead, name="V")
 
-    def body(k, o):
-        k_tile = K.slice(nctx, k * BN, (k + 1) * BN)
-        v_tile = V.slice(nctx, k * BN, (k + 1) * BN)
-        qk_tile = tjax.einsum(Q, k_tile, "qctx dhead, nctx dhead -> qctx nctx")
-        return o + tjax.einsum(
-            qk_tile, v_tile, "qctx nctx, nctx dhead -> qctx dhead",
-        )
-
     o_inv = (
         f"sum[nctx where nctx < {BN} * k]("
         f"(Q:qctx dhead, K:nctx dhead -> qctx nctx) * V:nctx dhead"
         f")"
     )
 
-    o_final = tjax.fori_loop(
-        0, nctx.size // BN, body,
-        init_val=tjax.zeros((qctx, dhead)),
-        invariant=o_inv,
+    @tjax.jit(
+        spec="((Q:qctx dhead, K:nctx dhead -> qctx nctx), "
+             "V:nctx dhead -> qctx dhead) -> "
     )
+    def attn(Q, K, V):
+        def body(k, o):
+            k_tile = K.slice(nctx, k * BN, (k + 1) * BN)
+            v_tile = V.slice(nctx, k * BN, (k + 1) * BN)
+            qk_tile = tjax.einsum(
+                Q, k_tile, "qctx dhead, nctx dhead -> qctx nctx",
+            )
+            return o + tjax.einsum(
+                qk_tile, v_tile, "qctx nctx, nctx dhead -> qctx dhead",
+            )
+        return tjax.fori_loop(
+            0, nctx.size // BN, body,
+            init_val=tjax.zeros((qctx, dhead)),
+            invariant=o_inv,
+        )
 
-    expected = parse_spec_into_type(
-        "((Q:qctx dhead, K:nctx dhead -> qctx nctx), "
-        "V:nctx dhead -> qctx dhead) -> "
+    result = attn(Q=Q, K=K, V=V)
+    expected = jnp.einsum(
+        "qn,nd->qd", jnp.einsum("qd,nd->qn", Q.arr, K.arr), V.arr,
     )
-    assert verify_exprs_equivalent(o_final.type.et, expected.et)
+    assert jnp.allclose(result.arr, expected, atol=1e-5)
 
 
 def test_flash_attention_via_invariant(reset):
-    """Causal flash attention as a rolled `fori_loop` with declared
-    invariants on `(m, l, o)`. The body applies the causal mask
-    `nctx <= qctx` per tile; the invariant carries both the iteration
-    restriction `nctx < BN*k` and the causal predicate. The verifier
-    discharges base case + inductive step against the parametric
-    Hoare-style invariants; the merge across iterations uses
-    loop-var-symbolic priority in `_split_reduce_domain` to share the
-    causal extras key across tile and running aggregate."""
+    """
+    Causal flash attention as a rolled `fori_loop` with declared
+    invariants on `(m, l, o)`, wired through `@tjax.jit`. The body
+    applies the causal mask `nctx <= qctx` per tile; the invariant
+    carries both the iteration restriction `nctx < BN*k` and the
+    causal predicate. The verifier discharges base case + inductive
+    step against the Hoare-style invariants; the merge across
+    iterations uses loop-var-symbolic priority in
+    `_split_reduce_domain` to share the causal extras key across tile
+    and running aggregate. Numerically compared to a reference causal
+    attention.
+    """
     dhead, qctx, nctx = dim("dhead", 4), dim("qctx", 8), dim("nctx", 8)
     BN = 4
     k1, k2, k3 = jax.random.split(jax.random.PRNGKey(0), 3)
@@ -220,62 +251,69 @@ def test_flash_attention_via_invariant(reset):
     K = tjax.random.normal(k2, nctx, dhead, name="K")
     V = tjax.random.normal(k3, nctx, dhead, name="V")
 
-    def body(k, state):
-        m, l, o = state
-        k_tile = K.slice(nctx, k * BN, (k + 1) * BN)
-        v_tile = V.slice(nctx, k * BN, (k + 1) * BN)
-        qk_tile = tjax.einsum(
-            Q, k_tile, "qctx dhead, nctx dhead -> nctx qctx",
-        )
-        # Bias-form causal mask: 0 inside / -inf outside, matching how the
-        # spec's `max[nctx where ...]` lowers. The -inf vanishes through
-        # both max (identity) and exp (→ 0 contribution to the sum).
-        qk_tile = qk_tile + tjax.mask(qk_tile.type.st, "nctx <= qctx", 0.0, -jnp.inf)
-        tile_max = qk_tile.max(nctx)
-        new_max = tjax.maximum(m, tile_max)
-        logits = tjax.exp(qk_tile - new_max.repeat(qk_tile.type.st[0]))
-        tile_l = logits.sum(nctx)
-        new_l = tjax.exp(m - new_max) * l + tile_l
-        v_proj = tjax.einsum(
-            logits, v_tile, "nctx qctx, nctx dhead -> qctx dhead",
-        )
-        new_o = (
-            tjax.exp(m - new_max).repeat(dhead).rearrange(qctx, dhead) * o
-            + v_proj
-        )
-        return (new_max, new_l, new_o)
-
     qk = "(Q:qctx dhead, K:nctx dhead -> qctx nctx)"
     pred = f"nctx < {BN} * k && nctx <= qctx"
     m_inv = f"max[nctx where {pred}]{qk}"
     l_inv = f"sum[nctx where {pred}](exp({qk} - {m_inv}))"
     o_inv = f"sum[nctx where {pred}](exp({qk} - {m_inv}) * V:nctx dhead)"
 
-    init_o = tjax.zeros((qctx, dhead))
-    m_final, l_final, o_final = tjax.fori_loop(
-        0, nctx.size // BN, body,
-        init_val=(-jnp.inf, 0.0, init_o),
-        invariant=(m_inv, l_inv, o_inv),
+    @tjax.jit(
+        spec="(softmax[nctx where nctx <= qctx]("
+             "Q:qctx dhead, K:nctx dhead -> qctx nctx"
+             "), V:nctx dhead -> qctx dhead) -> "
     )
+    def causal_attn(Q, K, V):
+        def body(k, state):
+            m, l, o = state
+            k_tile = K.slice(nctx, k * BN, (k + 1) * BN)
+            v_tile = V.slice(nctx, k * BN, (k + 1) * BN)
+            qk_tile = tjax.einsum(
+                Q, k_tile, "qctx dhead, nctx dhead -> nctx qctx",
+            )
+            # Bias-form causal mask: 0 inside / -inf outside, matching
+            # how the spec's `max[nctx where ...]` lowers.
+            qk_tile = qk_tile + tjax.mask(
+                qk_tile.type.st, "nctx <= qctx", 0.0, -jnp.inf,
+            )
+            tile_max = qk_tile.max(nctx)
+            new_max = tjax.maximum(m, tile_max)
+            logits = tjax.exp(qk_tile - new_max.repeat(qk_tile.type.st[0]))
+            tile_l = logits.sum(nctx)
+            new_l = tjax.exp(m - new_max) * l + tile_l
+            v_proj = tjax.einsum(
+                logits, v_tile, "nctx qctx, nctx dhead -> qctx dhead",
+            )
+            new_o = (
+                tjax.exp(m - new_max).repeat(dhead).rearrange(qctx, dhead) * o
+                + v_proj
+            )
+            return (new_max, new_l, new_o)
 
-    final_attn = o_final / l_final.repeat(dhead).rearrange(qctx, dhead)
-    expected = parse_spec_into_type(
-        "(softmax[nctx where nctx <= qctx]("
-        "Q:qctx dhead, K:nctx dhead -> qctx nctx"
-        "), V:nctx dhead -> qctx dhead) -> "
-    )
-    assert verify_exprs_equivalent(final_attn.type.et, expected.et)
+        init_o = tjax.zeros((qctx, dhead))
+        _, l_final, o_final = tjax.fori_loop(
+            0, nctx.size // BN, body,
+            init_val=(-jnp.inf, 0.0, init_o),
+            invariant=(m_inv, l_inv, o_inv),
+        )
+        return o_final / l_final.repeat(dhead).rearrange(qctx, dhead)
+
+    result = causal_attn(Q=Q, K=K, V=V)
+    expected = _causal_attention_jnp(Q.arr, K.arr, V.arr)
+    assert jnp.allclose(result.arr, expected, atol=1e-5)
 
 
 def test_flash_attention_via_invariant_skip_tail(reset):
-    """Causal flash attention with `nctx > qctx` and the loop stopping
+    """
+    Causal flash attention with `nctx > qctx` and the loop stopping
     early — only walking nctx tiles up to `qctx_size/BN`, skipping the
     tail where every position is above the causal diagonal. inv[K] is
-    `n in [0, BN*K) ∩ {n ≤ q}`; the spec is `n in [0, nctx_size) ∩ {n
-    ≤ q}`. With `q ∈ [0, qctx_size)` and `BN*K = qctx_size ≤ nctx_size`,
-    both `n < BN*K` and `n < nctx_size` are subsumed by `n ≤ q`, so the
-    bound-subsumption pass collapses them to the same canonical
-    `{n ≥ 0, n ≤ q}` form."""
+    `n in [0, BN*K) ∩ {n ≤ q}`; the spec is `n in [0, nctx_size) ∩
+    {n ≤ q}`. With `q ∈ [0, qctx_size)` and `BN*K = qctx_size ≤
+    nctx_size`, both `n < BN*K` and `n < nctx_size` are subsumed by
+    `n ≤ q`, so the bound-subsumption pass collapses them to the same
+    canonical `{n ≥ 0, n ≤ q}` form. Numerically verified against a
+    causal-masked reference attention.
+    """
     dhead, qctx, nctx = dim("dhead", 4), dim("qctx", 8), dim("nctx", 16)
     BN = 4
     k1, k2, k3 = jax.random.split(jax.random.PRNGKey(0), 3)
@@ -283,48 +321,56 @@ def test_flash_attention_via_invariant_skip_tail(reset):
     K = tjax.random.normal(k2, nctx, dhead, name="K")
     V = tjax.random.normal(k3, nctx, dhead, name="V")
 
-    def body(k, state):
-        m, l, o = state
-        k_tile = K.slice(nctx, k * BN, (k + 1) * BN)
-        v_tile = V.slice(nctx, k * BN, (k + 1) * BN)
-        qk_tile = tjax.einsum(
-            Q, k_tile, "qctx dhead, nctx dhead -> nctx qctx",
-        )
-        qk_tile = qk_tile + tjax.mask(qk_tile.type.st, "nctx <= qctx", 0.0, -jnp.inf)
-        tile_max = qk_tile.max(nctx)
-        new_max = tjax.maximum(m, tile_max)
-        logits = tjax.exp(qk_tile - new_max.repeat(qk_tile.type.st[0]))
-        tile_l = logits.sum(nctx)
-        new_l = tjax.exp(m - new_max) * l + tile_l
-        v_proj = tjax.einsum(
-            logits, v_tile, "nctx qctx, nctx dhead -> qctx dhead",
-        )
-        new_o = (
-            tjax.exp(m - new_max).repeat(dhead).rearrange(qctx, dhead) * o
-            + v_proj
-        )
-        return (new_max, new_l, new_o)
-
     qk = "(Q:qctx dhead, K:nctx dhead -> qctx nctx)"
     pred = f"nctx < {BN} * k && nctx <= qctx"
     m_inv = f"max[nctx where {pred}]{qk}"
     l_inv = f"sum[nctx where {pred}](exp({qk} - {m_inv}))"
     o_inv = f"sum[nctx where {pred}](exp({qk} - {m_inv}) * V:nctx dhead)"
 
-    init_o = tjax.zeros((qctx, dhead))
-    m_final, l_final, o_final = tjax.fori_loop(
-        0, qctx.size // BN, body,
-        init_val=(-jnp.inf, 0.0, init_o),
-        invariant=(m_inv, l_inv, o_inv),
+    @tjax.jit(
+        spec="(softmax[nctx where nctx <= qctx]("
+             "Q:qctx dhead, K:nctx dhead -> qctx nctx"
+             "), V:nctx dhead -> qctx dhead) -> "
     )
+    def causal_attn_skip_tail(Q, K, V):
+        def body(k, state):
+            m, l, o = state
+            k_tile = K.slice(nctx, k * BN, (k + 1) * BN)
+            v_tile = V.slice(nctx, k * BN, (k + 1) * BN)
+            qk_tile = tjax.einsum(
+                Q, k_tile, "qctx dhead, nctx dhead -> nctx qctx",
+            )
+            qk_tile = qk_tile + tjax.mask(
+                qk_tile.type.st, "nctx <= qctx", 0.0, -jnp.inf,
+            )
+            tile_max = qk_tile.max(nctx)
+            new_max = tjax.maximum(m, tile_max)
+            logits = tjax.exp(qk_tile - new_max.repeat(qk_tile.type.st[0]))
+            tile_l = logits.sum(nctx)
+            new_l = tjax.exp(m - new_max) * l + tile_l
+            v_proj = tjax.einsum(
+                logits, v_tile, "nctx qctx, nctx dhead -> qctx dhead",
+            )
+            new_o = (
+                tjax.exp(m - new_max).repeat(dhead).rearrange(qctx, dhead) * o
+                + v_proj
+            )
+            return (new_max, new_l, new_o)
 
-    final_attn = o_final / l_final.repeat(dhead).rearrange(qctx, dhead)
-    expected = parse_spec_into_type(
-        "(softmax[nctx where nctx <= qctx]("
-        "Q:qctx dhead, K:nctx dhead -> qctx nctx"
-        "), V:nctx dhead -> qctx dhead) -> "
-    )
-    assert verify_exprs_equivalent(final_attn.type.et, expected.et)
+        init_o = tjax.zeros((qctx, dhead))
+        _, l_final, o_final = tjax.fori_loop(
+            0, qctx.size // BN, body,
+            init_val=(-jnp.inf, 0.0, init_o),
+            invariant=(m_inv, l_inv, o_inv),
+        )
+        return o_final / l_final.repeat(dhead).rearrange(qctx, dhead)
+
+    result = causal_attn_skip_tail(Q=Q, K=K, V=V)
+    # Reference: causal-masked over all nctx, but the kernel only walks
+    # the first qctx_size positions — the tail is entirely above the
+    # diagonal so contributes nothing to a causal softmax.
+    expected = _causal_attention_jnp(Q.arr, K.arr, V.arr)
+    assert jnp.allclose(result.arr, expected, atol=1e-5)
 
 
 def test_tuple_state_invariant(reset):
