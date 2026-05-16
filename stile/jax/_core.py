@@ -51,6 +51,15 @@ _loop_var_resolver : dict = {}
 _g_jit_trace_depth = [0]
 
 
+# Stack of tile-context dim overrides — one entry per nested
+# `typed_pallas_call`. Each entry is a tuple of `Sliced` (or `FullDim`)
+# dims that should replace any matching-name `FullDim` in invariant
+# types being verified inside the kernel. Lets the Hoare-invariant
+# machinery (`_fori_loop_with_invariant`) prove a rolled inner loop
+# whose body operates on a tile-sliced piece of the full shape.
+_g_active_tile_overrides : list = []
+
+
 
 
 class loop_var_binding:
@@ -588,6 +597,31 @@ def fori_loop(lower, upper, body_fn, init_val, *, invariant=None):
             upper_rt = as_int(upper)
         return _fori_loop_jax_traced(lower_rt, upper_rt, body_fn, init_val)
 
+    # Inside a Pallas kernel (active tile context), an invariant-bearing
+    # fori_loop needs BOTH the Hoare-style proof AND runtime execution:
+    # `_fori_loop_with_invariant` discharges the proof (with tile-aware
+    # `override_dims_in_type`) and returns the symbolic
+    # `invariant[k=upper]` type; `_fori_loop_jax_traced` compiles to a
+    # real `jax.lax.fori_loop` for the hardware loop. Combine: keep the
+    # invariant-derived types (downstream consumers and the
+    # `OutputSpec.assign` check see the proved spec, not the body's
+    # one-iter expression) and graft on the runtime arrays.
+    if _g_active_tile_overrides and invariant is not None:
+        symbolic = _fori_loop_with_invariant(
+            lower, upper, body_fn, init_val, invariant,
+        )
+        runtime = _fori_loop_jax_traced(
+            as_int(lower), as_int(upper), body_fn, init_val,
+        )
+        is_tuple_state = isinstance(symbolic, tuple)
+        sym_leaves = list(symbolic) if is_tuple_state else [symbolic]
+        rt_leaves = list(runtime) if is_tuple_state else [runtime]
+        combined = []
+        for sym, rt in zip(sym_leaves, rt_leaves):
+            arr = rt.arr if isinstance(rt, TypedJaxArray) else rt
+            combined.append(TypedJaxArray(arr, sym.type))
+        return tuple(combined) if is_tuple_state else combined[0]
+
     if invariant is not None:
         return _fori_loop_with_invariant(lower, upper, body_fn, init_val, invariant)
 
@@ -859,6 +893,16 @@ def _fori_loop_with_invariant(lower, upper, body_fn, init_val, invariant):
         else parse_spec_into_type(s, loop_vars=loop_vars_for_spec)
         for s in inv_strs
     ]
+    # If we're inside a `typed_pallas_call`, the kernel body operates
+    # on tile-sliced refs — restrict each invariant's `FullDim`s to the
+    # tile's `Sliced` overrides so the body's Sliced types match the
+    # invariant's. Same `override_dims_in_type` mechanism the output
+    # spec already uses.
+    if _g_active_tile_overrides:
+        tile_overrides = _g_active_tile_overrides[-1]
+        inv_types = [
+            override_dims_in_type(t, *tile_overrides) for t in inv_types
+        ]
     k_var = LoopVariable("k")
 
     # 1. Base case: init_val == invariant[k=0].

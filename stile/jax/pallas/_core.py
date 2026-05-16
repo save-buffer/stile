@@ -38,7 +38,7 @@ from ...type import (
 from ...indexing import LoopVariable
 from ...specification import parse_spec_into_type
 from ...verification import verify_types_equivalent
-from .._core import TypedJaxArray, loop_var_binding
+from .._core import TypedJaxArray, loop_var_binding, _g_active_tile_overrides
 
 
 @dataclass
@@ -192,8 +192,20 @@ def typed_pallas_call(
                     sliced_out_st, tile_spec.et, out_type.dt,
                 )
                 wrapped_output.output_spec = out_type
-                with loop_var_binding(pid_runtime):
-                    kernel_fn(*wrapped_inputs, wrapped_output)
+                # The tile context: every Sliced dim that the kernel
+                # body operates on. Inner `tjax.fori_loop(..., invariant=...)`
+                # calls read this stack to restrict their parsed
+                # invariant types to the tile, so the body's Sliced
+                # types match the invariant's during verification.
+                tile_overrides = tuple(
+                    d for d in sliced_out_st if isinstance(d, Sliced)
+                )
+                _g_active_tile_overrides.append(tile_overrides)
+                try:
+                    with loop_var_binding(pid_runtime):
+                        kernel_fn(*wrapped_inputs, wrapped_output)
+                finally:
+                    _g_active_tile_overrides.pop()
             else:
                 wrapped_inputs = [
                     TypedRef(ref, ti.type)

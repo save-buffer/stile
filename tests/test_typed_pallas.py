@@ -272,6 +272,104 @@ def test_flash_attention(reset):
     assert jnp.allclose(result.arr, expected, atol=1e-5)
 
 
+def test_flash_attention_rolled_inner(reset):
+    """
+    Flash attention with the inner nctx loop rolled via
+    `tjax.fori_loop(..., invariant=...)` instead of Python-unrolled.
+    The carry is `(m, l, o)` where `o` is the *un-normalized*
+    numerator `sum(exp(qk - m_new) * V)` and `l` is the denominator
+    `sum(exp(qk - m_new))` — both running aggregates against the
+    latest running max. The final softmax-normalized output is `o / l`,
+    computed once after the loop. Exercises the tile-aware invariant
+    machinery: `typed_pallas_call` pushes the kernel's Sliced overrides
+    onto an active-tile stack and `_fori_loop_with_invariant` runs
+    `override_dims_in_type` on the parsed invariant Types so the body's
+    Sliced qctx matches the invariant's.
+    """
+    qctx = dim("qctx", 16)
+    nctx = dim("nctx", 16)
+    dhead = dim("dhead", 16)
+    BQ = 8
+    BN = 8
+    n_nctx_tiles = nctx.size // BN
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(0), 3)
+    Q = tjax.random.normal(k1, qctx, dhead, name="Q")
+    K = tjax.random.normal(k2, nctx, dhead, name="K")
+    V = tjax.random.normal(k3, nctx, dhead, name="V")
+
+    qk_str = (
+        f"(Q:qctx dhead, K:nctx dhead -> qctx nctx) / sqrt({dhead.size})"
+    )
+    pred = f"nctx < {BN} * k"
+    m_inv = f"max[nctx where {pred}]({qk_str})"
+    l_inv = f"sum[nctx where {pred}](exp(({qk_str}) - {m_inv}))"
+    o_inv = (
+        f"sum[nctx where {pred}](exp(({qk_str}) - {m_inv}) * V:nctx dhead)"
+    )
+
+    def kernel(q_ref, k_ref, v_ref, o_ref):
+        q = q_ref.load()
+        k_full = k_ref.load()
+        v_full = v_ref.load()
+
+        def body(ki, state):
+            m, l, o = state
+            ictx = ki * BN
+            k = k_full.slice(nctx, ictx, ictx + BN)
+            v = v_full.slice(nctx, ictx, ictx + BN)
+            qk_tile = tjax.einsum(
+                q, k, "qctx dhead, nctx dhead -> qctx nctx",
+            ) / tjax.sqrt(dhead.size)
+            sliced_nctx = qk_tile.type.st[1]
+            tile_max = qk_tile.max(nctx)
+            new_max = tjax.maximum(tile_max, m)
+            # `new_max` (not `tile_max`) in the exp so the per-iter
+            # contribution to `l`/`o` is anchored on the running max —
+            # matches the un-normalized invariant form.
+            logits = tjax.exp(
+                qk_tile - new_max.repeat(sliced_nctx).rearrange(qctx, nctx)
+            )
+            tile_l = logits.sum(nctx)
+            new_l = tjax.exp(m - new_max) * l + tile_l
+            v_proj = tjax.einsum(
+                logits, v, "qctx nctx, nctx dhead -> qctx dhead",
+            )
+            new_o = (
+                tjax.exp(m - new_max).repeat(dhead).rearrange(qctx, dhead) * o
+                + v_proj
+            )
+            return (new_max, new_l, new_o)
+
+        _, l_final, o_final = tjax.fori_loop(
+            0, n_nctx_tiles, body,
+            init_val=(-jnp.inf, 0.0, 0.0),
+            invariant=(m_inv, l_inv, o_inv),
+        )
+        attn = o_final / l_final.repeat(dhead).rearrange(qctx, dhead)
+        o_ref.assign(attn)
+
+    result = tpl.typed_pallas_call(
+        kernel,
+        out_type=tpl.OutputSpec(
+            "(softmax[nctx]((Q:qctx dhead, K:nctx dhead -> qctx nctx) "
+            f"/ sqrt({dhead.size})), V:nctx dhead -> qctx dhead)",
+            (qctx, dhead), jnp.float32,
+        ),
+        grid=(qctx.size // BQ,),
+        in_specs=[
+            pl.BlockSpec((BQ, dhead.size), lambda m: (m, 0)),
+            pl.BlockSpec((nctx.size, dhead.size), lambda m: (0, 0)),
+            pl.BlockSpec((nctx.size, dhead.size), lambda m: (0, 0)),
+        ],
+        out_specs=pl.BlockSpec((BQ, dhead.size), lambda m: (m, 0)),
+    )(Q, K, V)
+
+    qk_full = jnp.einsum("qd,nd->qn", Q.arr, K.arr) / jnp.sqrt(dhead.size)
+    softmax_full = jax.nn.softmax(qk_full, axis=-1)
+    expected = jnp.einsum("qn,nd->qd", softmax_full, V.arr)
+    assert jnp.allclose(result.arr, expected, atol=1e-5)
+
+
 def test_causal_flash_attention(reset):
     """Causal flash attention on Pallas: streaming online softmax over
     nctx tiles with a per-tile bias mask. Same shape as the dense

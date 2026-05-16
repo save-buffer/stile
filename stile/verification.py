@@ -1293,6 +1293,28 @@ def _absorb_max_boundaries(children : list["NormalizedExpr"]) -> list["Normalize
     return others + result
 
 
+def _common_positive_scalar(children) -> "float | None":
+    """
+    If every child has form `c * single_factor` (`num.const = c`, exactly
+    one `num.factor`, trivial denominator) with the same positive `c`,
+    return `c`. Else `None`. Used by `make_max` to factor `Max(c*A, c*B)`
+    → `c * Max(A, B)` when `c > 0`.
+    """
+    consts : set[float] = set()
+    for c in children:
+        if c.den.factors or c.den.const != 1.0:
+            return None
+        if c.num.const <= 0:
+            return None
+        if len(c.num.factors) != 1:
+            return None
+        consts.add(c.num.const)
+    if len(consts) != 1:
+        return None
+    (const,) = consts
+    return const
+
+
 def make_max(children) -> "NormalizedExpr":
     """Build a canonical NormalizedMax. Flattens nested maxes, drops -inf terms
     (identity for max), merges max-Reduce children that share dim and child by
@@ -1311,6 +1333,26 @@ def make_max(children) -> "NormalizedExpr":
 
     # Drop -inf children — they are the identity for max.
     flat = [c for c in flat if not (_is_pure_const(c) and c.num.const == float("-inf"))]
+
+    # Pull a common positive scalar out: `Max(c*A, c*B, …) = c*Max(A, B, …)`
+    # when `c > 0`. Lets per-tile reduces with a shared scaling
+    # (e.g. `qk / sqrt(d)` per tile) tile-merge — the inner `Max(A, B, …)`
+    # then has pure single-factor children that the per-Reduce grouping
+    # below can pick up.
+    common = _common_positive_scalar(flat)
+    if common is not None and common != 1.0:
+        scaled = [
+            NormalizedExpr.of(NormalizedProduct(
+                const=c.num.const / common,
+                factors=c.num.factors,
+            ))
+            for c in flat
+        ]
+        inner = make_max(scaled)
+        return mul(
+            NormalizedExpr.of(NormalizedProduct(const=common)),
+            inner,
+        )
 
     # Group max-Reduce children by (dim, body, cross-variable extras) so
     # tagged-with-shared-predicate max-reduces fuse alongside the plain
