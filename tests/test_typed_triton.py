@@ -100,3 +100,102 @@ def test_scalar_multiply(reset):
 
     result = double[(N.size // BLOCK,)](x, BLOCK=BLOCK)
     assert torch.allclose(result.tensor, x_arr * 2, atol=1e-5)
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
+def test_scalar_multiply_slice_syntax(reset):
+    """
+    Same kernel, but using `ttl.load(ptr, DIM[lo:hi])` /
+    `ttl.store(ptr, value, DIM[lo:hi])` — the stile-flavored slice
+    syntax that mirrors `.slice(dim, lo, hi)`. The source-level
+    rewriter turns these into raw `tl.load`/`tl.store` with offsets
+    + mask before handing the function to `@triton.jit`.
+    """
+    N = dim("TTN", 128)
+    BLOCK = 32
+
+    @ttl.jit(
+        spec="2 * X:TTN",
+        inputs={"X_ptr": "X:TTN"},
+        out_shape=(N,),
+        out_dtype=torch.float32,
+    )
+    def double(X_ptr, o_ptr, BLOCK : tl.constexpr):
+        pid = tl.program_id(0)
+        X = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
+        result = X * 2
+        ttl.store(o_ptr, result, N[pid * BLOCK : (pid + 1) * BLOCK])
+
+    x_arr = torch.randn(N.size, device="cuda")
+    x_type = Type(st=(N,), et=Tensor(dims=(N,), name="X"))
+    x = TypedTorchTensor(x_arr, x_type)
+
+    result = double[(N.size // BLOCK,)](x, BLOCK=BLOCK)
+    assert torch.allclose(result.tensor, x_arr * 2, atol=1e-5)
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
+def test_matmul(reset):
+    """
+    Simple non-K-tiled matmul. Each program computes one BLOCK_M ×
+    BLOCK_N tile of C from a full M × K column-strip of A and full
+    K × N row-strip of B. Demonstrates multi-dim `ttl.load`/`ttl.store`
+    with the `DIM[lo:hi]` syntax plus `tl.dot` interpretation.
+    """
+    M = dim("M", 32)
+    N = dim("N", 32)
+    K = dim("K", 32)
+    BLOCK_M = 16
+    BLOCK_N = 16
+    BLOCK_K = K.size  # whole K in one tile
+
+    @ttl.jit(
+        spec="(A:M K, B:K N -> M N)",
+        inputs={"A_ptr": "A:M K", "B_ptr": "B:K N"},
+        out_shape=(M, N),
+        out_dtype=torch.float32,
+    )
+    def matmul(
+        A_ptr, B_ptr, C_ptr,
+        BLOCK_M : tl.constexpr, BLOCK_N : tl.constexpr,
+        BLOCK_K : tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        a = ttl.load(
+            A_ptr,
+            M[pid_m * BLOCK_M : (pid_m + 1) * BLOCK_M],
+            K[0 : BLOCK_K],
+        )
+        b = ttl.load(
+            B_ptr,
+            K[0 : BLOCK_K],
+            N[pid_n * BLOCK_N : (pid_n + 1) * BLOCK_N],
+        )
+        c = tl.dot(a, b)
+        ttl.store(
+            C_ptr, c,
+            M[pid_m * BLOCK_M : (pid_m + 1) * BLOCK_M],
+            N[pid_n * BLOCK_N : (pid_n + 1) * BLOCK_N],
+        )
+
+    a_arr = torch.randn(M.size, K.size, device="cuda")
+    b_arr = torch.randn(K.size, N.size, device="cuda")
+    a = TypedTorchTensor(
+        a_arr, Type(st=(M, K), et=Tensor(dims=(M, K), name="A")),
+    )
+    b = TypedTorchTensor(
+        b_arr, Type(st=(K, N), et=Tensor(dims=(K, N), name="B")),
+    )
+    result = matmul[(M.size // BLOCK_M, N.size // BLOCK_N)](
+        a, b,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    # `tl.dot` defaults to tf32, so the result differs from PyTorch's
+    # fp32 matmul by a small absolute drift (verified bit-for-bit
+    # equal when `input_precision="ieee"` is passed). Tolerance
+    # reflects the tf32 path.
+    expected = a_arr @ b_arr
+    assert torch.allclose(result.tensor, expected, atol=2e-2, rtol=1e-3)
