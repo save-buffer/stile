@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 import stile.type as t
 from ..type import (
-    Type, ShapeType, Tensor, Constant, BinaryOp, UnaryOp,
+    Type, ShapeType, Tensor, Constant, BinaryOp, UnaryOp, Sliced,
     dim_size, dim_full_dim, dim_name, as_int,
 )
 from ..specification import parse_spec_into_type
@@ -38,6 +38,7 @@ def jit(
     inputs : dict[str, str],
     out_shape : ShapeType,
     out_dtype : object = None,
+    consts : "dict[str, int] | None" = None,
 ):
     """
     Decorator producing a typed Triton kernel.
@@ -70,7 +71,10 @@ def jit(
         # Verification: abstract-interpret the body. Raises if any
         # `tl.store` writes a value whose stile ET doesn't match the
         # declared spec.
-        _verify_kernel(fn_def, inputs, spec, out_shape, out_dtype)
+        _verify_kernel(
+            fn_def, inputs, spec, out_shape, out_dtype, fn,
+            consts=consts or {},
+        )
 
         # Re-emit: strip stile decorator + input annotations, add
         # @triton.jit, exec to define the runtime kernel.
@@ -78,9 +82,18 @@ def jit(
 
         return TypedTritonKernel(
             triton_fn, spec, inputs, out_shape, out_dtype,
+            consts=consts or {},
         )
 
     return decorate
+
+
+class _ProgramIdMarker:
+    """Sentinel returned by `_interpret_expr` for `tl.program_id(N)`.
+    The surrounding `Assign(target=Name, value=ProgramId)` binds the
+    target name as a fresh `SymbolicInt` in env so subsequent
+    `target * BLOCK` arithmetic resolves symbolically."""
+    pass
 
 
 def _is_ttl_call(node, name : str) -> bool:
@@ -94,80 +107,266 @@ def _is_ttl_call(node, name : str) -> bool:
     )
 
 
-def _verify_kernel(fn_def, inputs, spec, out_shape, out_dtype):
+def _verify_kernel(
+    fn_def, inputs, spec, out_shape, out_dtype, original_fn, consts=None,
+):
     """
     Abstract-interpret the kernel's body to build per-variable stile
-    Types, then check each `tl.store(...)`'s value against the spec.
+    Types, then check each store against the spec. Handles:
+      - `Assign`: `x = <expr>` binds env[x] = expr's stile Type.
+      - `AugAssign`: `acc += <expr>` updates env[acc] via the op.
+      - `For` over `range(lo, hi, step)` with concrete bounds: unroll
+        and walk the body once per iteration with the loop var bound
+        to the concrete int. `_interpret_expr` then resolves slice
+        bounds to concrete `Sliced` dims, and the verifier's existing
+        tile-merge folds the sum-of-slices into a full reduce.
+      - `Expr(Call)` of `tl.store` / `ttl.store` against the output
+        pointer: verifies the stored value's Type against the spec
+        (tile-restricted to the slice).
 
-    Pattern recognition (first pass, kernel-by-kernel):
-      - Assignment `x = tl.load(p + offs, mask=…)` → if `p` is one of
-        the declared input pointers, bind `x` to that input's stile
-        `Tensor` ET.
-      - Assignment `x = <arith on tracked vars or constants>` → build
-        a `BinaryOp` / `UnaryOp` / `Constant` ET.
-      - `tl.store(p_out + offs, value, mask=…)` → if `p_out` is the
-        output pointer, verify `value`'s stile ET against the spec.
+    `dim_atoms` maps each Python identifier visible in the kernel's
+    closure to its `FullDim` (so `K[lo:hi]` resolves the dim atom by
+    Python name, and `range(0, K, BLOCK_K)` resolves `K` and
+    `BLOCK_K` to concrete ints for unrolling).
     """
     spec_type = parse_spec_into_type(spec)
 
-    # Resolve `inputs={"X_ptr": "X:N"}` into a map from pointer-arg
-    # name → stile `Type`.
     input_types : dict[str, Type] = {}
     for ptr_name, ptr_spec in inputs.items():
         input_types[ptr_name] = parse_spec_into_type(ptr_spec)
 
-    # The output pointer is whatever positional arg comes immediately
-    # after the input pointers. Convention: first N args are pointers
-    # (N = len(inputs)), next is the output pointer, then any constexpr
-    # / scalar args.
     arg_names = [a.arg for a in fn_def.args.args]
     out_ptr_name = arg_names[len(inputs)]
 
-    env : dict[str, Type] = {}
+    dim_atoms = _collect_dim_atoms(original_fn)
+    env : dict[str, object] = {}
+    if consts is not None:
+        env.update(consts)
 
-    for stmt in fn_def.body:
+    def visit(stmt):
         if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
             target = stmt.targets[0].id
-            et = _interpret_expr(stmt.value, env, input_types)
-            if et is not None:
-                env[target] = et
+            val = _interpret_expr(stmt.value, env, input_types, dim_atoms)
+            if isinstance(val, _ProgramIdMarker):
+                from ..indexing import SymbolicInt
+                env[target] = SymbolicInt(name=target)
+            elif val is not None:
+                env[target] = val
+        elif isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name):
+            target = stmt.target.id
+            rhs = _interpret_expr(stmt.value, env, input_types, dim_atoms)
+            if target in env and rhs is not None:
+                op_str = {
+                    ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/",
+                }.get(type(stmt.op))
+                if op_str is not None:
+                    env[target] = t.type_from_binary_op(env[target], rhs, op_str)
+        elif isinstance(stmt, ast.For):
+            _unroll_for(stmt, env, visit, dim_atoms)
         elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
             call = stmt.value
-            # tl.store(p_out + offs, value, mask=…) — verification point.
             if _is_tl_call(call, "store"):
                 store_ptr = call.args[0]
                 store_val = call.args[1]
                 base = _peel_pointer_base(store_ptr)
                 if base == out_ptr_name:
-                    _verify_stored_value(store_val, env, input_types, spec_type)
-            # ttl.store(p_out, value, DIM, start, end) — stile-flavored
-            # store. The dim/start/end name the slice along DIM; for
-            # verification we only care that `value`'s type matches the
-            # spec.
+                    _verify_stored_value(
+                        store_val, env, input_types, dim_atoms,
+                        spec_type, slices=None, out_shape=out_shape,
+                    )
             elif _is_ttl_call(call, "store"):
                 store_ptr = call.args[0]
                 store_val = call.args[1]
+                slices = call.args[2:]
                 if (
                     isinstance(store_ptr, ast.Name)
                     and store_ptr.id == out_ptr_name
                 ):
-                    _verify_stored_value(store_val, env, input_types, spec_type)
+                    _verify_stored_value(
+                        store_val, env, input_types, dim_atoms,
+                        spec_type, slices=slices, out_shape=out_shape,
+                    )
+
+    for stmt in fn_def.body:
+        visit(stmt)
 
 
-def _verify_stored_value(value_node, env, input_types, spec_type):
-    """Verify a kernel's output value against the spec."""
-    val_type = _interpret_expr(value_node, env, input_types)
+def _collect_dim_atoms(fn) -> dict:
+    """Build `name -> FullDim` for every closure / global that's a
+    stile dim. Used by the AST-to-SymbolicIndex evaluator to resolve
+    things like `K[lo:hi]` and `range(0, K, BLOCK_K)`."""
+    out : dict = {}
+    closure = fn.__closure__ or ()
+    for name, cell in zip(fn.__code__.co_freevars, closure):
+        try:
+            val = cell.cell_contents
+        except ValueError:
+            continue
+        if hasattr(val, "name") and hasattr(val, "size") and isinstance(val.size, int):
+            out[name] = val
+    for name, val in fn.__globals__.items():
+        if hasattr(val, "name") and hasattr(val, "size") and isinstance(val.size, int):
+            out.setdefault(name, val)
+    return out
+
+
+def _unroll_for(node, env, visit, dim_atoms):
+    """
+    Concretely unroll a `for <var> in range(lo, hi, step):` over
+    integer bounds. Within each iteration the loop var is bound in
+    `env` as a Python int — so `ttl.load(p, K[ki:ki+BLOCK])` resolves
+    to a concrete `Sliced(K, ki, ki+BLOCK)`.
+    """
+    if not isinstance(node.target, ast.Name):
+        return
+    if not (
+        isinstance(node.iter, ast.Call)
+        and isinstance(node.iter.func, ast.Name)
+        and node.iter.func.id == "range"
+    ):
+        return
+    bounds = [_eval_int(a, env, dim_atoms) for a in node.iter.args]
+    if any(b is None for b in bounds):
+        return
+    if len(bounds) == 1:
+        lo, hi, step = 0, bounds[0], 1
+    elif len(bounds) == 2:
+        lo, hi, step = bounds[0], bounds[1], 1
+    elif len(bounds) == 3:
+        lo, hi, step = bounds
+    else:
+        return
+    var = node.target.id
+    saved = env.get(var, None)
+    for i in range(lo, hi, step):
+        env[var] = i
+        for stmt in node.body:
+            visit(stmt)
+    if saved is None:
+        env.pop(var, None)
+    else:
+        env[var] = saved
+
+
+def _eval_int(node, env, dim_atoms) -> "int | None":
+    """
+    Evaluate an AST expression to a Python `int` when possible.
+    Handles literals, names (env or dim_atoms[.size]), and the four
+    arithmetic ops. Returns `None` if any sub-expression isn't
+    concretely an int — caller skips the unrolling.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return node.value
+    if isinstance(node, ast.Name):
+        if node.id in env and isinstance(env[node.id], int):
+            return env[node.id]
+        if node.id in dim_atoms:
+            return dim_atoms[node.id].size
+        return None
+    if isinstance(node, ast.BinOp):
+        l = _eval_int(node.left, env, dim_atoms)
+        r = _eval_int(node.right, env, dim_atoms)
+        if l is None or r is None:
+            return None
+        if isinstance(node.op, ast.Add): return l + r
+        if isinstance(node.op, ast.Sub): return l - r
+        if isinstance(node.op, ast.Mult): return l * r
+        if isinstance(node.op, ast.FloorDiv): return l // r
+    return None
+
+
+def _verify_stored_value(
+    value_node, env, input_types, dim_atoms, spec_type, slices, out_shape,
+):
+    """
+    Verify a kernel's output value against the spec, tile-restricting
+    the spec to the slice when `slices` is provided. `slices` is a
+    list of `DIM[lo:hi]` Subscripts from a `ttl.store` call; `None`
+    for a raw `tl.store` (no slice info — verify against the full
+    spec).
+    """
+    val_type = _interpret_expr(value_node, env, input_types, dim_atoms)
     if not isinstance(val_type, Type):
         raise ValueError(
             f"store value `{ast.unparse(value_node)}` does not resolve "
             f"to a typed stile expression"
         )
-    if not verify_exprs_equivalent(val_type.et, spec_type.et):
+    target_spec = spec_type
+    if slices is not None:
+        target_spec = _restrict_spec_to_tile(
+            spec_type, slices, out_shape, env, dim_atoms,
+        )
+    if not verify_exprs_equivalent(val_type.et, target_spec.et):
         raise AssertionError(
             f"Triton kernel output does not match spec.\n"
-            f"  spec: {spec_type.et}\n"
+            f"  spec: {target_spec.et}\n"
             f"  actual: {val_type.et}"
         )
+
+
+def _restrict_spec_to_tile(spec_type, slices, out_shape, env, dim_atoms):
+    """
+    Replace each FullDim of `spec_type` whose name matches a slice's
+    DIM with the slice's `Sliced(DIM, lo, hi)`. Lets the per-tile
+    store certify "this tile equals the spec restricted to (M_slice,
+    N_slice, …)".
+    """
+    overrides = []
+    for s in slices:
+        if not (isinstance(s, ast.Subscript) and isinstance(s.slice, ast.Slice)):
+            continue
+        dim_node = s.value
+        if not isinstance(dim_node, ast.Name):
+            continue
+        dim_atom = dim_atoms.get(dim_node.id)
+        if dim_atom is None:
+            continue
+        lo = _eval_symindex(s.slice.lower, env, dim_atoms)
+        hi = _eval_symindex(s.slice.upper, env, dim_atoms)
+        if lo is None or hi is None:
+            continue
+        overrides.append(Sliced(dim_atom, lo, hi))
+    if not overrides:
+        return spec_type
+    from ..type import override_dims_in_type
+    return override_dims_in_type(spec_type, *overrides)
+
+
+def _eval_symindex(node, env, dim_atoms):
+    """
+    Evaluate an AST expression to a stile `SymbolicIndex` — a Python
+    `int`, a `SymbolicInt` (for runtime values like `tl.program_id`),
+    or an `AffineExpr` for arithmetic over the two. Unknown names
+    default to a fresh `SymbolicInt(name)` so e.g. `pid_m * BLOCK_M`
+    yields `AffineExpr(0, {(pid_m, BLOCK_M)})`.
+    """
+    from ..indexing import SymbolicInt, to_affine
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return node.value
+    if isinstance(node, ast.Name):
+        if node.id in env:
+            return env[node.id]
+        if node.id in dim_atoms:
+            return dim_atoms[node.id].size
+        return SymbolicInt(name=node.id)
+    if isinstance(node, ast.BinOp):
+        l = _eval_symindex(node.left, env, dim_atoms)
+        r = _eval_symindex(node.right, env, dim_atoms)
+        if l is None or r is None:
+            return None
+        if isinstance(node.op, ast.Add): return to_affine(l) + to_affine(r)
+        if isinstance(node.op, ast.Sub): return to_affine(l) - to_affine(r)
+        if isinstance(node.op, ast.Mult):
+            # SymbolicInt only supports multiplication by a Python int —
+            # require one side to reduce to an int.
+            l_int = _eval_int(node.left, env, dim_atoms)
+            r_int = _eval_int(node.right, env, dim_atoms)
+            if l_int is not None:
+                return to_affine(r) * l_int
+            if r_int is not None:
+                return to_affine(l) * r_int
+            return None
+    return None
 
 
 def _is_tl_call(node, name : str) -> bool:
@@ -195,41 +394,77 @@ def _peel_pointer_base(node) -> "str | None":
     return None
 
 
-def _interpret_expr(node, env, input_types):
+def _interpret_expr(node, env, input_types, dim_atoms):
     """
     Abstract-interpret an AST expression. Returns one of:
       - a stile `Type` (when the expression has a typed-stile result),
-      - a raw `float` / `int` (numeric literals — passed as-is to
-        `type_from_binary_op` so they get wrapped as `Constant(x)` on
-        the spot),
-      - `None` (expression isn't stile-relevant, e.g. plain ints used
-        as block sizes / offsets).
+      - a raw `float` / `int` (numeric literals or evaluated names —
+        passed as-is to `type_from_binary_op` so they get wrapped as
+        `Constant(x)` on the spot),
+      - `None` (expression isn't stile-relevant).
     """
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return float(node.value)
     if isinstance(node, ast.Name):
-        return env.get(node.id)
+        # First env (per-loop-iter bindings; loop vars are ints), then
+        # dim_atoms (FullDim.size as int).
+        if node.id in env:
+            v = env[node.id]
+            if isinstance(v, int):
+                return float(v)
+            if isinstance(v, Type):
+                return v
+            # SymbolicInt / AffineExpr — not a Type, doesn't flow as
+            # a value expression in this slot.
+            return None
+        if node.id in dim_atoms:
+            return float(dim_atoms[node.id].size)
+        return None
+    if _is_tl_call(node, "program_id"):
+        # `pid_x = tl.program_id(N)` — a runtime grid coord. Treat as
+        # an opaque `SymbolicInt`; the variable name (from the
+        # surrounding `Assign`) is used as the atom's identity. Caller
+        # handles the binding in env.
+        return _ProgramIdMarker()
     if _is_tl_call(node, "load"):
-        # `tl.load(ptr + offs, mask=…)` — bind to the declared input
-        # type for `ptr`.
         ptr_base = _peel_pointer_base(node.args[0])
         if ptr_base is not None and ptr_base in input_types:
             return input_types[ptr_base]
         return None
     if _is_ttl_call(node, "load"):
-        # `ttl.load(ptr, DIM_0[lo:hi], DIM_1[lo:hi], …)` — stile-flavored
-        # slice load. Returns the declared input's type; slice
-        # tracking is a future refinement.
-        if len(node.args) >= 1 and isinstance(node.args[0], ast.Name):
-            if node.args[0].id in input_types:
-                return input_types[node.args[0].id]
-        return None
+        # `ttl.load(ptr, DIM_0[lo:hi], DIM_1[lo:hi], …)`. Restrict the
+        # input's Type to the slice: each `DIM[lo:hi]` becomes
+        # `Sliced(DIM, lo_int, hi_int)`, evaluated from the AST against
+        # the current env / dim_atoms.
+        if not (len(node.args) >= 1 and isinstance(node.args[0], ast.Name)):
+            return None
+        ptr_name = node.args[0].id
+        if ptr_name not in input_types:
+            return None
+        base = input_types[ptr_name]
+        slice_args = node.args[1:]
+        if len(slice_args) != len(base.st):
+            return base
+        overrides = []
+        for s in slice_args:
+            if not (isinstance(s, ast.Subscript) and isinstance(s.slice, ast.Slice)):
+                return base
+            dim_node = s.value
+            if not isinstance(dim_node, ast.Name):
+                return base
+            dim_atom = dim_atoms.get(dim_node.id)
+            if dim_atom is None:
+                return base
+            lo = _eval_symindex(s.slice.lower, env, dim_atoms)
+            hi = _eval_symindex(s.slice.upper, env, dim_atoms)
+            if lo is None or hi is None:
+                return base
+            overrides.append(Sliced(dim_atom, lo, hi))
+        from ..type import override_dims_in_type
+        return override_dims_in_type(base, *overrides)
     if _is_tl_call(node, "dot"):
-        # `tl.dot(a, b)` — 2-D matmul contracting a's last dim with
-        # b's first. Build the einsum Type from the operand shapes,
-        # using their stile dim names.
-        a_type = _interpret_expr(node.args[0], env, input_types)
-        b_type = _interpret_expr(node.args[1], env, input_types)
+        a_type = _interpret_expr(node.args[0], env, input_types, dim_atoms)
+        b_type = _interpret_expr(node.args[1], env, input_types, dim_atoms)
         if not (isinstance(a_type, Type) and isinstance(b_type, Type)):
             return None
         if len(a_type.st) != 2 or len(b_type.st) != 2:
@@ -244,14 +479,39 @@ def _interpret_expr(node, env, input_types):
             f"{dim_name(m_dim)} {dim_name(n_dim)}"
         )
         return t.einsum(a_type, b_type, einstr)
+    if _is_tl_call(node, "zeros") or _is_ttl_call(node, "zeros"):
+        # `ttl.zeros(DIM_0[lo:hi], DIM_1[lo:hi], …, dtype=…)` returns
+        # the additive identity at the given (sliced) shape — used as
+        # an accumulator init. `tl.zeros((BLOCK_M, BLOCK_N), …)` is
+        # also accepted but doesn't carry stile-dim info, so the
+        # caller gets a shape-agnostic Constant(0).
+        if _is_ttl_call(node, "zeros"):
+            overrides = []
+            for s in node.args:
+                if not (isinstance(s, ast.Subscript) and isinstance(s.slice, ast.Slice)):
+                    return None
+                dim_node = s.value
+                if not isinstance(dim_node, ast.Name):
+                    return None
+                dim_atom = dim_atoms.get(dim_node.id)
+                if dim_atom is None:
+                    return None
+                lo = _eval_symindex(s.slice.lower, env, dim_atoms)
+                hi = _eval_symindex(s.slice.upper, env, dim_atoms)
+                if lo is None or hi is None:
+                    return None
+                overrides.append(Sliced(dim_atom, lo, hi))
+            return Type(st=tuple(overrides), et=Constant(0.0))
+        # Plain `tl.zeros((...), dtype=…)`: shape-agnostic zero.
+        return Type(st=(), et=Constant(0.0))
     if _is_tl_call(node, "exp"):
-        child_type = _interpret_expr(node.args[0], env, input_types)
+        child_type = _interpret_expr(node.args[0], env, input_types, dim_atoms)
         if not isinstance(child_type, Type):
             return None
         return t.exp(child_type)
     if isinstance(node, ast.BinOp):
-        l = _interpret_expr(node.left, env, input_types)
-        r = _interpret_expr(node.right, env, input_types)
+        l = _interpret_expr(node.left, env, input_types, dim_atoms)
+        r = _interpret_expr(node.right, env, input_types, dim_atoms)
         if l is None or r is None:
             return None
         op_str = {
@@ -291,10 +551,47 @@ class _RewriteTtlCalls(ast.NodeTransformer):
             len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
             and isinstance(node.value, ast.Call)
-            and _is_ttl_call(node.value, "load")
         ):
-            return self._rewrite_load_assign(node)
+            if _is_ttl_call(node.value, "load"):
+                return self._rewrite_load_assign(node)
+            if _is_ttl_call(node.value, "zeros"):
+                return self._rewrite_zeros_assign(node)
         return node
+
+    def _rewrite_zeros_assign(self, node):
+        """
+        `acc = ttl.zeros(M[lo:hi], N[lo:hi], dtype=…)`
+        →
+        `acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)`
+
+        Sizes are pulled from the same `_extract_size` patterns the
+        load/store rewriter uses. dtype defaults to `tl.float32`.
+        """
+        call = node.value
+        sizes = []
+        for s in call.args:
+            if not (isinstance(s, ast.Subscript) and isinstance(s.slice, ast.Slice)):
+                return node
+            size = _extract_size(s.slice.lower, s.slice.upper)
+            if size is None:
+                return node
+            sizes.append(size)
+        shape = ast.Tuple(elts=sizes, ctx=ast.Load())
+        dtype_kw = next(
+            (kw for kw in call.keywords if kw.arg == "dtype"),
+            ast.keyword(
+                arg="dtype",
+                value=ast.Attribute(
+                    value=ast.Name(id="tl"), attr="float32",
+                ),
+            ),
+        )
+        new_call = ast.Call(
+            func=ast.Attribute(value=ast.Name(id="tl"), attr="zeros"),
+            args=[shape],
+            keywords=[dtype_kw],
+        )
+        return ast.Assign(targets=node.targets, value=new_call)
 
     def visit_Expr(self, node):
         self.generic_visit(node)
@@ -598,12 +895,15 @@ class TypedTritonKernel:
     delegates to the underlying `@triton.jit` function; the
     `TypedTorchTensor` inputs are unwrapped to raw tensors before
     launch, and the output is rewrapped with the declared type.
+    `consts` declared at decoration time are passed as kwargs to
+    `@triton.jit` automatically — overridable per-launch.
     """
     triton_fn : object
     spec : str
     inputs : dict[str, str]
     out_shape : ShapeType
     out_dtype : object
+    consts : dict
 
     def __getitem__(self, grid):
         if isinstance(grid, int):
@@ -630,7 +930,9 @@ class _Launcher:
             out_shape_ints, dtype=out_dtype, device="cuda",
         )
         raw_inputs = tuple(ti.tensor for ti in typed_inputs)
-        self.kernel.triton_fn[self.grid](*raw_inputs, out_tensor, **kwargs)
+        all_kwargs = dict(self.kernel.consts)
+        all_kwargs.update(kwargs)
+        self.kernel.triton_fn[self.grid](*raw_inputs, out_tensor, **all_kwargs)
         spec_type = parse_spec_into_type(self.kernel.spec)
         return TypedTorchTensor(
             out_tensor,
