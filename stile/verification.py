@@ -2597,8 +2597,11 @@ def normalize(expr : ExprType) -> NormalizedExpr:
         case BinaryOp(op, lhs, rhs):
             return binary_op(op, normalize(lhs), normalize(rhs))
         case Repeat(dim, child):
-            # Repeat is special - don't pre-normalize!
-            return repeat(frozenset([dim]), child)
+            # Repeat is special - don't pre-normalize! Slice info on
+            # `dim` is structural noise (the broadcast doesn't care
+            # about tile bounds); strip to FullDim so a tile-restricted
+            # spec and a tile-walked kernel canonicalize identically.
+            return repeat(frozenset([dim_full_dim(dim)]), child)
         case Reduce(op, dim, child):
             normalized_child = normalize(child)
             return reduce(
@@ -2610,6 +2613,11 @@ def normalize(expr : ExprType) -> NormalizedExpr:
         case ParametricReduce(loop_var, lo, hi, op, body):
             return make_parametric_reduce(loop_var, lo, hi, op, normalize(body))
         case Gather(source, dim_in_source, idx):
+            # Slice info on `dim_in_source` is structural noise — the
+            # gather itself reads opaquely along the named axis, and any
+            # tile-restriction lives in the enclosing shape, not in the
+            # gather's identity. Strip down to FullDim for canonical form.
+            dim_in_source = dim_full_dim(dim_in_source)
             norm_source = normalize(source)
             norm_idx = normalize(idx)
             # Permutation round-trip: `gather(scatter(Y, dim, perm), dim, perm) = Y`
@@ -2654,6 +2662,7 @@ def normalize(expr : ExprType) -> NormalizedExpr:
                 idx=norm_idx,
             ))
         case Scatter(source, dim_in_dest, idx):
+            dim_in_dest = dim_full_dim(dim_in_dest)
             norm_source = normalize(source)
             norm_idx = normalize(idx)
             # Dual round-trip: `scatter(gather(Y, dim, perm), dim, perm) = Y`

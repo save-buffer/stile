@@ -633,5 +633,23 @@ def override_dims_in_type(type : Type, *dim_override : Dim) -> Type:
                     get_overridden(dim),
                     recursively_replace(child)
                 )
+            case Gather(source, dim_in_source, idx):
+                return Gather(
+                    source=recursively_replace(source),
+                    dim_in_source=get_overridden(dim_in_source),
+                    idx=recursively_replace(idx),
+                )
+            case Scatter(source, dim_in_dest, idx):
+                return Scatter(
+                    source=recursively_replace(source),
+                    dim_in_dest=get_overridden(dim_in_dest),
+                    idx=recursively_replace(idx),
+                )
+            case _:
+                raise ValueError(
+                    f"override_dims_in_type: unhandled ExprType "
+                    f"{type(et).__name__} — returning None would silently "
+                    f"corrupt downstream normalize."
+                )
     new_et = recursively_replace(type.et)
     return Type(new_st, new_et, type.dt)

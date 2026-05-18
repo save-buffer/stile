@@ -215,3 +215,66 @@ def zeros(shape : tuple[FullDim, ...], device : str = "cpu") -> TypedTorchTensor
         et=0.0,
     )
     return TypedTorchTensor(tensor, type)
+
+
+def tensor(
+    arr : "torch.Tensor", *shape : FullDim, name : str,
+) -> TypedTorchTensor:
+    """
+    Wrap `arr` as a typed tensor with the given dim shape and a stile
+    `Tensor(name=...)` ET. Mirrors `tjax.tensor` for the torch host —
+    saves the `TypedTorchTensor(arr, Type(...))` boilerplate.
+    """
+    return TypedTorchTensor(
+        arr, Type(st=shape, et=t.Tensor(dims=shape, name=name)),
+    )
+
+
+def runtime_index(
+    name : str,
+    dim : FullDim,
+    *,
+    values_in : FullDim | None = None,
+    arr : "torch.Tensor | None" = None,
+    permutation : bool = False,
+    partition : bool = False,
+    device : str = "cuda",
+) -> TypedTorchTensor:
+    """
+    Torch parallel of `tjax.runtime_index`. A 1-d integer tensor used
+    as a runtime gather index into another tensor's `values_in` dim.
+    Registers algebraic properties (`permutation` / `partition`) with
+    the verifier so the surrounding gather/scatter rewrites apply.
+    """
+    from ..indexing import declare_index_properties
+    props = []
+    if permutation:
+        props.append("permutation")
+    if partition:
+        props.append("partition")
+    if props:
+        declare_index_properties(name, *props)
+    typ = Type(st=(dim,), et=t.Tensor(dims=(dim,), name=name))
+    if arr is None:
+        size = dim_size(dim)
+        arr = torch.arange(size, dtype=torch.int32, device=device)
+    return TypedTorchTensor(arr, typ)
+
+
+def gather(
+    src : TypedTorchTensor, dim : FullDim, idx : TypedTorchTensor,
+) -> TypedTorchTensor:
+    """Gather `src` along `dim` using `idx` (a 1-D index tensor over
+    `dim`). Mirrors `TypedJaxArray.gather`."""
+    new_type = src.type.gather(dim, idx.type)
+    axis = next(
+        i for i, d in enumerate(src.type.st) if dim_name(d) == dim_name(dim)
+    )
+    idx_i64 = idx.tensor.to(torch.int64)
+    # Broadcast idx to src's shape along the gather axis.
+    bcast_shape = list(src.tensor.shape)
+    expand_shape = [1] * src.tensor.ndim
+    expand_shape[axis] = src.tensor.shape[axis]
+    idx_bcast = idx_i64.view(expand_shape).expand(bcast_shape)
+    new_tensor = torch.gather(src.tensor, axis, idx_bcast)
+    return TypedTorchTensor(new_tensor, new_type)
