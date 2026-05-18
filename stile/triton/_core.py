@@ -73,6 +73,12 @@ def jit(
             "@ttl.jit must decorate a plain function definition"
         )
 
+        # Pre-pass: resolve any f-string predicate/value args inside
+        # `ttl.mask(...)` to plain Constants so both the verifier and
+        # the rewriter see literal strings instead of `JoinedStr` nodes
+        # they'd otherwise silently skip.
+        _resolve_ttl_mask_fstrings(fn_def, fn, consts or {})
+
         # Verification: abstract-interpret the body. Raises if any
         # `tl.store` writes a value whose stile ET doesn't match the
         # declared spec.
@@ -83,7 +89,9 @@ def jit(
 
         # Re-emit: strip stile decorator + input annotations, add
         # @triton.jit, exec to define the runtime kernel.
-        triton_fn = _emit_triton_fn(fn_def, fn, inputs, out_shape, out_dtype)
+        triton_fn = _emit_triton_fn(
+            fn_def, fn, inputs, out_shape, out_dtype, consts=consts or {},
+        )
 
         return TypedTritonKernel(
             triton_fn, spec, inputs, out_shape, out_dtype,
@@ -314,6 +322,43 @@ def _unroll_for(
         env.pop(var, None)
     else:
         env[var] = saved
+
+
+def _resolve_ttl_mask_fstrings(fn_def, original_fn, consts):
+    """
+    Walk the kernel body and replace every `ttl.mask(..., predicate=…)`
+    keyword whose value is a `JoinedStr` (f-string) with a plain
+    `ast.Constant(value=<resolved-str>)`. Eval'd against the function's
+    globals + closure + decorator-time `consts`, mirroring how
+    `_const_str` resolves invariant specs. This is a one-shot transform
+    before verification/rewriting so neither path has to plumb
+    closure-eval context through every `ttl.mask` recognition site.
+    """
+    fstr_eval_locals = dict(consts)
+    for name, cell in zip(
+        original_fn.__code__.co_freevars,
+        original_fn.__closure__ or (),
+    ):
+        try:
+            fstr_eval_locals[name] = cell.cell_contents
+        except ValueError:
+            continue
+
+    class _Resolver(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if _is_ttl_call(node, "mask"):
+                for kw in node.keywords:
+                    if kw.arg == "predicate" and isinstance(kw.value, ast.JoinedStr):
+                        resolved = _const_str(
+                            kw.value, original_fn, fstr_eval_locals,
+                        )
+                        if resolved is not None:
+                            kw.value = ast.Constant(value=resolved)
+            return node
+
+    _Resolver().visit(fn_def)
+    ast.fix_missing_locations(fn_def)
 
 
 def _const_str(node, original_fn=None, fstr_eval_locals=None) -> "str | None":
@@ -943,7 +988,7 @@ class _RewriteTtlCalls(ast.NodeTransformer):
       - `start : start + N` → N
       - `k*N : (k+1)*N` → N
     """
-    def __init__(self, input_types : dict):
+    def __init__(self, input_types : dict, original_fn=None, fstr_eval_locals=None):
         self.input_types = input_types
         self._uid = 0
         # var_name -> list of (dim_python_name, size_ast). Populated
@@ -952,6 +997,11 @@ class _RewriteTtlCalls(ast.NodeTransformer):
         # which axis `dhead` corresponds to and what x's tile shape
         # is for broadcasting the 1-D index.
         self._load_meta : "dict[str, list[tuple[str, ast.AST]]]" = {}
+        # Closure / decorator-time consts dict for evaluating f-string
+        # arguments (e.g. `predicate=f"nctx <= qctx + {OFFSET}"`).
+        # `_rewrite_mask_assign` resolves them at decoration time.
+        self._original_fn = original_fn
+        self._fstr_eval_locals = fstr_eval_locals or {}
 
     def visit_Assign(self, node):
         # Capture dim ordering / tile sizes for any var being bound to
@@ -1142,21 +1192,22 @@ class _RewriteTtlCalls(ast.NodeTransformer):
         pred_kw = next((kw for kw in call.keywords if kw.arg == "predicate"), None)
         on_kw = next((kw for kw in call.keywords if kw.arg == "on"), None)
         off_kw = next((kw for kw in call.keywords if kw.arg == "off"), None)
-        if not (
-            pred_kw and on_kw and off_kw
-            and isinstance(pred_kw.value, ast.Constant)
-            and isinstance(pred_kw.value.value, str)
-        ):
+        if not (pred_kw and on_kw and off_kw):
             return node
-        atoms = _parse_simple_predicate(pred_kw.value.value)
+        pred_str = _const_str(
+            pred_kw.value, self._original_fn, self._fstr_eval_locals,
+        )
+        if pred_str is None:
+            return node
+        atoms = _parse_simple_predicate(pred_str)
         if atoms is None:
             return node
         dim_to_axis = {name: i for i, (name, _, _) in enumerate(slices)}
-        # Every identifier-term referenced by any atom must be a
-        # declared slice dim (integers fall through as literals).
-        for lhs_name, _, rhs_name in atoms:
-            for term in (lhs_name, rhs_name):
-                if term.isidentifier() and term not in dim_to_axis:
+        # Every dim-name referenced by any atom must be a declared
+        # slice dim (pure-integer terms have name=None).
+        for lhs_term, _, rhs_term in atoms:
+            for t in (lhs_term, rhs_term):
+                if t.name is not None and t.name not in dim_to_axis:
                     return node
 
         uid = self._next_uid()
@@ -1179,23 +1230,35 @@ class _RewriteTtlCalls(ast.NodeTransformer):
             idx_names[dim_name_str] = idx_name
 
         n = len(slices)
-        def term_node(term : str):
-            if term.isidentifier():
-                axis = dim_to_axis[term]
-                if n == 1:
-                    return ast.Name(id=idx_names[term], ctx=ast.Load())
+        def term_node(term : _PredTerm):
+            if term.name is None:
+                # Pure literal: `Constant(offset)`. Triton broadcasts an
+                # int against a tensor automatically.
+                return ast.Constant(value=term.offset)
+            axis = dim_to_axis[term.name]
+            if n == 1:
+                base = ast.Name(id=idx_names[term.name], ctx=ast.Load())
+            else:
                 slc_elts = [
                     ast.Slice() if j == axis else ast.Constant(value=None)
                     for j in range(n)
                 ]
-                return ast.Subscript(
-                    value=ast.Name(id=idx_names[term], ctx=ast.Load()),
+                base = ast.Subscript(
+                    value=ast.Name(id=idx_names[term.name], ctx=ast.Load()),
                     slice=ast.Tuple(elts=slc_elts, ctx=ast.Load()),
                     ctx=ast.Load(),
                 )
-            # Integer literal — Triton broadcasts a Python int against
-            # a tensor automatically.
-            return ast.Constant(value=int(term))
+            if term.offset == 0:
+                return base
+            if term.offset > 0:
+                return ast.BinOp(
+                    left=base, op=ast.Add(),
+                    right=ast.Constant(value=term.offset),
+                )
+            return ast.BinOp(
+                left=base, op=ast.Sub(),
+                right=ast.Constant(value=-term.offset),
+            )
 
         cmp_nodes = [
             ast.Compare(
@@ -1473,21 +1536,27 @@ _AST_CMP_OPS = {
 }
 
 
-def _parse_simple_predicate(s : str) -> "list[tuple[str, str, str]] | None":
-    """Parse a `&&`-conjunction of `<term> <op> <term>` atoms, where each
-    term is either a dim-name identifier or an integer literal. Returns
-    the list of `(lhs, op, rhs)` atoms (all-AND), or None for anything
-    the rewriter can't lower. The verifier side handles a richer
-    predicate grammar (via `stile.specification._parse_predicate`); only
-    the runtime codegen needs this simpler form."""
-    atoms : list[tuple[str, str, str]] = []
+def _parse_simple_predicate(s : str) -> "list[tuple[_PredTerm, str, _PredTerm]] | None":
+    """Parse a `&&`-conjunction of `<term> <op> <term>` atoms. Each
+    term is either a bare dim-name identifier, a bare integer literal,
+    or `<name> ± <int>` / `<int> + <name>` (so shifted-causal masks
+    like `nctx <= qctx + 1` and sliding-window masks like
+    `nctx >= qctx - W` lower to the right Triton arithmetic). The
+    verifier side handles the full predicate grammar via stile's
+    `_parse_predicate` — only the runtime codegen needs this form.
+
+    Returns the list of `(lhs_term, op, rhs_term)` atoms (all-AND), or
+    None if any sub-part fails to parse.
+    """
+    atoms : list[tuple[_PredTerm, str, _PredTerm]] = []
     for part in s.split("&&"):
         part = part.strip()
         for op in ("<=", ">=", "==", "!=", "<", ">"):
             if op in part:
-                lhs, _, rhs = part.partition(op)
-                lhs, rhs = lhs.strip(), rhs.strip()
-                if not (_is_pred_term(lhs) and _is_pred_term(rhs)):
+                lhs_str, _, rhs_str = part.partition(op)
+                lhs = _parse_pred_term(lhs_str)
+                rhs = _parse_pred_term(rhs_str)
+                if lhs is None or rhs is None:
                     return None
                 atoms.append((lhs, op, rhs))
                 break
@@ -1496,14 +1565,38 @@ def _parse_simple_predicate(s : str) -> "list[tuple[str, str, str]] | None":
     return atoms or None
 
 
-def _is_pred_term(t : str) -> bool:
-    """Predicate-term: a Python identifier (dim name) or a decimal int
-    (possibly negative). Anything else, the runtime rewriter passes on."""
-    if t.isidentifier():
-        return True
-    if t.startswith("-") and t[1:].isdigit():
-        return True
-    return t.isdigit()
+@dataclass(frozen=True)
+class _PredTerm:
+    """A predicate atom side: either a bare integer (`name=None`,
+    `offset=k`) or a dim-name with an integer offset (`name=DIM`,
+    `offset=k`, meaning `DIM + k`). Anything richer (coefficients,
+    arithmetic on both sides, name1 ± name2) is rejected by
+    `_parse_pred_term` and falls through to the rewriter's failure
+    path."""
+    name : "str | None"
+    offset : int
+
+
+def _parse_pred_term(s : str) -> "_PredTerm | None":
+    s = s.strip()
+    if not s:
+        return None
+    # Pure integer (possibly negative).
+    if s.lstrip("-").isdigit() and s.count("-") <= 1:
+        return _PredTerm(None, int(s))
+    if s.isidentifier():
+        return _PredTerm(s, 0)
+    # Look for the splitting `+` / `-` (skip a leading sign character).
+    for i in range(1, len(s)):
+        if s[i] in "+-":
+            lhs, op_char, rhs = s[:i].strip(), s[i], s[i + 1:].strip()
+            sign = 1 if op_char == "+" else -1
+            if lhs.isidentifier() and rhs.lstrip("-").isdigit():
+                return _PredTerm(lhs, sign * int(rhs))
+            if lhs.lstrip("-").isdigit() and rhs.isidentifier() and op_char == "+":
+                return _PredTerm(rhs, int(lhs))
+            return None
+    return None
 
 
 def _extract_size(lo, hi):
@@ -1553,7 +1646,9 @@ def _stride_for_axis(axis : int, dim_nodes : list) -> "ast.AST | None":
     return expr
 
 
-def _emit_triton_fn(fn_def, original_fn, inputs, out_shape=None, out_dtype=None):
+def _emit_triton_fn(
+    fn_def, original_fn, inputs, out_shape=None, out_dtype=None, consts=None,
+):
     """
     Re-emit the kernel function with stile decorations stripped and
     `@triton.jit` applied. Triton's parser uses `inspect.getsourcelines`
@@ -1582,7 +1677,21 @@ def _emit_triton_fn(fn_def, original_fn, inputs, out_shape=None, out_dtype=None)
     )
     out_full_type = Type(out_shape, out_full_type.et, out_dtype)
     ptr_types[out_ptr_name] = out_full_type
-    fn_def = _RewriteTtlCalls(ptr_types).visit(fn_def)
+    # Build the same closure+consts dict the verifier uses for f-string
+    # spec literals so the rewriter can resolve f-string predicates
+    # (e.g. `predicate=f"nctx <= qctx + {OFFSET}"`) at decoration time.
+    fstr_eval_locals = dict(consts or {})
+    for name, cell in zip(
+        original_fn.__code__.co_freevars,
+        original_fn.__closure__ or (),
+    ):
+        try:
+            fstr_eval_locals[name] = cell.cell_contents
+        except ValueError:
+            continue
+    fn_def = _RewriteTtlCalls(
+        ptr_types, original_fn=original_fn, fstr_eval_locals=fstr_eval_locals,
+    ).visit(fn_def)
     ast.fix_missing_locations(fn_def)
     new_src = ast.unparse(ast.Module(body=[fn_def], type_ignores=[]))
 

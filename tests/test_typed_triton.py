@@ -575,6 +575,118 @@ def test_rope(reset):
 
 @_REQUIRES_TRITON
 @_REQUIRES_TORCH
+def test_flash_attention_shifted_causal(reset):
+    """
+    Shifted-causal flash attention: each query at position q can attend
+    to keys at positions `[0, q + OFFSET]` (rather than `[0, q]`).
+    Exercises the offset path in the runtime mask rewriter — the
+    predicate is `nctx <= qctx + OFFSET`, parameterized via an f-string
+    that resolves at decoration time.
+    """
+    qctx = dim("qctx", 32)
+    nctx = dim("nctx", 32)
+    dhead = dim("dhead", 16)
+    OFFSET = 4
+    BQ = 16
+    BN = 16
+    BD = dhead.size
+
+    qk_spec = "(Q:qctx dhead, K:nctx dhead -> qctx nctx)"
+    pred = f"nctx < {BN} * ki && nctx <= qctx + {OFFSET}"
+    m_inv = f"max[nctx where {pred}]{qk_spec}"
+    l_inv = f"sum[nctx where {pred}](exp({qk_spec} - {m_inv}))"
+    o_inv = (
+        f"sum[nctx where {pred}]"
+        f"(exp({qk_spec} - {m_inv}) * V:nctx dhead)"
+    )
+
+    @ttl.jit(
+        spec=(
+            f"(softmax[nctx where nctx <= qctx + {OFFSET}]({qk_spec}), "
+            f"V:nctx dhead -> qctx dhead)"
+        ),
+        inputs={
+            "Q_ptr": "Q:qctx dhead",
+            "K_ptr": "K:nctx dhead",
+            "V_ptr": "V:nctx dhead",
+        },
+        out_shape=(qctx, dhead),
+        out_dtype=torch.float32,
+        consts={"BQ": BQ, "BN": BN, "BD": BD},
+    )
+    def attn(
+        Q_ptr, K_ptr, V_ptr, O_ptr,
+        BQ: tl.constexpr, BN: tl.constexpr, BD: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        q = ttl.load(
+            Q_ptr,
+            qctx[pid_m * BQ : (pid_m + 1) * BQ],
+            dhead[0 : BD],
+        )
+        m = ttl.full(qctx[pid_m * BQ : (pid_m + 1) * BQ], value=float("-inf"))
+        l = ttl.zeros(qctx[pid_m * BQ : (pid_m + 1) * BQ])
+        o = ttl.zeros(
+            qctx[pid_m * BQ : (pid_m + 1) * BQ],
+            dhead[0 : BD],
+        )
+        for ki in ttl.range(
+            0, nctx // BN,
+            invariant={"m": m_inv, "l": l_inv, "o": o_inv},
+        ):
+            k = ttl.load(
+                K_ptr,
+                nctx[ki * BN : (ki + 1) * BN],
+                dhead[0 : BD],
+            )
+            v = ttl.load(
+                V_ptr,
+                nctx[ki * BN : (ki + 1) * BN],
+                dhead[0 : BD],
+            )
+            qk = tl.dot(q, tl.trans(k))
+            qk = qk + ttl.mask(
+                qctx[pid_m * BQ : (pid_m + 1) * BQ],
+                nctx[ki * BN : (ki + 1) * BN],
+                predicate=f"nctx <= qctx + {OFFSET}",
+                on=0.0, off=float("-inf"),
+            )
+            tile_max = tl.max(qk, axis=1)
+            new_max = tl.maximum(m, tile_max)
+            logits = tl.exp(qk - new_max[:, None])
+            tile_l = tl.sum(logits, axis=1)
+            new_l = tl.exp(m - new_max) * l + tile_l
+            v_proj = tl.dot(logits, v)
+            new_o = tl.exp(m - new_max)[:, None] * o + v_proj
+            m = new_max
+            l = new_l
+            o = new_o
+        attn_out = o / l[:, None]
+        ttl.store(
+            O_ptr, attn_out,
+            qctx[pid_m * BQ : (pid_m + 1) * BQ],
+            dhead[0 : BD],
+        )
+
+    Q_arr = torch.randn(qctx.size, dhead.size, device="cuda")
+    K_arr = torch.randn(nctx.size, dhead.size, device="cuda")
+    V_arr = torch.randn(nctx.size, dhead.size, device="cuda")
+    Q = TypedTorchTensor(Q_arr, Type(st=(qctx, dhead), et=Tensor(dims=(qctx, dhead), name="Q")))
+    K = TypedTorchTensor(K_arr, Type(st=(nctx, dhead), et=Tensor(dims=(nctx, dhead), name="K")))
+    V = TypedTorchTensor(V_arr, Type(st=(nctx, dhead), et=Tensor(dims=(nctx, dhead), name="V")))
+    result = attn[(qctx.size // BQ,)](Q, K, V)
+
+    # Reference: shifted-causal softmax attention.
+    qk_full = Q_arr @ K_arr.T
+    q_idx = torch.arange(qctx.size, device="cuda")[:, None]
+    k_idx = torch.arange(nctx.size, device="cuda")[None, :]
+    qk_full = qk_full.masked_fill(k_idx > q_idx + OFFSET, float("-inf"))
+    expected = torch.softmax(qk_full, dim=-1) @ V_arr
+    assert torch.allclose(result.tensor, expected, atol=2e-2, rtol=1e-3)
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
 def test_moe_per_token_dispatch(reset):
     """
     Simplest MoE: each token's output is its assigned expert's matmul.
@@ -653,7 +765,7 @@ def test_moe_per_token_dispatch(reset):
     expected = torch.einsum(
         "nd,nde->ne", X_arr, W_arr[eid_arr.to(torch.int64)],
     )
-    assert torch.allclose(result.tensor, expected, atol=2e-2, rtol=1e-3)
+    assert torch.allclose(result.tensor, expected, atol=1e-4)
 
 
 @_REQUIRES_TRITON
@@ -752,7 +864,7 @@ def test_moe_tiled(reset):
     expected = torch.einsum(
         "nd,nde->ne", X_arr, W_arr[eid_arr.to(torch.int64)],
     )
-    assert torch.allclose(result.tensor, expected, atol=2e-2, rtol=1e-3)
+    assert torch.allclose(result.tensor, expected, atol=1e-4)
 
 
 @_REQUIRES_TRITON
