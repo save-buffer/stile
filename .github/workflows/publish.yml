@@ -1,0 +1,58 @@
+name: Publish to PyPI
+
+# Fires when you push a tag like `v0.1.0`, `v0.2.1`, `v1.0.0-rc.1`.
+# The tag's version (minus the leading `v`) must match `pyproject.toml`'s
+# `version` field; the workflow aborts otherwise.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    # The `pypi` GitHub environment scopes the OIDC token so the
+    # trusted-publisher claim on PyPI only accepts releases from this
+    # specific environment. Configure the environment in
+    # Settings → Environments → New environment → name = "pypi".
+    environment:
+      name: pypi
+      url: https://pypi.org/project/stile-verifier/
+
+    permissions:
+      # Required for PyPI trusted publishing (uv exchanges this for a
+      # short-lived publish token automatically — no API token stored).
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.12"
+
+      - name: Verify tag matches pyproject version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PYPROJECT_VERSION="$(uv run --with tomli python -c \
+            'import tomli; print(tomli.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          if [ "$TAG_VERSION" != "$PYPROJECT_VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME → version '$TAG_VERSION' does not match pyproject version '$PYPROJECT_VERSION'"
+            exit 1
+          fi
+          echo "OK: tag $GITHUB_REF_NAME ↔ pyproject $PYPROJECT_VERSION"
+
+      - name: Build sdist + wheel
+        run: |
+          rm -rf dist
+          uv build
+
+      - name: Check distribution metadata
+        run: uv run --with twine twine check dist/*
+
+      - name: Publish to PyPI (trusted publishing)
+        run: uv publish --trusted-publishing always

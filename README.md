@@ -30,6 +30,21 @@ for iqctx in range(0, qctx.size, qctx_tile_size):
 
 The verifier proves the kernel's online softmax, with `-inf` bias on the diagonal tile and skipped upper-triangle tiles, normalizes to the explicit causal-attention spec.
 
+## Installation
+Install via pip or uv
+```bash
+pip install stile-verifier
+uv pip install stile-verifier
+```
+
+Then import the typed version of your backend!
+```python
+import stile.jax as tjax # Typed Jax!
+import stile.jax.pallas as tpl # Typed Pallas!
+import stile.torch as ttorch # Typed Torch!
+import stile.triton as ttl # Typed Triton!
+```
+
 ## How it works
 
 A Stile-typed tensor has two types:

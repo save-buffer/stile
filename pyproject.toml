@@ -3,12 +3,31 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "stile"
-version = "0.1.0"
+name = "stile-verifier"
+version = "0.1.1"
+description = "A type system for numerical programs: write a spec, get a structural proof your code computes it."
+readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Sasha Krassovsky", email = "krassovskysasha@gmail.com" },
+]
+keywords = [
+    "verification", "type-system", "numerical", "jax", "pytorch",
+    "triton", "pallas", "kernels", "einsum",
+]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: Implementation :: CPython",
-    "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dependencies = [
     "einops>=0.8.1",
@@ -18,15 +37,40 @@ dependencies = [
 [project.optional-dependencies]
 jax = ["jax>=0.4.0"]
 torch = ["torch>=2.0.0"]
+triton = [
+    "torch>=2.0.0",
+    "triton>=3.0.0",
+]
 all = [
     "jax>=0.4.0",
     "torch>=2.0.0",
+    "triton>=3.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/save-buffer/stile"
+Repository = "https://github.com/save-buffer/stile"
+Issues = "https://github.com/save-buffer/stile/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["stile"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+    "stile/",
+    "tests/",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+exclude = [
+    "**/__pycache__",
+    "*.pyc",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
+    "build>=1.2.0",
+    "twine>=5.0.0",
 ]
