@@ -33,6 +33,29 @@ class NormalizedTagCond:
         return h
 
 
+def make_tag_cond(
+    domain : Domain, if_true : "NormalizedTagTree", if_false : "NormalizedTagTree",
+) -> "NormalizedTagTree":
+    """
+    Canonical constructor for `NormalizedTagCond`. Applies same-predicate
+    collapse: inside the `if_true` branch, `domain` is true, so any
+    nested `Cond(domain, A, B)` resolves to `A`; symmetrically in
+    `if_false`. This collapses arbitrarily deep nestings of the same
+    predicate to a single `Cond`, which is what makes
+    `mask^k = mask` (boolean idempotence under multiplication) — the
+    `_distribute_binop_through_tag` step nests Conds when masks are
+    multiplied; this rule then flattens them back.
+
+    Caller-equivalent: `NormalizedTagCond(domain, if_true, if_false)`
+    with the collapse rule applied at the construction site.
+    """
+    if isinstance(if_true, NormalizedTagCond) and if_true.domain == domain:
+        if_true = if_true.if_true
+    if isinstance(if_false, NormalizedTagCond) and if_false.domain == domain:
+        if_false = if_false.if_false
+    return NormalizedTagCond(domain, if_true, if_false)
+
+
 # NormalizedTagTree = NormalizedExpr | NormalizedTagCond
 # Defined after NormalizedExpr is declared.
 
@@ -1718,7 +1741,7 @@ def _push_through_tag(
     """
     def apply(tag):
         if isinstance(tag, NormalizedTagCond):
-            return NormalizedTagCond(
+            return make_tag_cond(
                 domain=tag.domain,
                 if_true=apply(tag.if_true),
                 if_false=apply(tag.if_false),
@@ -1748,13 +1771,52 @@ def _distribute_binop_through_tag(
         return _push_through_tag(lambda leaf: op_fn(leaf, rhs), lhs_tag)
     if lhs_tag is None and rhs_tag is not None:
         return _push_through_tag(lambda leaf: op_fn(lhs, leaf), rhs_tag)
-    # Both tagged: nest (outer = lhs's tag, inner = rhs's tag).
+    # Both tagged. Same-predicate fast path: when both tags are a
+    # `Cond(P, …)` with the *same* domain, the unreachable cross-branch
+    # cells (P-true ⊗ P-false) never fire. Combine branch-by-branch
+    # into a single `Cond(P, op(t_l, t_r), op(f_l, f_r))`. This is what
+    # makes `mask^k = mask` (boolean idempotence): without it, repeated
+    # mults of the same mask produce arbitrarily deep nested same-P
+    # `Cond` trees that don't structurally compare equal to the single
+    # `Cond` form.
+    if (
+        isinstance(lhs_tag.tag, NormalizedTagCond)
+        and isinstance(rhs_tag.tag, NormalizedTagCond)
+        and lhs_tag.tag.domain == rhs_tag.tag.domain
+        and lhs_tag.dims == rhs_tag.dims
+    ):
+        l_tag, r_tag = lhs_tag.tag, rhs_tag.tag
+        def _combine_branches(l_leaf, r_leaf):
+            return op_fn(_leaf_to_expr(l_leaf), _leaf_to_expr(r_leaf))
+        new_tag = make_tag_cond(
+            domain=l_tag.domain,
+            if_true=_combine_branches(l_tag.if_true, r_tag.if_true),
+            if_false=_combine_branches(l_tag.if_false, r_tag.if_false),
+        )
+        return NormalizedExpr.of(NormalizedTensor(
+            dims=lhs_tag.dims, tag=new_tag, name=lhs_tag.name,
+        ))
+    # General nest (outer = lhs's tag, inner = rhs's tag).
     return _push_through_tag(
         lambda l_leaf: _push_through_tag(
             lambda r_leaf: op_fn(l_leaf, r_leaf), rhs_tag,
         ),
         lhs_tag,
     )
+
+
+def _leaf_to_expr(leaf) -> "NormalizedExpr":
+    """A `NormalizedTagTree` leaf is either a `NormalizedExpr` (the
+    plain value at that branch) or a deeper `NormalizedTagCond`. The
+    latter only appears when the tag itself is nested. For the
+    same-predicate fast path in `_distribute_binop_through_tag`, we
+    treat any nested `Cond` leaf by wrapping it back into a tagged
+    tensor and lifting to a `NormalizedExpr`."""
+    if isinstance(leaf, NormalizedTagCond):
+        return NormalizedExpr.of(NormalizedTensor(
+            dims=frozenset(), tag=leaf, name="_mask",
+        ))
+    return leaf
 
 
 def add(lhs : NormalizedExpr, rhs : NormalizedExpr):
@@ -1978,7 +2040,7 @@ def repeat(dims : frozenset[FullDim], x : ExprType) -> NormalizedExpr:
                     return NormalizedExpr.of(NormalizedRepeat(dims, leaf))
                 def apply(tag):
                     if isinstance(tag, NormalizedTagCond):
-                        return NormalizedTagCond(
+                        return make_tag_cond(
                             domain=tag.domain,
                             if_true=apply(tag.if_true),
                             if_false=apply(tag.if_false),
@@ -2311,7 +2373,7 @@ def _normalize_tag(tag : TagTree) -> NormalizedTagTree:
         nf = _normalize_tag(tag.if_false)
         if nt == nf:
             return nt
-        return NormalizedTagCond(tag.domain, nt, nf)
+        return make_tag_cond(tag.domain, nt, nf)
     # tag is an ExprType leaf.
     return normalize(tag)
 

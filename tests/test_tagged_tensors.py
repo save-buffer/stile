@@ -196,3 +196,27 @@ def test_tensors_with_different_tags_compare_unequal(reset):
         ),
     ))
     assert tagged_a != tagged_b
+
+
+def test_mask_squared_idempotent(reset):
+    """
+    Boolean idempotence under multiplication: `mask * mask = mask`
+    when `mask = Cond(P, 1, 0)`. Naively, `_distribute_binop_through_tag`
+    nests the second mask inside the first's tag tree; the same-predicate
+    fast path in that function collapses the nesting branch-by-branch
+    into a single `Cond(P, 1*1, 0*0) = Cond(P, 1, 0)`.
+    """
+    from stile.specification import parse_spec_into_type
+    from stile.verification import verify_exprs_equivalent
+    N = dim("IdemN", 8)
+    M = dim("IdemM", 8)
+
+    mask_once = parse_spec_into_type("X:IdemN IdemM where IdemN <= IdemM")
+    # `(X*mask) * (X*mask) / X = X * mask^2`. With idempotence, equals
+    # `X * mask = lhs`.
+    mask_sq = parse_spec_into_type(
+        "(X:IdemN IdemM where IdemN <= IdemM) "
+        "* (X:IdemN IdemM where IdemN <= IdemM) "
+        "/ X:IdemN IdemM"
+    )
+    assert verify_exprs_equivalent(mask_once.et, mask_sq.et)
