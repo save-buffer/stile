@@ -37,13 +37,24 @@ from ..indexing import SymbolicInt, to_affine, LoopScope
 from ..torch._core import TypedTorchTensor
 
 
+@dataclass(frozen=True)
+class _OutputDecl:
+    """Internal per-output bundle. Single-output kernels have one of
+    these; multi-output kernels have N. `ptr_name` is the kernel-arg
+    name (assigned from `fn_def.args.args[len(inputs) + i]`)."""
+    ptr_name : str
+    spec : str
+    shape : "tuple"
+    dtype : object
+
+
 def jit(
     *,
-    spec : str,
+    spec : "str | list[str] | tuple[str, ...]",
     inputs : dict[str, str],
-    out_shape : ShapeType,
-    out_dtype : object = None,
-    consts : "dict[str, int] | None" = None,
+    out_shape : "tuple | list",
+    out_dtype : "object | list | tuple" = None,
+    consts : "dict[str, int | float] | None" = None,
 ):
     """
     Decorator producing a typed Triton kernel.
@@ -51,19 +62,19 @@ def jit(
     The user writes a kernel that *looks like Triton* — `tl.load` /
     `tl.store` / arithmetic / `tl.exp` / etc. — and declares per-pointer
     stile types via `inputs={...}` (mapping each pointer parameter name
-    to a stile spec like `"X:N"`) plus `spec=` for what the output
+    to a stile spec like `"X:N"`) plus `spec=` for what the output(s)
     should equal.
 
-    At decoration time the decorator:
-      1. `inspect.getsource(fn)` + `ast.parse` the body.
-      2. Abstract-interpret the AST: every `tl.load(ptr + …)` binds to
-         the input's stile `Tensor(name=…)`; arithmetic / `tl.exp` /
-         etc. propagate stile Types. At each `tl.store`, verifies the
-         stored value's stile ET against the OutputSpec.
-      3. Re-emits the function with stile decorator + `inputs=`
-         stripped, decorates with `@triton.jit`, and `exec`s it. The
-         returned object is `TypedTritonKernel`, launchable with
-         Triton's familiar `kernel[grid](*typed_inputs)` syntax.
+    For single-output kernels, pass strings/tuples: `spec="..."`,
+    `out_shape=(M, N)`, `out_dtype=torch.float32`. The launcher returns
+    a single `TypedTorchTensor`.
+
+    For multi-output kernels, pass lists of equal length: `spec=["..",
+    ".."]`, `out_shape=[(M, N), (M,)]`, `out_dtype=[torch.float32,
+    torch.int32]` (or a single dtype that's broadcast to all outputs).
+    The kernel signature has N output pointer args after the inputs,
+    in declaration order. The launcher returns a tuple of N
+    `TypedTorchTensor`s in the same order.
     """
     def decorate(fn):
         src = textwrap.dedent(inspect.getsource(fn))
@@ -73,6 +84,42 @@ def jit(
             "@ttl.jit must decorate a plain function definition"
         )
 
+        is_multi = not isinstance(spec, str)
+        if is_multi:
+            specs = list(spec)
+            if not (isinstance(out_shape, (list, tuple)) and len(out_shape) == len(specs)):
+                raise ValueError(
+                    f"multi-output kernel: out_shape must be a list/tuple "
+                    f"of {len(specs)} per-output shapes; got {out_shape!r}"
+                )
+            shapes = [tuple(s) for s in out_shape]
+            if isinstance(out_dtype, (list, tuple)):
+                if len(out_dtype) != len(specs):
+                    raise ValueError(
+                        f"multi-output kernel: out_dtype list must have "
+                        f"{len(specs)} entries; got {len(out_dtype)}"
+                    )
+                dtypes = list(out_dtype)
+            else:
+                dtypes = [out_dtype] * len(specs)
+        else:
+            specs = [spec]
+            shapes = [tuple(out_shape)]
+            dtypes = [out_dtype]
+
+        arg_names = [a.arg for a in fn_def.args.args]
+        out_ptr_names = arg_names[len(inputs) : len(inputs) + len(specs)]
+        if len(out_ptr_names) != len(specs):
+            raise ValueError(
+                f"@ttl.jit expected {len(specs)} output-pointer parameter(s) "
+                f"after {len(inputs)} input(s); the kernel only has "
+                f"{len(arg_names) - len(inputs)} non-input args."
+            )
+        outputs = [
+            _OutputDecl(ptr_name=p, spec=s, shape=sh, dtype=dt)
+            for p, s, sh, dt in zip(out_ptr_names, specs, shapes, dtypes)
+        ]
+
         # Pre-pass: resolve any f-string predicate/value args inside
         # `ttl.mask(...)` to plain Constants so both the verifier and
         # the rewriter see literal strings instead of `JoinedStr` nodes
@@ -81,21 +128,21 @@ def jit(
 
         # Verification: abstract-interpret the body. Raises if any
         # `tl.store` writes a value whose stile ET doesn't match the
-        # declared spec.
+        # declared spec for that output pointer.
         _verify_kernel(
-            fn_def, inputs, spec, out_shape, out_dtype, fn,
-            consts=consts or {},
+            fn_def, inputs, outputs, fn, consts=consts or {},
         )
 
         # Re-emit: strip stile decorator + input annotations, add
         # @triton.jit, exec to define the runtime kernel.
         triton_fn = _emit_triton_fn(
-            fn_def, fn, inputs, out_shape, out_dtype, consts=consts or {},
+            fn_def, fn, inputs, outputs, consts=consts or {},
         )
 
         return TypedTritonKernel(
-            triton_fn, spec, inputs, out_shape, out_dtype,
+            triton_fn, inputs, outputs,
             consts=consts or {},
+            single_output=not is_multi,
         )
 
     return decorate
@@ -121,35 +168,21 @@ def _is_ttl_call(node, name : str) -> bool:
 
 
 def _verify_kernel(
-    fn_def, inputs, spec, out_shape, out_dtype, original_fn, consts=None,
+    fn_def, inputs, outputs, original_fn, consts=None,
 ):
     """
-    Abstract-interpret the kernel's body to build per-variable stile
-    Types, then check each store against the spec. Handles:
-      - `Assign`: `x = <expr>` binds env[x] = expr's stile Type.
-      - `AugAssign`: `acc += <expr>` updates env[acc] via the op.
-      - `For` over `range(lo, hi, step)` with concrete bounds: unroll
-        and walk the body once per iteration with the loop var bound
-        to the concrete int. `_interpret_expr` then resolves slice
-        bounds to concrete `Sliced` dims, and the verifier's existing
-        tile-merge folds the sum-of-slices into a full reduce.
-      - `Expr(Call)` of `tl.store` / `ttl.store` against the output
-        pointer: verifies the stored value's Type against the spec
-        (tile-restricted to the slice).
-
-    `dim_atoms` maps each Python identifier visible in the kernel's
-    closure to its `FullDim` (so `K[lo:hi]` resolves the dim atom by
-    Python name, and `range(0, K, BLOCK_K)` resolves `K` and
-    `BLOCK_K` to concrete ints for unrolling).
+    Abstract-interpret the kernel's body and check each `tl.store` /
+    `ttl.store` against the spec of the matching output pointer.
+    `outputs` is a list of `_OutputDecl`; for single-output kernels
+    that's a 1-element list.
     """
-    spec_type = parse_spec_into_type(spec)
+    out_specs : dict[str, tuple] = {}
+    for o in outputs:
+        out_specs[o.ptr_name] = (parse_spec_into_type(o.spec), o.shape)
 
     input_types : dict[str, Type] = {}
     for ptr_name, ptr_spec in inputs.items():
         input_types[ptr_name] = parse_spec_into_type(ptr_spec)
-
-    arg_names = [a.arg for a in fn_def.args.args]
-    out_ptr_name = arg_names[len(inputs)]
 
     dim_atoms = _collect_dim_atoms(original_fn)
     env : dict[str, object] = {}
@@ -199,7 +232,8 @@ def _verify_kernel(
                 store_ptr = call.args[0]
                 store_val = call.args[1]
                 base = _peel_pointer_base(store_ptr)
-                if base == out_ptr_name:
+                if base in out_specs:
+                    spec_type, out_shape = out_specs[base]
                     _verify_stored_value(
                         store_val, env, input_types, dim_atoms,
                         spec_type, slices=None, out_shape=out_shape,
@@ -210,8 +244,9 @@ def _verify_kernel(
                 slices = call.args[2:]
                 if (
                     isinstance(store_ptr, ast.Name)
-                    and store_ptr.id == out_ptr_name
+                    and store_ptr.id in out_specs
                 ):
+                    spec_type, out_shape = out_specs[store_ptr.id]
                     _verify_stored_value(
                         store_val, env, input_types, dim_atoms,
                         spec_type, slices=slices, out_shape=out_shape,
@@ -668,11 +703,16 @@ def _interpret_expr(node, env, input_types, dim_atoms):
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return float(node.value)
     if isinstance(node, ast.Name):
-        # First env (per-loop-iter bindings; loop vars are ints), then
-        # dim_atoms (FullDim.size as int).
+        # First env (per-loop-iter bindings, decorator-time `consts={…}`
+        # — these may be ints, floats, or Types), then dim_atoms
+        # (FullDim.size promoted to float).
         if node.id in env:
             v = env[node.id]
-            if isinstance(v, int):
+            if isinstance(v, bool):
+                # Python's bool is a subclass of int; treat it
+                # explicitly so 0/1 stays as int-like, not Constant(True).
+                return float(v)
+            if isinstance(v, (int, float)):
                 return float(v)
             if isinstance(v, Type):
                 return v
@@ -689,10 +729,33 @@ def _interpret_expr(node, env, input_types, dim_atoms):
         # handles the binding in env.
         return _ProgramIdMarker()
     if _is_tl_call(node, "load"):
+        # `tl.load(ptr + arithmetic)` — fall through to the input's
+        # declared full type. The shape of the actual loaded tile (e.g.
+        # what `i[:, None] * stride + j[None, :]` selects) isn't
+        # inferred here; if the user wants per-tile slice information
+        # in the verifier, they should use `ttl.load(ptr, DIM[lo:hi],
+        # ...)`. Raise loudly if we can't even find the base pointer,
+        # rather than silently returning a None that confuses downstream.
         ptr_base = _peel_pointer_base(node.args[0])
-        if ptr_base is not None and ptr_base in input_types:
-            return input_types[ptr_base]
-        return None
+        if ptr_base is None:
+            raise ValueError(
+                f"tl.load({ast.unparse(node.args[0])}): couldn't find a "
+                f"declared input-pointer name in the offset expression. "
+                f"Either start the offset with one of {sorted(input_types)} "
+                f"as the leftmost operand, or use the typed-slice form "
+                f"`ttl.load(ptr, DIM[lo:hi], ...)` to declare the tile "
+                f"shape explicitly."
+            )
+        if ptr_base not in input_types:
+            raise ValueError(
+                f"tl.load(...): peeled base pointer `{ptr_base}` isn't "
+                f"declared in `inputs={{...}}`. Known input pointers: "
+                f"{sorted(input_types)}. If `{ptr_base}` is a derived "
+                f"pointer variable (e.g. `{ptr_base} = X_ptr + …`), use "
+                f"`ttl.load(X_ptr, DIM[lo:hi], ...)` instead so the "
+                f"verifier sees the original pointer and the tile shape."
+            )
+        return input_types[ptr_base]
     if _is_ttl_call(node, "load"):
         # `ttl.load(ptr, DIM_0[lo:hi], DIM_1[lo:hi], …)`. Restrict the
         # input's Type to the slice: each `DIM[lo:hi]` becomes
@@ -866,6 +929,20 @@ def _interpret_expr(node, env, input_types, dim_atoms):
             return None
         a, b = _broadcast_pair(a, b)
         return t.maximum(a, b)
+    if _is_tl_call(node, "minimum"):
+        # `tl.minimum(a, b)` → lowered as `-max(-a, -b)` since stile's
+        # BinaryOpType doesn't have a native "min". Matches the
+        # `minimum(...)` lowering in the spec grammar so both sides
+        # normalize to the same NormalizedExpr.
+        a = _interpret_expr(node.args[0], env, input_types, dim_atoms)
+        b = _interpret_expr(node.args[1], env, input_types, dim_atoms)
+        if a is None or b is None:
+            return None
+        a, b = _broadcast_pair(a, b)
+        neg_a = t.type_from_binary_op(0.0, a, "-")
+        neg_b = t.type_from_binary_op(0.0, b, "-")
+        neg_max = t.maximum(neg_a, neg_b)
+        return t.type_from_binary_op(0.0, neg_max, "-")
     if _is_tl_call(node, "max") or _is_tl_call(node, "sum"):
         x = _interpret_expr(node.args[0], env, input_types, dim_atoms)
         if not isinstance(x, Type):
@@ -1199,16 +1276,17 @@ class _RewriteTtlCalls(ast.NodeTransformer):
         )
         if pred_str is None:
             return node
-        atoms = _parse_simple_predicate(pred_str)
-        if atoms is None:
+        conjs = _parse_simple_predicate(pred_str)
+        if conjs is None:
             return node
         dim_to_axis = {name: i for i, (name, _, _) in enumerate(slices)}
         # Every dim-name referenced by any atom must be a declared
         # slice dim (pure-integer terms have name=None).
-        for lhs_term, _, rhs_term in atoms:
-            for t in (lhs_term, rhs_term):
-                if t.name is not None and t.name not in dim_to_axis:
-                    return node
+        for conj in conjs:
+            for lhs_term, _, rhs_term in conj:
+                for t in (lhs_term, rhs_term):
+                    if t.name is not None and t.name not in dim_to_axis:
+                        return node
 
         uid = self._next_uid()
         prelude = []
@@ -1260,17 +1338,24 @@ class _RewriteTtlCalls(ast.NodeTransformer):
                 right=ast.Constant(value=-term.offset),
             )
 
-        cmp_nodes = [
-            ast.Compare(
-                left=term_node(lhs),
-                ops=[_AST_CMP_OPS[op]()],
-                comparators=[term_node(rhs)],
-            )
-            for lhs, op, rhs in atoms
-        ]
-        combined = cmp_nodes[0]
-        for c in cmp_nodes[1:]:
-            combined = ast.BinOp(left=combined, op=ast.BitAnd(), right=c)
+        # AND within a conjunct → BitAnd; OR across conjuncts → BitOr.
+        conj_nodes = []
+        for conj in conjs:
+            cmp_nodes = [
+                ast.Compare(
+                    left=term_node(lhs),
+                    ops=[_AST_CMP_OPS[op]()],
+                    comparators=[term_node(rhs)],
+                )
+                for lhs, op, rhs in conj
+            ]
+            conj_node = cmp_nodes[0]
+            for c in cmp_nodes[1:]:
+                conj_node = ast.BinOp(left=conj_node, op=ast.BitAnd(), right=c)
+            conj_nodes.append(conj_node)
+        combined = conj_nodes[0]
+        for c in conj_nodes[1:]:
+            combined = ast.BinOp(left=combined, op=ast.BitOr(), right=c)
         where_call = ast.Call(
             func=ast.Attribute(value=ast.Name(id="tl"), attr="where"),
             args=[combined, on_kw.value, off_kw.value],
@@ -1536,33 +1621,38 @@ _AST_CMP_OPS = {
 }
 
 
-def _parse_simple_predicate(s : str) -> "list[tuple[_PredTerm, str, _PredTerm]] | None":
-    """Parse a `&&`-conjunction of `<term> <op> <term>` atoms. Each
-    term is either a bare dim-name identifier, a bare integer literal,
-    or `<name> ± <int>` / `<int> + <name>` (so shifted-causal masks
-    like `nctx <= qctx + 1` and sliding-window masks like
-    `nctx >= qctx - W` lower to the right Triton arithmetic). The
-    verifier side handles the full predicate grammar via stile's
-    `_parse_predicate` — only the runtime codegen needs this form.
+def _parse_simple_predicate(s : str) -> "list[list[tuple[_PredTerm, str, _PredTerm]]] | None":
+    """Parse a DNF predicate `<conj> [|| <conj>]*` where each `<conj>`
+    is `<atom> [&& <atom>]*` and each `<atom>` is `<term> <op> <term>`.
+    A term is a bare identifier, bare integer, or `<name> ± <int>` /
+    `<int> + <name>`. `&&` binds tighter than `||`. The verifier side
+    handles the full grammar via stile's `_parse_predicate`; the
+    runtime codegen lifts to AND of `&` (BitAnd) inside each conjunct
+    and OR of `|` (BitOr) across conjuncts.
 
-    Returns the list of `(lhs_term, op, rhs_term)` atoms (all-AND), or
-    None if any sub-part fails to parse.
+    Returns a list of conjuncts (each a list of atoms), or None if any
+    sub-part fails to parse.
     """
-    atoms : list[tuple[_PredTerm, str, _PredTerm]] = []
-    for part in s.split("&&"):
-        part = part.strip()
-        for op in ("<=", ">=", "==", "!=", "<", ">"):
-            if op in part:
-                lhs_str, _, rhs_str = part.partition(op)
-                lhs = _parse_pred_term(lhs_str)
-                rhs = _parse_pred_term(rhs_str)
-                if lhs is None or rhs is None:
-                    return None
-                atoms.append((lhs, op, rhs))
-                break
-        else:
+    conjs : list[list[tuple[_PredTerm, str, _PredTerm]]] = []
+    for conj_str in s.split("||"):
+        atoms : list[tuple[_PredTerm, str, _PredTerm]] = []
+        for part in conj_str.split("&&"):
+            part = part.strip()
+            for op in ("<=", ">=", "==", "!=", "<", ">"):
+                if op in part:
+                    lhs_str, _, rhs_str = part.partition(op)
+                    lhs = _parse_pred_term(lhs_str)
+                    rhs = _parse_pred_term(rhs_str)
+                    if lhs is None or rhs is None:
+                        return None
+                    atoms.append((lhs, op, rhs))
+                    break
+            else:
+                return None
+        if not atoms:
             return None
-    return atoms or None
+        conjs.append(atoms)
+    return conjs or None
 
 
 @dataclass(frozen=True)
@@ -1647,7 +1737,7 @@ def _stride_for_axis(axis : int, dim_nodes : list) -> "ast.AST | None":
 
 
 def _emit_triton_fn(
-    fn_def, original_fn, inputs, out_shape=None, out_dtype=None, consts=None,
+    fn_def, original_fn, inputs, outputs, consts=None,
 ):
     """
     Re-emit the kernel function with stile decorations stripped and
@@ -1663,20 +1753,17 @@ def _emit_triton_fn(
     ]
     # Rewrite `ttl.load`/`ttl.store` into raw `tl.load`/`tl.store` with
     # offsets + masks computed from the slice info + row-major strides
-    # derived from the declared input shape. The output pointer's
-    # shape comes from the @ttl.jit decorator's out_shape; the output
-    # is always the kernel-arg right after the inputs.
+    # derived from the declared input + output shapes. Multi-output
+    # kernels have one entry per output pointer.
     ptr_types : dict[str, Type] = {
         ptr_name: parse_spec_into_type(ptr_spec)
         for ptr_name, ptr_spec in inputs.items()
     }
-    arg_names = [a.arg for a in fn_def.args.args]
-    out_ptr_name = arg_names[len(inputs)]
-    out_full_type = parse_spec_into_type(
-        " ".join(d.name for d in out_shape)
-    )
-    out_full_type = Type(out_shape, out_full_type.et, out_dtype)
-    ptr_types[out_ptr_name] = out_full_type
+    for o in outputs:
+        out_full_type = parse_spec_into_type(
+            " ".join(d.name for d in o.shape)
+        )
+        ptr_types[o.ptr_name] = Type(o.shape, out_full_type.et, o.dtype)
     # Build the same closure+consts dict the verifier uses for f-string
     # spec literals so the rewriter can resolve f-string predicates
     # (e.g. `predicate=f"nctx <= qctx + {OFFSET}"`) at decoration time.
@@ -1758,16 +1845,20 @@ class TypedTritonKernel:
     Verified Triton kernel. Triton's `[grid](*args)` launch syntax
     delegates to the underlying `@triton.jit` function; the
     `TypedTorchTensor` inputs are unwrapped to raw tensors before
-    launch, and the output is rewrapped with the declared type.
+    launch, and each output is rewrapped with its declared type.
     `consts` declared at decoration time are passed as kwargs to
     `@triton.jit` automatically — overridable per-launch.
+
+    `single_output` selects the return convention: True means the
+    launcher returns one `TypedTorchTensor` directly (the common case);
+    False means it returns a tuple of N `TypedTorchTensor`s in the
+    declaration order.
     """
     triton_fn : object
-    spec : str
     inputs : dict[str, str]
-    out_shape : ShapeType
-    out_dtype : object
+    outputs : "list[_OutputDecl]"
     consts : dict
+    single_output : bool = True
 
     def __getitem__(self, grid):
         if isinstance(grid, int):
@@ -1786,19 +1877,23 @@ class _Launcher:
                 "Triton is not installed; cannot launch the verified "
                 "kernel. Install triton or run on a GPU host."
             )
-        out_shape_ints = tuple(
-            as_int(dim_size(d)) for d in self.kernel.out_shape
-        )
-        out_dtype = self.kernel.out_dtype or torch.float32
-        out_tensor = torch.empty(
-            out_shape_ints, dtype=out_dtype, device="cuda",
-        )
+        out_tensors = []
+        wrapped = []
+        for o in self.kernel.outputs:
+            shape_ints = tuple(as_int(dim_size(d)) for d in o.shape)
+            dtype = o.dtype or torch.float32
+            buf = torch.empty(shape_ints, dtype=dtype, device="cuda")
+            out_tensors.append(buf)
+            spec_type = parse_spec_into_type(o.spec)
+            wrapped.append(TypedTorchTensor(
+                buf, Type(o.shape, spec_type.et, o.dtype),
+            ))
         raw_inputs = tuple(ti.tensor for ti in typed_inputs)
         all_kwargs = dict(self.kernel.consts)
         all_kwargs.update(kwargs)
-        self.kernel.triton_fn[self.grid](*raw_inputs, out_tensor, **all_kwargs)
-        spec_type = parse_spec_into_type(self.kernel.spec)
-        return TypedTorchTensor(
-            out_tensor,
-            Type(self.kernel.out_shape, spec_type.et, self.kernel.out_dtype),
+        self.kernel.triton_fn[self.grid](
+            *raw_inputs, *out_tensors, **all_kwargs,
         )
+        if self.kernel.single_output:
+            return wrapped[0]
+        return tuple(wrapped)

@@ -869,6 +869,99 @@ def test_moe_tiled(reset):
 
 @_REQUIRES_TRITON
 @_REQUIRES_TORCH
+def test_multi_output_relu_maximum_float_const(reset):
+    """
+    Multi-output kernel that also exercises the new `relu` / `maximum`
+    spec keywords and a float `consts={"SCALE": 0.7}` (regression: the
+    env-lookup path was rejecting non-int consts and silently dropping
+    them, breaking any spec arithmetic that multiplied by a float).
+    """
+    N = dim("N", 32)
+    BLOCK = 16
+    SCALE = 0.7
+
+    X_arr = torch.randn(N.size, device="cuda")
+    Y_arr = torch.randn(N.size, device="cuda")
+    X = ttensor(X_arr, N, name="X")
+    Y = ttensor(Y_arr, N, name="Y")
+
+    @ttl.jit(
+        spec=[
+            f"relu({SCALE} * X:N)",
+            f"maximum({SCALE} * X:N, Y:N)",
+        ],
+        inputs={"X_ptr": "X:N", "Y_ptr": "Y:N"},
+        out_shape=[(N,), (N,)],
+        out_dtype=[torch.float32, torch.float32],
+        consts={"BLOCK": BLOCK, "SCALE": SCALE},
+    )
+    def kernel(
+        X_ptr, Y_ptr, OutRelu_ptr, OutMax_ptr,
+        BLOCK: tl.constexpr, SCALE: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        x = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
+        y = ttl.load(Y_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
+        scaled = x * SCALE
+        ttl.store(
+            OutRelu_ptr, tl.maximum(scaled, 0.0),
+            N[pid * BLOCK : (pid + 1) * BLOCK],
+        )
+        ttl.store(
+            OutMax_ptr, tl.maximum(scaled, y),
+            N[pid * BLOCK : (pid + 1) * BLOCK],
+        )
+
+    out_relu, out_max = kernel[(N.size // BLOCK,)](X, Y)
+    expected_relu = torch.maximum(SCALE * X_arr, torch.zeros_like(X_arr))
+    expected_max = torch.maximum(SCALE * X_arr, Y_arr)
+    assert torch.allclose(out_relu.tensor, expected_relu, atol=1e-5)
+    assert torch.allclose(out_max.tensor, expected_max, atol=1e-5)
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
+def test_mask_or_predicate(reset):
+    """
+    `||` in `ttl.mask` lowers to a runtime BitOr of comparisons. The
+    predicate `N < 8 || N >= 24` keeps the edges of the tile and
+    zeros out the middle. Spec uses a top-level `where`-clause that
+    parses through the same predicate grammar (so both sides see the
+    same Domain after normalization).
+    """
+    N = dim("N", 32)
+    BLOCK = 32
+
+    X_arr = torch.randn(N.size, device="cuda")
+    X = ttensor(X_arr, N, name="X")
+
+    @ttl.jit(
+        spec="X:N where N < 8 || N >= 24",
+        inputs={"X_ptr": "X:N"},
+        out_shape=(N,),
+        out_dtype=torch.float32,
+        consts={"BLOCK": BLOCK},
+    )
+    def kernel(X_ptr, O_ptr, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        x = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
+        mult_mask = ttl.mask(
+            N[pid * BLOCK : (pid + 1) * BLOCK],
+            predicate="N < 8 || N >= 24",
+            on=1.0, off=0.0,
+        )
+        ttl.store(
+            O_ptr, x * mult_mask, N[pid * BLOCK : (pid + 1) * BLOCK],
+        )
+
+    result = kernel[(1,)](X)
+    expected = X_arr.clone()
+    expected[8:24] = 0.0
+    assert torch.allclose(result.tensor, expected, atol=1e-5)
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
 def test_matmul_with_invariant(reset):
     """
     Same tiled matmul, but the K-loop is wrapped in `ttl.range(...,

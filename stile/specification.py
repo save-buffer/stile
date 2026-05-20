@@ -3,7 +3,7 @@ from .type import _g_tensor_counter
 from .indexing import (
     AffineExpr, LoopVariable, Domain, to_affine,
     domain as _indexing_domain,
-    le, lt, ge, gt, eq, free_vars, and_domains,
+    le, lt, ge, gt, eq, free_vars, and_domains, or_domains,
 )
 
 
@@ -494,6 +494,37 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
             dim_in_dest=dim_full_dim(dim_in_dest),
             idx=idx_et,
         )
+    elif binary_fn := lex.maybe_consume_keyword("maximum", "minimum"):
+        # `maximum(<spec1>, <spec2>)` → BinaryOp(max, et1, et2).
+        # `minimum(<spec1>, <spec2>)` → `-max(-et1, -et2)` since stile's
+        # BinaryOpType doesn't have a native "min". Shapes must match;
+        # for broadcasting against a scalar, wrap the scalar side in
+        # `0 + <scalar>` to force it into a Constant ET (or use `relu`
+        # for the common `max(x, 0)` case).
+        lex.expect('(')
+        st1, et1 = _parse_spec(lex)
+        lex.expect(',')
+        st2, et2 = _parse_spec(lex)
+        lex.expect(')')
+        if st1 != st2:
+            raise ValueError(
+                f"{binary_fn}() expects same-shape arguments; got "
+                f"{[dim_name(d) for d in st1]} vs "
+                f"{[dim_name(d) for d in st2]}"
+            )
+        if binary_fn == "maximum":
+            return st1, BinaryOp(op="max", lhs=et1, rhs=et2)
+        # minimum: `0 - max(0 - x, 0 - y)`.
+        neg_et1 = BinaryOp(op="-", lhs=Constant(0.0), rhs=et1)
+        neg_et2 = BinaryOp(op="-", lhs=Constant(0.0), rhs=et2)
+        neg_max = BinaryOp(op="max", lhs=neg_et1, rhs=neg_et2)
+        return st1, BinaryOp(op="-", lhs=Constant(0.0), rhs=neg_max)
+    elif lex.maybe_consume_keyword("relu"):
+        # `relu(<spec>)` → `maximum(<spec>, 0)`.
+        lex.expect('(')
+        st, et = _parse_spec(lex)
+        lex.expect(')')
+        return st, BinaryOp(op="max", lhs=et, rhs=Constant(0.0))
     elif unary_op := lex.maybe_consume_keyword("exp", "sin", "cos", "sqrt", "sigmoid", "softmax"):
         pred_domain = None
         if lex.maybe_consume('['):
@@ -633,10 +664,19 @@ def _parse_atomic_predicate(lex : LexState) -> Domain:
 
 def _parse_predicate(lex : LexState) -> Domain:
     """
-    A `where`-clause predicate, optionally a conjunction joined by `&&`
-    (or `and`). The result is a single-disjunct `Domain` whose conjunct
-    is the AND of every atomic comparison.
+    A `where`-clause predicate in DNF form: `<conj> [|| <conj>]*`
+    where each `<conj>` is `<atom> [&& <atom>]*`. `&&` binds tighter
+    than `||`, matching the C / Python boolean convention. Returns a
+    `Domain` whose disjuncts cover the union of conjuncts.
     """
+    domain = _parse_conjunction(lex)
+    while (lex.maybe_consume("||") or lex.maybe_consume_keyword("or")):
+        rhs = _parse_conjunction(lex)
+        domain = or_domains(domain, rhs)
+    return domain
+
+
+def _parse_conjunction(lex : LexState) -> Domain:
     domain = _parse_atomic_predicate(lex)
     while (lex.maybe_consume("&&") or lex.maybe_consume_keyword("and")):
         rhs = _parse_atomic_predicate(lex)
