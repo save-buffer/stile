@@ -962,6 +962,145 @@ def test_mask_or_predicate(reset):
 
 @_REQUIRES_TRITON
 @_REQUIRES_TORCH
+def test_persistent_grid_strided_loop(reset):
+    """
+    Persistent grid: launch a small fixed number of programs
+    (typically num_SMs) and have each one stride-loop over many tiles
+    via `for tile_id in ttl.range(pid, num_tiles, num_programs)`.
+
+    The verifier binds `tile_id` as a symbolic int inside a LoopScope
+    and walks the body once; each per-tile `ttl.store` must equal the
+    spec restricted to that tile. No invariant is needed because the
+    body has no inter-iteration accumulator — every iteration writes
+    an independent output tile.
+    """
+    N = dim("N", 64)
+    BLOCK = 16
+    NUM_PID = 2  # persistent grid: 2 programs handle 4 tiles each.
+
+    X_arr = torch.randn(N.size, device="cuda")
+    X = ttensor(X_arr, N, name="X")
+
+    @ttl.jit(
+        spec="2 * X:N",
+        inputs={"X_ptr": "X:N"},
+        out_shape=(N,),
+        out_dtype=torch.float32,
+        consts={"BLOCK": BLOCK, "NUM_TILES": N.size // BLOCK},
+    )
+    def kernel(
+        X_ptr, O_ptr, BLOCK: tl.constexpr, NUM_TILES: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        num_pid = tl.num_programs(0)
+        for tile_id in ttl.range(pid, NUM_TILES, num_pid):
+            x = ttl.load(
+                X_ptr,
+                N[tile_id * BLOCK : (tile_id + 1) * BLOCK],
+            )
+            ttl.store(
+                O_ptr, x * 2,
+                N[tile_id * BLOCK : (tile_id + 1) * BLOCK],
+            )
+
+    result = kernel[(NUM_PID,)](X)
+    assert torch.allclose(result.tensor, X_arr * 2, atol=1e-5)
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
+def test_abs_relu_static_range_cdiv(reset):
+    """
+    Bundles the smaller adds:
+      - `abs(...)` in the spec, `tl.abs(...)` in the kernel.
+      - `ttl.static_range(...)` (compile-time unrolled, alias of
+        `range` at verify time).
+      - `tl.cdiv(NUM, BLOCK)` as the loop bound (constexpr ceil-div).
+    """
+    N = dim("N", 32)
+    BLOCK = 16
+
+    X_arr = torch.randn(N.size, device="cuda")
+    X = ttensor(X_arr, N, name="X")
+
+    @ttl.jit(
+        spec="abs(X:N)",
+        inputs={"X_ptr": "X:N"},
+        out_shape=(N,),
+        out_dtype=torch.float32,
+        consts={"BLOCK": BLOCK, "N_SIZE": N.size},
+    )
+    def kernel(
+        X_ptr, O_ptr, BLOCK: tl.constexpr, N_SIZE: tl.constexpr,
+    ):
+        for tile_id in ttl.static_range(0, tl.cdiv(N_SIZE, BLOCK)):
+            x = ttl.load(
+                X_ptr,
+                N[tile_id * BLOCK : (tile_id + 1) * BLOCK],
+            )
+            ttl.store(
+                O_ptr, tl.abs(x),
+                N[tile_id * BLOCK : (tile_id + 1) * BLOCK],
+            )
+
+    result = kernel[(1,)](X)
+    assert torch.allclose(result.tensor, X_arr.abs(), atol=1e-5)
+
+
+_L1_N = dim("L1_N", 8)
+_L1_Bin = dim("L1_Bin", 8)
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
+def test_l1_normalize_module_level_dims(reset):
+    """
+    L1-normalize `raw / sum[bin](abs(raw))` with the dims declared at
+    module scope (not inside the test function). Regression for the
+    bug where `_emit_triton_fn`'s closure-inlining loop only walked
+    `__closure__`, missing globals; the kernel then tripped on
+    `Cannot access global variable N` at Triton-parse time. Spec-side
+    fully verifies — exercises the "fraction with a reduction in the
+    denominator" normalization path that one user mis-attributed to
+    the documented sum-across-denominator gap.
+    """
+    # Re-register the module-level dims in case a prior test fixture
+    # called `reset_stile()` (which clears `g_dim_registry`). The
+    # module-level FullDim objects themselves are still live — calling
+    # dim() again with the same (name, size) is idempotent and just
+    # re-inserts the registry entry the spec parser checks against.
+    dim("L1_N", 8)
+    dim("L1_Bin", 8)
+    BN = 4
+    BB = _L1_Bin.size
+
+    X_arr = torch.randn(_L1_N.size, _L1_Bin.size, device="cuda")
+    X = ttensor(X_arr, _L1_N, _L1_Bin, name="raw")
+
+    @ttl.jit(
+        spec="raw:L1_N L1_Bin / sum[L1_Bin](abs(raw:L1_N L1_Bin))",
+        inputs={"R_ptr": "raw:L1_N L1_Bin"},
+        out_shape=(_L1_N, _L1_Bin),
+        out_dtype=torch.float32,
+        consts={"BN": BN, "BB": BB},
+    )
+    def kernel(R_ptr, O_ptr, BN: tl.constexpr, BB: tl.constexpr):
+        pid = tl.program_id(0)
+        raw = ttl.load(R_ptr, _L1_N[pid * BN : (pid + 1) * BN], _L1_Bin[0 : BB])
+        abs_sum = tl.sum(tl.abs(raw), axis=1)
+        out = raw / abs_sum[:, None]
+        ttl.store(
+            O_ptr, out,
+            _L1_N[pid * BN : (pid + 1) * BN], _L1_Bin[0 : BB],
+        )
+
+    result = kernel[(_L1_N.size // BN,)](X)
+    expected = X_arr / X_arr.abs().sum(dim=1, keepdim=True)
+    assert torch.allclose(result.tensor, expected, atol=1e-5)
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
 def test_matmul_with_invariant(reset):
     """
     Same tiled matmul, but the K-loop is wrapped in `ttl.range(...,

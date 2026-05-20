@@ -525,6 +525,13 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
         st, et = _parse_spec(lex)
         lex.expect(')')
         return st, BinaryOp(op="max", lhs=et, rhs=Constant(0.0))
+    elif lex.maybe_consume_keyword("abs"):
+        # `abs(<spec>)` → `maximum(<spec>, 0 - <spec>)`.
+        lex.expect('(')
+        st, et = _parse_spec(lex)
+        lex.expect(')')
+        neg_et = BinaryOp(op="-", lhs=Constant(0.0), rhs=et)
+        return st, BinaryOp(op="max", lhs=et, rhs=neg_et)
     elif unary_op := lex.maybe_consume_keyword("exp", "sin", "cos", "sqrt", "sigmoid", "softmax"):
         pred_domain = None
         if lex.maybe_consume('['):

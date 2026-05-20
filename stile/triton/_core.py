@@ -189,10 +189,10 @@ def _verify_kernel(
     if consts is not None:
         env.update(consts)
     # Locals dict for evaluating f-string spec literals (invariants,
-    # etc.) at decoration time. Pulls in both closure free vars and
-    # the decorator-time `consts={…}` — kernel-arg names like `BLOCK_K`
-    # aren't in `__closure__` (they're parameters), but the user
-    # declared their values via `consts=`.
+    # etc.) at decoration time. Pulls in closure free vars, referenced
+    # module globals, and the decorator-time `consts={…}`. Kernel-arg
+    # names like `BLOCK_K` aren't in `__closure__` (they're parameters),
+    # but the user declared their values via `consts=`.
     fstr_eval_locals = dict(consts or {})
     for name, cell in zip(
         original_fn.__code__.co_freevars,
@@ -202,6 +202,9 @@ def _verify_kernel(
             fstr_eval_locals[name] = cell.cell_contents
         except ValueError:
             continue
+    for name in original_fn.__code__.co_names:
+        if name not in fstr_eval_locals and name in original_fn.__globals__:
+            fstr_eval_locals[name] = original_fn.__globals__[name]
 
     def visit(stmt):
         if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
@@ -257,9 +260,10 @@ def _verify_kernel(
 
 
 def _collect_dim_atoms(fn) -> dict:
-    """Build `name -> FullDim` for every closure / global that's a
-    stile dim. Used by the AST-to-SymbolicIndex evaluator to resolve
-    things like `K[lo:hi]` and `range(0, K, BLOCK_K)`."""
+    """Build `name -> FullDim` for every closure / referenced global
+    that's a stile dim. Used by the AST-to-SymbolicIndex evaluator to
+    resolve things like `K[lo:hi]` and `range(0, K, BLOCK_K)`.
+    Closure entries take precedence (function-local shadows the global)."""
     out : dict = {}
     closure = fn.__closure__ or ()
     for name, cell in zip(fn.__code__.co_freevars, closure):
@@ -269,9 +273,13 @@ def _collect_dim_atoms(fn) -> dict:
             continue
         if hasattr(val, "name") and hasattr(val, "size") and isinstance(val.size, int):
             out[name] = val
-    for name, val in fn.__globals__.items():
-        if hasattr(val, "name") and hasattr(val, "size") and isinstance(val.size, int):
-            out.setdefault(name, val)
+    referenced_names = set(fn.__code__.co_names)
+    for name in referenced_names:
+        if name in out:
+            continue
+        val = fn.__globals__.get(name)
+        if val is not None and hasattr(val, "name") and hasattr(val, "size") and isinstance(val.size, int):
+            out[name] = val
     return out
 
 
@@ -300,11 +308,11 @@ def _unroll_for(
     if not isinstance(iter_call, ast.Call):
         return
 
-    is_ttl_range = _is_ttl_call(iter_call, "range")
+    is_ttl_range = _is_ttl_call(iter_call, "range") or _is_ttl_call(iter_call, "static_range")
     is_plain_range = (
         isinstance(iter_call.func, ast.Name)
         and iter_call.func.id == "range"
-    )
+    ) or _is_tl_call(iter_call, "static_range")
     if not (is_ttl_range or is_plain_range):
         return
 
@@ -341,11 +349,33 @@ def _unroll_for(
         return
 
     if any(b is None for b in (lo_i, hi_i, step_i)):
-        raise ValueError(
-            f"for-loop over `{node.target.id}` has non-concrete bounds "
-            f"and no invariant — wrap in `ttl.range(..., invariant=…)` "
-            f"to verify symbolically."
-        )
+        # Non-concrete bounds and no invariant → persistent-grid /
+        # strided-loop pattern (`for tile_id in ttl.range(pid,
+        # num_tiles, num_programs)` — bounds depend on per-program
+        # runtime quantities). The kernel body has no inter-iteration
+        # accumulator; we just need each `ttl.store(...)` inside the
+        # body to certify against its tile of the spec. Walk the body
+        # once with `target` bound as a symbolic int under a LoopScope
+        # so dim slicing like `dhead[tile_id*BD:(tile_id+1)*BD]`
+        # resolves to a `Sliced(dhead, AffineExpr(tile_id), ...)`.
+        if not is_ttl_range:
+            raise ValueError(
+                f"for-loop over `{node.target.id}` has non-concrete "
+                f"bounds. Use `ttl.range(lo, hi[, step])` so the verifier "
+                f"can bind the loop var symbolically, optionally with "
+                f"`invariant=…` if there's an inter-iteration accumulator."
+            )
+        var = node.target.id
+        saved = env.get(var, None)
+        with LoopScope(var, lo_s, hi_s) as k_var:
+            env[var] = k_var
+            for stmt in node.body:
+                visit(stmt)
+        if saved is None:
+            env.pop(var, None)
+        else:
+            env[var] = saved
+        return
 
     var = node.target.id
     saved = env.get(var, None)
@@ -561,6 +591,12 @@ def _eval_int(node, env, dim_atoms) -> "int | None":
         if isinstance(node.op, ast.Sub): return l - r
         if isinstance(node.op, ast.Mult): return l * r
         if isinstance(node.op, ast.FloorDiv): return l // r
+    if _is_tl_call(node, "cdiv") and len(node.args) == 2:
+        a = _eval_int(node.args[0], env, dim_atoms)
+        b = _eval_int(node.args[1], env, dim_atoms)
+        if a is None or b is None or b == 0:
+            return None
+        return -(-a // b)  # ceil-div
     return None
 
 
@@ -834,6 +870,107 @@ def _interpret_expr(node, env, input_types, dim_atoms):
         if not isinstance(child_type, Type):
             return None
         return t.exp(child_type)
+    # Pass-through unary math ops. Each propagates the operand's shape
+    # and wraps the ET as a stile `UnaryOp(op=..., child=...)`. Stile
+    # already supports `sin`, `cos`, `sqrt` via `t.sin`/`t.cos`/etc.;
+    # the rest just need the verifier-side handler.
+    for _tl_op, _stile_fn in (
+        ("sin", t.sin), ("cos", t.cos), ("sqrt", t.sqrt),
+    ):
+        if _is_tl_call(node, _tl_op):
+            child_type = _interpret_expr(node.args[0], env, input_types, dim_atoms)
+            if not isinstance(child_type, Type):
+                return None
+            return _stile_fn(child_type)
+    if _is_tl_call(node, "abs"):
+        # `tl.abs(x)` → `maximum(x, -x)`, matching the `abs(...)`
+        # lowering in the spec parser.
+        x = _interpret_expr(node.args[0], env, input_types, dim_atoms)
+        if not isinstance(x, Type):
+            return None
+        neg_x = t.type_from_binary_op(0.0, x, "-")
+        return t.maximum(x, neg_x)
+    if _is_tl_call(node, "num_programs"):
+        # `tl.num_programs(N)` → the grid size along axis N at launch.
+        # Modeled as a SymbolicInt named after the axis so AffineExpr
+        # arithmetic (`pid + i * num_programs(0)`) works in loop bounds.
+        axis = _eval_int(node.args[0], env, dim_atoms) if node.args else 0
+        return SymbolicInt(name=f"num_programs_{axis if axis is not None else 0}")
+    if _is_tl_call(node, "cdiv"):
+        # `tl.cdiv(a, b)` = ceiling division = `(a + b - 1) // b`.
+        # Only meaningful when both reduce to concrete ints (loop
+        # bounds, tile counts).
+        a = _eval_int(node.args[0], env, dim_atoms)
+        b = _eval_int(node.args[1], env, dim_atoms)
+        if a is None or b is None or b == 0:
+            return None
+        return float(-(-a // b))  # Python's ceil-div idiom.
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "to"
+    ):
+        # `x.to(dtype)` (also `tl.to(x, dtype)`) — type cast. The Type
+        # carries through unchanged; the dtype slot updates so that
+        # downstream output verification matches the declared dtype.
+        # Both call shapes go through this same handler.
+        if isinstance(node.func.value, ast.Name) and node.func.value.id == "tl":
+            args = node.args  # tl.to(x, dtype)
+            if len(args) < 1:
+                return None
+            x = _interpret_expr(args[0], env, input_types, dim_atoms)
+            dtype_node = args[1] if len(args) >= 2 else None
+        else:
+            # `x.to(dtype)` — x is `node.func.value`.
+            x = _interpret_expr(node.func.value, env, input_types, dim_atoms)
+            dtype_node = node.args[0] if node.args else None
+        if not isinstance(x, Type):
+            return None
+        return Type(st=x.st, et=x.et, dt=None)  # dtype carried opaquely
+    if _is_tl_call(node, "reshape"):
+        # `tl.reshape` is intentionally rejected by the verifier. The
+        # ergonomic uses (squeeze of a singleton dim, axis permutation,
+        # tile-slice) are all expressible without re-deriving stile
+        # types from a raw shape tuple:
+        #   - axis permute / transpose      → `tl.trans(x)`
+        #   - insert/squeeze singleton axis → `x[:, None]` / drop via
+        #     a reduction or broadcast against the surrounding op
+        #   - sub-tile selection            → `ttl.load(ptr, DIM[lo:hi], …)`
+        # Real flatten/unflatten would need a "compound dim" type in
+        # stile (see todo.txt). Until then, raise rather than silently
+        # accepting an unverified hint.
+        raise ValueError(
+            "tl.reshape is not supported by the typed-Triton verifier. "
+            "Use tl.trans for axis permutation, `x[:, None]` (etc.) for "
+            "singleton-axis insertion, or ttl.load(ptr, DIM[lo:hi], ...) "
+            "for sub-tile selection. Stile can't reconstruct a typed "
+            "shape from a raw shape tuple."
+        )
+    if _is_tl_call(node, "where"):
+        # `tl.where(cond, a, b)` — pick a where cond, else b. Verifier
+        # propagates whichever side is a real Type; if both, requires
+        # shape match and emits BinaryOp("+", a*cond_mask, b*(1-cond_mask))
+        # — but we have no general way to type `cond` so we pass
+        # through whichever branch carries a Type. Use `ttl.mask` for
+        # predicate-based selection that needs structural verification.
+        if len(node.args) != 3:
+            return None
+        a = _interpret_expr(node.args[1], env, input_types, dim_atoms)
+        b = _interpret_expr(node.args[2], env, input_types, dim_atoms)
+        if isinstance(a, Type):
+            return a
+        if isinstance(b, Type):
+            return b
+        return None
+    if _is_tl_call(node, "expand_dims") or _is_tl_call(node, "broadcast_to"):
+        # Pass-through: stile shape comes from declared types and our
+        # broadcast helper handles the BinOp side; these op recognitions
+        # are here mostly so user code containing them doesn't trip the
+        # `return None` silent path.
+        x = _interpret_expr(node.args[0], env, input_types, dim_atoms)
+        if isinstance(x, Type):
+            return x
+        return None
     if _is_ttl_call(node, "mask"):
         # `ttl.mask(DIM_0[lo:hi], DIM_1[lo:hi], ..., predicate="...",
         #           on=v, off=v)` — bias-form predicate mask. ET is a
@@ -1446,15 +1583,24 @@ class _RewriteTtlCalls(ast.NodeTransformer):
         # `for var in ttl.range(lo, hi[, step], invariant=…)` →
         # `for var in range(lo, hi[, step]):` — invariant kwargs are
         # verification-only, Triton doesn't need them at compile time.
-        if (
-            isinstance(node.iter, ast.Call)
-            and _is_ttl_call(node.iter, "range")
-        ):
-            node.iter = ast.Call(
-                func=ast.Name(id="range", ctx=ast.Load()),
-                args=list(node.iter.args),
-                keywords=[],
-            )
+        # `ttl.static_range(...)` rewrites to `tl.static_range(...)`
+        # (Triton's compile-time-unrolled loop); plain `tl.static_range`
+        # passes through unchanged.
+        if isinstance(node.iter, ast.Call):
+            if _is_ttl_call(node.iter, "range"):
+                node.iter = ast.Call(
+                    func=ast.Name(id="range", ctx=ast.Load()),
+                    args=list(node.iter.args),
+                    keywords=[],
+                )
+            elif _is_ttl_call(node.iter, "static_range"):
+                node.iter = ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(id="tl"), attr="static_range",
+                    ),
+                    args=list(node.iter.args),
+                    keywords=[],
+                )
         return node
 
     def _next_uid(self):
@@ -1776,6 +1922,9 @@ def _emit_triton_fn(
             fstr_eval_locals[name] = cell.cell_contents
         except ValueError:
             continue
+    for name in original_fn.__code__.co_names:
+        if name not in fstr_eval_locals and name in original_fn.__globals__:
+            fstr_eval_locals[name] = original_fn.__globals__[name]
     fn_def = _RewriteTtlCalls(
         ptr_types, original_fn=original_fn, fstr_eval_locals=fstr_eval_locals,
     ).visit(fn_def)
@@ -1803,16 +1952,33 @@ def _emit_triton_fn(
         if k.startswith("__") and k.endswith("__"):
             continue
         mod.__dict__.setdefault(k, v)
-    # Inline closure free vars (e.g. `N = dim("TTN", 128)` declared in
-    # the caller's scope) so Triton's parser can resolve them. Stile
-    # `FullDim`s lower to their `.size` int — Triton's body sees a
-    # plain compile-time constant rather than an opaque Python object.
+    # Inline closure free vars AND module globals (e.g. `N = dim("TTN",
+    # 128)` declared in the caller's scope, whether function-local or
+    # module-level) so Triton's parser can resolve them. Stile `FullDim`s
+    # lower to their `.size` int — Triton's body sees a plain
+    # compile-time constant rather than an opaque Python object. Closure
+    # entries override globals when both are present.
+    free_var_sources : "list[tuple[str, object]]" = []
     closure = original_fn.__closure__ or ()
     for name, cell in zip(original_fn.__code__.co_freevars, closure):
         try:
-            val = cell.cell_contents
+            free_var_sources.append((name, cell.cell_contents))
         except ValueError:
             continue
+    # Pull in *referenced* globals — any name that appears as a Load in
+    # the function's bytecode. We don't lift all globals because that
+    # would smuggle in irrelevant module-level state (and possibly break
+    # Triton if a global happens to be an opaque object).
+    referenced_names = set(original_fn.__code__.co_names)
+    for name in referenced_names:
+        if name in original_fn.__globals__:
+            free_var_sources.append((name, original_fn.__globals__[name]))
+
+    seen : set[str] = set()
+    for name, val in free_var_sources:
+        if name in seen:
+            continue
+        seen.add(name)
         if hasattr(val, "size") and hasattr(val, "name") and isinstance(val.size, int):
             val = val.size
         # Triton requires kernel-accessible globals to be wrapped as
