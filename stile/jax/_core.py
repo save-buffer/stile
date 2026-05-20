@@ -541,6 +541,32 @@ def maximum(x : TypedJaxArray, y : TypedJaxArray) -> TypedJaxArray:
     return _binary_op_helper(x, y, "max")
 
 
+def minimum(x : TypedJaxArray, y : TypedJaxArray) -> TypedJaxArray:
+    """
+    `tjax.minimum(x, y)` — `min(x, y) = -max(-x, -y)`. Lowers to the
+    same ET as the `minimum(...)` spec keyword so verification works.
+    """
+    return _binary_op_helper(
+        0.0, _binary_op_helper(0.0 - x, 0.0 - y, "max"), "-",
+    )
+
+
+def abs(x : TypedJaxArray) -> TypedJaxArray:
+    """
+    `tjax.abs(x)` — `abs(x) = max(x, -x)`. Matches the `abs(...)`
+    spec keyword's ET lowering.
+    """
+    return _binary_op_helper(x, 0.0 - x, "max")
+
+
+def relu(x : TypedJaxArray) -> TypedJaxArray:
+    """
+    `tjax.relu(x)` — `relu(x) = max(x, 0)`. Matches the `relu(...)`
+    spec keyword's ET lowering.
+    """
+    return _binary_op_helper(x, 0.0, "max")
+
+
 def einsum(x : TypedJaxArray, y : TypedJaxArray, einstr : str) -> TypedJaxArray:
     new_type = t.einsum(x.type, y.type, einstr)
     if x.arr is None or y.arr is None:

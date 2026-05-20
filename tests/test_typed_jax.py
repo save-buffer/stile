@@ -45,6 +45,31 @@ def test_basic_matmul(reset):
             c.assign(c_accum)
 
 
+def test_abs_relu_minimum(reset):
+    """
+    `tjax.abs/relu/minimum` lower to the same ETs as the `abs(...)`,
+    `relu(...)`, `minimum(...)` spec keywords, so each `.assert_equivalent`
+    is a structural equality between the kernel-built ET and the
+    spec-parsed ET. Numerical checks against jax's reference ops too.
+    """
+    key = jax.random.PRNGKey(0)
+    M, N = dim('AbsM', 6), dim('AbsN', 4)
+    a = tjax.random.normal(key, M, N, name="A")
+    b = tjax.random.normal(jax.random.split(key)[0], M, N, name="B")
+
+    abs_a = tjax.abs(a)
+    abs_a.assert_equivalent("abs(A:AbsM AbsN)")
+    assert jnp.allclose(abs_a.arr, jnp.abs(a.arr))
+
+    relu_a = tjax.relu(a)
+    relu_a.assert_equivalent("relu(A:AbsM AbsN)")
+    assert jnp.allclose(relu_a.arr, jnp.maximum(a.arr, 0.0))
+
+    min_ab = tjax.minimum(a, b)
+    min_ab.assert_equivalent("minimum(A:AbsM AbsN, B:AbsM AbsN)")
+    assert jnp.allclose(min_ab.arr, jnp.minimum(a.arr, b.arr))
+
+
 def test_exp(reset):
     key = jax.random.PRNGKey(0)
     M, N = dim('M', 10), dim('N', 10)

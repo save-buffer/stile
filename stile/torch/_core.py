@@ -181,6 +181,31 @@ def maximum(x : TypedTorchTensor, y : TypedTorchTensor) -> TypedTorchTensor:
     return _binary_op_helper(x, y, "max")
 
 
+def minimum(x : TypedTorchTensor, y : TypedTorchTensor) -> TypedTorchTensor:
+    """
+    `min(x, y) = -max(-x, -y)`. Matches the `minimum(...)` spec
+    keyword's ET lowering so verification across the spec / actual
+    boundary normalizes identically.
+    """
+    return _binary_op_helper(
+        0.0, _binary_op_helper(0.0 - x, 0.0 - y, "max"), "-",
+    )
+
+
+def abs(x : TypedTorchTensor) -> TypedTorchTensor:
+    """
+    `abs(x) = max(x, -x)`. Matches the `abs(...)` spec keyword.
+    """
+    return _binary_op_helper(x, 0.0 - x, "max")
+
+
+def relu(x : TypedTorchTensor) -> TypedTorchTensor:
+    """
+    `relu(x) = max(x, 0)`. Matches the `relu(...)` spec keyword.
+    """
+    return _binary_op_helper(x, 0.0, "max")
+
+
 def einsum(x : TypedTorchTensor, y : TypedTorchTensor, einstr : str) -> TypedTorchTensor:
     new_tensor = einops.einsum(x.tensor, y.tensor, einstr)
     new_type = t.einsum(x.type, y.type, einstr)

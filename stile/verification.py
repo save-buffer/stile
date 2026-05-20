@@ -1,3 +1,4 @@
+import builtins
 import functools
 import math
 from dataclasses import dataclass, field
@@ -1879,7 +1880,7 @@ def normalize_exp(nchild : NormalizedExpr) -> NormalizedExpr:
     den_factors : dict[NormalizedFactor, int] = {}
     for term in sum_factor.children:
         term_expr = NormalizedExpr.of(
-            NormalizedProduct(abs(term.const), term.factors)
+            NormalizedProduct(builtins.abs(term.const), term.factors)
         )
         target = num_factors if term.const >= 0 else den_factors
 

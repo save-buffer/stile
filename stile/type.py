@@ -594,6 +594,32 @@ def maximum(x : Type | float, y : Type | float) -> Type:
     return type_from_binary_op(x, y, "max")
 
 
+def minimum(x : Type | float, y : Type | float) -> Type:
+    """
+    `min(x, y) = -max(-x, -y)`. Stile's `BinaryOpType` doesn't have
+    a native "min" so we lower via negation — matches the `minimum(...)`
+    lowering in the spec parser so both sides normalize identically.
+    """
+    neg_x = type_from_binary_op(0.0, x, "-")
+    neg_y = type_from_binary_op(0.0, y, "-")
+    return type_from_binary_op(0.0, type_from_binary_op(neg_x, neg_y, "max"), "-")
+
+
+def abs(x : Type) -> Type:
+    """
+    `abs(x) = max(x, -x)`. Matches the `abs(...)` spec lowering.
+    """
+    neg_x = type_from_binary_op(0.0, x, "-")
+    return type_from_binary_op(x, neg_x, "max")
+
+
+def relu(x : Type) -> Type:
+    """
+    `relu(x) = max(x, 0)`. Matches the `relu(...)` spec lowering.
+    """
+    return type_from_binary_op(x, 0.0, "max")
+
+
 def substitute_tensor_in_et(
     et : "ExprType", name_to_replacement : dict,
 ) -> "ExprType":

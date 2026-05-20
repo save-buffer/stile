@@ -42,6 +42,29 @@ def test_basic_matmul(reset):
             c.assign(c_accum)
 
 
+def test_abs_relu_minimum(reset):
+    """
+    `ttorch.abs/relu/minimum` lower to the same ETs as the matching
+    spec keywords, so `assert_equivalent` is a structural identity.
+    Numerical checks against torch's reference ops too.
+    """
+    M, N = dim('AbsTM', 6), dim('AbsTN', 4)
+    a = ttorch.random.randn(M, N, name="A")
+    b = ttorch.random.randn(M, N, name="B")
+
+    abs_a = ttorch.abs(a)
+    abs_a.assert_equivalent("abs(A:AbsTM AbsTN)")
+    assert torch.allclose(abs_a.tensor, a.tensor.abs())
+
+    relu_a = ttorch.relu(a)
+    relu_a.assert_equivalent("relu(A:AbsTM AbsTN)")
+    assert torch.allclose(relu_a.tensor, torch.maximum(a.tensor, torch.zeros_like(a.tensor)))
+
+    min_ab = ttorch.minimum(a, b)
+    min_ab.assert_equivalent("minimum(A:AbsTM AbsTN, B:AbsTM AbsTN)")
+    assert torch.allclose(min_ab.tensor, torch.minimum(a.tensor, b.tensor))
+
+
 def test_exp(reset):
     M, N = dim('M', 10), dim('N', 10)
     a = ttorch.random.randn(M, N)

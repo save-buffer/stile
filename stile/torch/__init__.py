@@ -6,6 +6,9 @@ from ._core import (
     cos,
     sqrt,
     maximum,
+    minimum,
+    abs,
+    relu,
     einsum,
     zeros,
 )
