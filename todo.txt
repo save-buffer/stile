@@ -1,0 +1,26 @@
+- Consider adding a `Masks` class that automatically broadcasts up to the desired shape
+
+- `tl.reshape` is intentionally rejected by the typed-Triton verifier
+  (`stile/triton/_core.py` raises on encounter). Reasoning:
+
+    Reshape's two real use cases — singleton squeeze/unsqueeze and
+    flatten/unflatten of contiguous dims — both have alternatives that
+    fit the stile type system without new infrastructure:
+
+      - Axis permute / transpose      → `tl.trans(x)` (already verified).
+      - Insert / squeeze singleton    → `x[:, None]` (broadcast handler
+        already handles), or implicit via stile's `_broadcast_pair`.
+      - Sub-tile selection            → `ttl.load(ptr, DIM[lo:hi], …)`
+        with the typed slice syntax.
+
+    True flatten/unflatten would require a "compound dim" type in
+    stile so that e.g. `(BM*BN,)` had a recoverable identity as the
+    row-major flatten of `(BM, BN)`. The normalizer would then need
+    a rule like
+        `reduce(compound, op, body) ≡ reduce(d1, op, reduce(d2, op, body))`
+    so a `tl.sum(reshape(x, (BM*BN,)))` matched `sum_BM sum_BN X`.
+    That's a substantial extension — not on the path right now.
+
+    If a use case appears that genuinely can't be expressed via
+    rearrange/trans/slice/broadcast, the path forward is to land
+    compound-dim infrastructure rather than weakening the verifier.
