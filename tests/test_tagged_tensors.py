@@ -235,6 +235,33 @@ def test_max_propagates_through_mask(reset):
     )
 
 
+def test_mask_minus_mask_is_zero(reset):
+    """
+    `mask - mask ≡ 0` for any TagCond mask. The same-pred fast path
+    in `_distribute_binop_through_tag` combines branches, the
+    `if_true == if_false` collapse in `make_tag_cond` returns the
+    bare leaf, and the new "collapsed-to-pure-constant" unwrap at
+    the fast-path's return site turns the resulting degenerate
+    `Tensor(tag=Const(0))` back into a plain `0`.
+    """
+    from stile.indexing import domain, lt, LoopVariable
+    from stile.verification import verify_exprs_equivalent
+
+    N = dim("MaskSubN", 8)
+    v = LoopVariable("MaskSubN")
+    P = domain([v], [lt(v, 4)])
+
+    mask = Tensor(
+        dims=(N,),
+        tag=TagCond(P, Constant(1.0), Constant(0.0)),
+        name="_mask",
+    )
+    assert verify_exprs_equivalent(
+        BinaryOp(op="-", lhs=mask, rhs=mask),
+        Constant(0.0),
+    )
+
+
 def test_mask_squared_idempotent(reset):
     """
     Boolean idempotence under multiplication: `mask * mask = mask`

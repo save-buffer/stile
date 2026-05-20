@@ -1221,6 +1221,89 @@ def test_static_if_use_bias(reset):
 
 @_REQUIRES_TRITON
 @_REQUIRES_TORCH
+def test_unstored_output_raises(reset):
+    """
+    Kernel that declares an output pointer but never writes to it
+    must fail at decoration time. Without this check, the launcher
+    would allocate a buffer and return whatever uninitialized memory
+    came up in it wrapped with the (vacuously verified) spec type.
+    """
+    N = dim("UnstoredN", 8)
+
+    with pytest.raises(ValueError, match="never writes to declared output"):
+        @ttl.jit(
+            spec="X:UnstoredN",
+            inputs={"X_ptr": "X:UnstoredN"},
+            out_shape=(N,),
+            out_dtype=torch.float32,
+            consts={"BLOCK": 8},
+        )
+        def kernel(X_ptr, O_ptr, BLOCK: tl.constexpr):
+            # Loads but never stores to O_ptr.
+            x = ttl.load(X_ptr, N[0:BLOCK])
+            _unused = x + 1
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
+def test_tl_where_raises(reset):
+    """
+    `tl.where` doesn't carry the predicate at the type level, so the
+    verifier would otherwise silently drop the cond's effect. The
+    handler raises with a pointer to `ttl.mask`.
+    """
+    N = dim("WhereN", 8)
+
+    with pytest.raises(ValueError, match="tl.where is not supported"):
+        @ttl.jit(
+            spec="X:WhereN",
+            inputs={"X_ptr": "X:WhereN"},
+            out_shape=(N,),
+            out_dtype=torch.float32,
+            consts={"BLOCK": 8},
+        )
+        def kernel(X_ptr, O_ptr, BLOCK: tl.constexpr):
+            pid = tl.program_id(0)
+            x = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
+            # Using `tl.where` triggers the verifier-side raise; the
+            # spec is unimportant because we never get past `_interpret_expr`.
+            y = tl.where(x > 0, x, 0.0)
+            ttl.store(O_ptr, y, N[pid * BLOCK : (pid + 1) * BLOCK])
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
+def test_x_to_carries_dtype(reset):
+    """
+    `x.to(dtype)` now resolves the dtype arg against the function's
+    globals and stamps it onto the returned Type. Regression: previously
+    the dtype was dropped to None, which masked downstream dtype-aware
+    output verification.
+    """
+    N = dim("ToN", 16)
+    BLOCK = 16
+
+    X_arr = torch.randn(N.size, device="cuda")
+    X = ttensor(X_arr, N, name="X")
+
+    @ttl.jit(
+        spec="X:ToN",
+        inputs={"X_ptr": "X:ToN"},
+        out_shape=(N,),
+        out_dtype=torch.float16,
+        consts={"BLOCK": BLOCK},
+    )
+    def kernel(X_ptr, O_ptr, BLOCK: tl.constexpr):
+        x = ttl.load(X_ptr, N[0:BLOCK])
+        ttl.store(O_ptr, x.to(tl.float16), N[0:BLOCK])
+
+    result = kernel[(1,)](X)
+    assert result.tensor.dtype == torch.float16
+    assert torch.allclose(result.tensor.float(), X_arr, atol=1e-3)
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
 def test_matmul_with_invariant(reset):
     """
     Same tiled matmul, but the K-loop is wrapped in `ttl.range(...,

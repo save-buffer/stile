@@ -34,7 +34,10 @@ from ..verification import (
     substitute_loop_var_in_et,
     simplify_under_active_loop_scope as _simplify_under_loop_scope,
 )
-from ..indexing import SymbolicInt, to_affine, LoopScope
+from ..indexing import (
+    SymbolicInt, to_affine, LoopScope,
+    _g_symint_metadata,
+)
 from ..torch._core import TypedTorchTensor
 
 
@@ -157,6 +160,14 @@ class _ProgramIdMarker:
     pass
 
 
+# Module-level scratch slot: the function currently under verification.
+# Set/cleared in `_verify_kernel`; read by `_interpret_expr` paths that
+# need the function's globals/closure (e.g. resolving `tl.float32`-style
+# dtype references in `x.to(...)`). Avoids threading `original_fn` as
+# a parameter through every recursive interp call.
+_current_fn = None
+
+
 def _is_ttl_call(node, name : str) -> bool:
     """True iff `node` is a call of the form `ttl.<name>(…)`."""
     return (
@@ -177,13 +188,22 @@ def _verify_kernel(
     `outputs` is a list of `_OutputDecl`; for single-output kernels
     that's a 1-element list.
     """
+    # Any `runtime_scalar(name, max)` declared by the user appears in
+    # the spec as a free affine identifier; make sure the parser knows
+    # to accept those names rather than rejecting them as unknown dims.
+    rt_names = _runtime_scalar_names()
     out_specs : dict[str, tuple] = {}
     for o in outputs:
-        out_specs[o.ptr_name] = (parse_spec_into_type(o.spec), o.shape)
+        out_specs[o.ptr_name] = (
+            parse_spec_into_type(o.spec, loop_vars=rt_names), o.shape,
+        )
+    # Track which output pointers received a verified store. Anything
+    # missing from this set after the walk is a vacuous-pass risk.
+    stored_outputs : set[str] = set()
 
     input_types : dict[str, Type] = {}
     for ptr_name, ptr_spec in inputs.items():
-        input_types[ptr_name] = parse_spec_into_type(ptr_spec)
+        input_types[ptr_name] = parse_spec_into_type(ptr_spec, loop_vars=rt_names)
 
     dim_atoms = _collect_dim_atoms(original_fn)
     env : dict[str, object] = {}
@@ -267,6 +287,7 @@ def _verify_kernel(
                         store_val, env, input_types, dim_atoms,
                         spec_type, slices=None, out_shape=out_shape,
                     )
+                    stored_outputs.add(base)
             elif _is_ttl_call(call, "store"):
                 store_ptr = call.args[0]
                 store_val = call.args[1]
@@ -280,9 +301,41 @@ def _verify_kernel(
                         store_val, env, input_types, dim_atoms,
                         spec_type, slices=slices, out_shape=out_shape,
                     )
+                    stored_outputs.add(store_ptr.id)
 
-    for stmt in fn_def.body:
-        visit(stmt)
+    global _current_fn
+    saved_fn = _current_fn
+    _current_fn = original_fn
+    try:
+        for stmt in fn_def.body:
+            visit(stmt)
+    finally:
+        _current_fn = saved_fn
+
+    # Any declared output pointer that received no `tl.store`/`ttl.store`
+    # call against its spec is a vacuous-pass risk — the launcher would
+    # allocate the buffer and return whatever uninitialized memory the
+    # tensor came up with, with the wrong-but-trusted typed wrapper.
+    # Raise so the user sees the mismatch at decoration time.
+    missing = [p for p in out_specs if p not in stored_outputs]
+    if missing:
+        raise ValueError(
+            f"kernel never writes to declared output pointer(s) "
+            f"{missing!r}. Each entry in `out_shape=[…]` / `spec=[…]` "
+            f"must have a matching `ttl.store(ptr, value, …)` "
+            f"(or `tl.store(ptr + …, value, …)`) somewhere in the body."
+        )
+
+
+def _runtime_scalar_names() -> set[str]:
+    """All currently-registered `runtime_scalar(...)` names. Used so
+    the Triton spec parser accepts those names as affine identifiers
+    in input / output spec strings (otherwise the spec parser rejects
+    them as unknown dim names)."""
+    return {
+        atom.name for atom in _g_symint_metadata
+        if atom.source is None
+    }
 
 
 def _collect_dim_atoms(fn) -> dict:
@@ -456,9 +509,12 @@ def _eval_static_bool(node, original_fn, fstr_eval_locals) -> "bool | None":
     """
     Statically evaluate `node` as a boolean using the function's
     globals + closure + decorator-time `consts={…}`. Returns
-    True/False on success; None when any name in the condition isn't
-    resolvable (a genuinely dynamic if, which is rejected by the
-    caller). Used for static-`if` branch resolution.
+    True/False on success; None **only** when a name in the condition
+    isn't resolvable (a genuinely dynamic if — the caller raises with
+    a user-readable error). Any other exception (a real bug inside
+    the condition like a TypeError or AttributeError) propagates so
+    we don't silently misclassify it as "dynamic". Used for static-`if`
+    branch resolution.
     """
     if original_fn is None:
         return None
@@ -468,12 +524,9 @@ def _eval_static_bool(node, original_fn, fstr_eval_locals) -> "bool | None":
             "<stile-triton-static-if>", "eval",
         )
         val = eval(code, original_fn.__globals__, fstr_eval_locals or {})
-    except Exception:
+    except NameError:
         return None
-    try:
-        return bool(val)
-    except Exception:
-        return None
+    return bool(val)
 
 
 def _const_str(node, original_fn=None, fstr_eval_locals=None) -> "str | None":
@@ -960,10 +1013,10 @@ def _interpret_expr(node, env, input_types, dim_atoms):
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "to"
     ):
-        # `x.to(dtype)` (also `tl.to(x, dtype)`) — type cast. The Type
-        # carries through unchanged; the dtype slot updates so that
-        # downstream output verification matches the declared dtype.
-        # Both call shapes go through this same handler.
+        # `x.to(dtype)` (also `tl.to(x, dtype)`) — type cast. The Type's
+        # shape and ET carry through unchanged; the dtype slot updates
+        # to the requested type so downstream output verification can
+        # match against the declared output dtype.
         if isinstance(node.func.value, ast.Name) and node.func.value.id == "tl":
             args = node.args  # tl.to(x, dtype)
             if len(args) < 1:
@@ -976,7 +1029,21 @@ def _interpret_expr(node, env, input_types, dim_atoms):
             dtype_node = node.args[0] if node.args else None
         if not isinstance(x, Type):
             return None
-        return Type(st=x.st, et=x.et, dt=None)  # dtype carried opaquely
+        # Resolve the dtype arg against the function's globals + closure
+        # so `tl.float32` / `torch.int64` / etc. resolve to actual dtype
+        # objects at decoration time. Falls back to x's existing dtype
+        # if the arg can't be resolved.
+        new_dtype = x.dt
+        if dtype_node is not None and _current_fn is not None:
+            try:
+                code = compile(
+                    ast.Expression(body=ast.fix_missing_locations(dtype_node)),
+                    "<stile-triton-to-dtype>", "eval",
+                )
+                new_dtype = eval(code, _current_fn.__globals__, {})
+            except Exception:
+                pass  # leave new_dtype = x.dt as fallback
+        return Type(st=x.st, et=x.et, dt=new_dtype)
     if _is_tl_call(node, "reshape"):
         # `tl.reshape` is intentionally rejected by the verifier. The
         # ergonomic uses (squeeze of a singleton dim, axis permutation,
@@ -997,21 +1064,24 @@ def _interpret_expr(node, env, input_types, dim_atoms):
             "shape from a raw shape tuple."
         )
     if _is_tl_call(node, "where"):
-        # `tl.where(cond, a, b)` — pick a where cond, else b. Verifier
-        # propagates whichever side is a real Type; if both, requires
-        # shape match and emits BinaryOp("+", a*cond_mask, b*(1-cond_mask))
-        # — but we have no general way to type `cond` so we pass
-        # through whichever branch carries a Type. Use `ttl.mask` for
-        # predicate-based selection that needs structural verification.
-        if len(node.args) != 3:
-            return None
-        a = _interpret_expr(node.args[1], env, input_types, dim_atoms)
-        b = _interpret_expr(node.args[2], env, input_types, dim_atoms)
-        if isinstance(a, Type):
-            return a
-        if isinstance(b, Type):
-            return b
-        return None
+        # `tl.where(cond, a, b)` is intentionally rejected by the
+        # verifier. The condition tensor isn't typed (we'd have to
+        # trace boolean comparisons end-to-end), so any prior version
+        # of this handler that "propagated whichever side has a Type"
+        # was silently dropping the cond's effect — verification would
+        # pass even when the runtime value differed from the spec.
+        # The supported alternative for predicate-driven selection is
+        # `ttl.mask(DIM_0[lo:hi], ..., predicate="...", on=v_on,
+        # off=v_off)` which carries the predicate at the type level
+        # (via `TagCond`) and verifies structurally.
+        raise ValueError(
+            "tl.where is not supported by the typed-Triton verifier. "
+            "Use ttl.mask(DIM_0[lo:hi], ..., predicate='...', "
+            "on=value_when_true, off=value_when_false) for predicate-"
+            "driven selection; ttl.mask carries the predicate at the "
+            "type level (as TagCond) so the kernel's behavior is "
+            "actually checked against the spec."
+        )
     if _is_tl_call(node, "expand_dims") or _is_tl_call(node, "broadcast_to"):
         # Pass-through: stile shape comes from declared types and our
         # broadcast helper handles the BinOp side; these op recognitions
@@ -1951,13 +2021,15 @@ def _emit_triton_fn(
     # offsets + masks computed from the slice info + row-major strides
     # derived from the declared input + output shapes. Multi-output
     # kernels have one entry per output pointer.
+    rt_names = _runtime_scalar_names()
     ptr_types : dict[str, Type] = {
-        ptr_name: parse_spec_into_type(ptr_spec)
+        ptr_name: parse_spec_into_type(ptr_spec, loop_vars=rt_names)
         for ptr_name, ptr_spec in inputs.items()
     }
     for o in outputs:
         out_full_type = parse_spec_into_type(
-            " ".join(d.name for d in o.shape)
+            " ".join(d.name for d in o.shape),
+            loop_vars=rt_names,
         )
         ptr_types[o.ptr_name] = Type(o.shape, out_full_type.et, o.dtype)
     # Build the same closure+consts dict the verifier uses for f-string
@@ -2100,10 +2172,11 @@ class _Launcher:
         # the kernel's output ET and substituting `Tensor(name=N) →
         # input_et` lets a `y = ka(x); z = kb(y)` chain produce z with
         # a composed end-to-end ET.
+        rt_names = _runtime_scalar_names()
         name_to_replacement : dict = {}
         for ptr_name, typed_input in zip(self.kernel.inputs.keys(), typed_inputs):
             input_spec = self.kernel.inputs[ptr_name]
-            declared_et = parse_spec_into_type(input_spec).et
+            declared_et = parse_spec_into_type(input_spec, loop_vars=rt_names).et
             if isinstance(declared_et, Tensor):
                 name_to_replacement[declared_et.name] = typed_input.type.et
         out_tensors = []
@@ -2113,7 +2186,7 @@ class _Launcher:
             dtype = o.dtype or torch.float32
             buf = torch.empty(shape_ints, dtype=dtype, device="cuda")
             out_tensors.append(buf)
-            spec_type = parse_spec_into_type(o.spec)
+            spec_type = parse_spec_into_type(o.spec, loop_vars=rt_names)
             composed_et = (
                 substitute_tensor_in_et(spec_type.et, name_to_replacement)
                 if name_to_replacement else spec_type.et

@@ -1837,6 +1837,13 @@ def _distribute_binop_through_tag(
             if_true=_combine_branches(l_tag.if_true, r_tag.if_true),
             if_false=_combine_branches(l_tag.if_false, r_tag.if_false),
         )
+        # If both branches collapsed to the same pure-constant leaf
+        # (e.g. `mask - mask = Cond(P, 0, 0) → 0`), return that
+        # constant directly instead of wrapping it back into a
+        # degenerate `Tensor(tag=Const)`. Mirrors the same unwrap rule
+        # `_push_through_tag` applies for single-tagged distribution.
+        if isinstance(new_tag, NormalizedExpr) and _is_pure_const(new_tag):
+            return new_tag
         return NormalizedExpr.of(NormalizedTensor(
             dims=lhs_tag.dims, tag=new_tag, name=lhs_tag.name,
         ))

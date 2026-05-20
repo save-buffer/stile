@@ -1,5 +1,23 @@
 - Consider adding a `Masks` class that automatically broadcasts up to the desired shape
 
+- Triton-side output coverage tracking. Today we check that every
+  declared output ptr receives at least one `ttl.store` (the bare
+  vacuous-pass guard in `stile/triton/_core.py::_verify_kernel`).
+  We don't yet prove the *union* of stores covers the full declared
+  output shape. The jax-side `TypedResult.assign` already does this:
+  every assignment of a sliced typed value gets accumulated, and a
+  final check confirms the union equals the declared shape.
+
+  For Triton we'd need the same shape of pattern adapted to:
+    - grid dims (`pid_m * BM : (pid_m + 1) * BM` symbolic in `pid_m ∈ [0, grid_m)`),
+    - inner `ttl.range` loop vars (range substitution),
+    - static `if` branches (per-branch tracking unioned at the join).
+
+  Hooks: `_eval_symindex` already lifts slice bounds to `AffineExpr`;
+  `_split_reduce_domain` / interval-union helpers in `verification.py`
+  know how to merge contiguous intervals. Catches off-by-one in slice
+  bounds and grid sizing that the "at least one store" check misses.
+
 - `tl.reshape` is intentionally rejected by the typed-Triton verifier
   (`stile/triton/_core.py` raises on encounter). Reasoning:
 
