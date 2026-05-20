@@ -26,6 +26,7 @@ import stile.type as t
 from ..type import (
     Type, ShapeType, Tensor, Constant, BinaryOp, UnaryOp, Sliced, TagCond,
     dim_size, dim_full_dim, dim_name, as_int,
+    substitute_tensor_in_et,
 )
 from ..specification import parse_spec_into_type, _parse_predicate, LexState
 from ..verification import (
@@ -229,6 +230,31 @@ def _verify_kernel(
                 stmt, env, visit, dim_atoms, input_types,
                 original_fn, fstr_eval_locals,
             )
+        elif isinstance(stmt, ast.If):
+            # Static branch resolution. Triton already specializes the
+            # emitted kernel on constexpr `if`s at its own compile time;
+            # the verifier just needs to walk the matching branch so
+            # the rest of the body sees the right env. The condition
+            # is eval'd against the function's globals + closure +
+            # decorator-time `consts={…}`. The user's spec is expected
+            # to be picked at decoration time using the same condition
+            # — typically `spec=f"..." if FLAG else "..."` outside the
+            # @ttl.jit call.
+            cond_val = _eval_static_bool(
+                stmt.test, original_fn, fstr_eval_locals,
+            )
+            if cond_val is None:
+                raise ValueError(
+                    f"static if at line {stmt.lineno}: condition "
+                    f"`{ast.unparse(stmt.test)}` doesn't resolve to True "
+                    f"or False at verification time. The verifier walks "
+                    f"only one branch of an `if`; the condition must be "
+                    f"computable from `consts={{…}}`, closure variables, "
+                    f"or globals (use `tl.where(...)` for branches that "
+                    f"depend on data values rather than constexprs)."
+                )
+            for sub_stmt in (stmt.body if cond_val else stmt.orelse):
+                visit(sub_stmt)
         elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
             call = stmt.value
             if _is_tl_call(call, "store"):
@@ -424,6 +450,30 @@ def _resolve_ttl_mask_fstrings(fn_def, original_fn, consts):
 
     _Resolver().visit(fn_def)
     ast.fix_missing_locations(fn_def)
+
+
+def _eval_static_bool(node, original_fn, fstr_eval_locals) -> "bool | None":
+    """
+    Statically evaluate `node` as a boolean using the function's
+    globals + closure + decorator-time `consts={…}`. Returns
+    True/False on success; None when any name in the condition isn't
+    resolvable (a genuinely dynamic if, which is rejected by the
+    caller). Used for static-`if` branch resolution.
+    """
+    if original_fn is None:
+        return None
+    try:
+        code = compile(
+            ast.Expression(body=ast.fix_missing_locations(node)),
+            "<stile-triton-static-if>", "eval",
+        )
+        val = eval(code, original_fn.__globals__, fstr_eval_locals or {})
+    except Exception:
+        return None
+    try:
+        return bool(val)
+    except Exception:
+        return None
 
 
 def _const_str(node, original_fn=None, fstr_eval_locals=None) -> "str | None":
@@ -2043,6 +2093,19 @@ class _Launcher:
                 "Triton is not installed; cannot launch the verified "
                 "kernel. Install triton or run on a GPU host."
             )
+        # Spec-composition substitution map: each declared input pointer
+        # was verified against its named `Tensor(name=…)`; at launch
+        # time the actual TypedTorchTensor carries an ET that may be
+        # something richer (e.g. another kernel's output spec). Walking
+        # the kernel's output ET and substituting `Tensor(name=N) →
+        # input_et` lets a `y = ka(x); z = kb(y)` chain produce z with
+        # a composed end-to-end ET.
+        name_to_replacement : dict = {}
+        for ptr_name, typed_input in zip(self.kernel.inputs.keys(), typed_inputs):
+            input_spec = self.kernel.inputs[ptr_name]
+            declared_et = parse_spec_into_type(input_spec).et
+            if isinstance(declared_et, Tensor):
+                name_to_replacement[declared_et.name] = typed_input.type.et
         out_tensors = []
         wrapped = []
         for o in self.kernel.outputs:
@@ -2051,8 +2114,12 @@ class _Launcher:
             buf = torch.empty(shape_ints, dtype=dtype, device="cuda")
             out_tensors.append(buf)
             spec_type = parse_spec_into_type(o.spec)
+            composed_et = (
+                substitute_tensor_in_et(spec_type.et, name_to_replacement)
+                if name_to_replacement else spec_type.et
+            )
             wrapped.append(TypedTorchTensor(
-                buf, Type(o.shape, spec_type.et, o.dtype),
+                buf, Type(o.shape, composed_et, o.dtype),
             ))
         raw_inputs = tuple(ti.tensor for ti in typed_inputs)
         all_kwargs = dict(self.kernel.consts)

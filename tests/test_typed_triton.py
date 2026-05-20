@@ -1101,6 +1101,126 @@ def test_l1_normalize_module_level_dims(reset):
 
 @_REQUIRES_TRITON
 @_REQUIRES_TORCH
+def test_kernel_composition(reset):
+    """
+    Spec composition across a sequence of kernels.
+
+    Kernel A computes `relu(X)`; kernel B computes `2 * Y`. Chaining
+    them — `y = A(x); z = B(y)` — should produce `z.type.et = 2 *
+    relu(X)` automatically, without the user having to declare a
+    composed spec on either kernel. The launcher substitutes each
+    typed input's ET into the kernel's output ET at launch time, so
+    the chain is structurally typed end-to-end.
+    """
+    N = dim("N", 16)
+    BLOCK = 16
+
+    X_arr = torch.randn(N.size, device="cuda")
+    X = ttensor(X_arr, N, name="X")
+
+    @ttl.jit(
+        spec="relu(X:N)",
+        inputs={"X_ptr": "X:N"},
+        out_shape=(N,),
+        out_dtype=torch.float32,
+        consts={"BLOCK": BLOCK},
+    )
+    def relu_kernel(X_ptr, Y_ptr, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        x = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
+        ttl.store(
+            Y_ptr, tl.maximum(x, 0.0),
+            N[pid * BLOCK : (pid + 1) * BLOCK],
+        )
+
+    @ttl.jit(
+        spec="2 * Y:N",
+        inputs={"Y_ptr": "Y:N"},
+        out_shape=(N,),
+        out_dtype=torch.float32,
+        consts={"BLOCK": BLOCK},
+    )
+    def double_kernel(Y_ptr, Z_ptr, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        y = ttl.load(Y_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
+        ttl.store(
+            Z_ptr, y * 2,
+            N[pid * BLOCK : (pid + 1) * BLOCK],
+        )
+
+    y = relu_kernel[(N.size // BLOCK,)](X)
+    z = double_kernel[(N.size // BLOCK,)](y)
+
+    # Numerical: 2 * relu(X).
+    expected = 2 * torch.maximum(X_arr, torch.zeros_like(X_arr))
+    assert torch.allclose(z.tensor, expected, atol=1e-5)
+
+    # Structural: z's ET must be equivalent to "2 * relu(X)" — the
+    # composition was substituted into double_kernel's output spec.
+    z.assert_equivalent("2 * relu(X:N)")
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
+def test_static_if_use_bias(reset):
+    """
+    Static-`if` branch resolution. One kernel body, two specializations:
+    `USE_BIAS=True` includes the `bias` load + add (spec = `X + bias`)
+    and `USE_BIAS=False` skips it (spec = `X`). The condition is a
+    constexpr declared in `consts={…}`; the verifier evaluates it at
+    decoration time and walks only the active branch. Triton's own
+    constexpr-if specialization handles the runtime side.
+
+    Documented pattern: `spec` is picked at decoration time using the
+    same constexpr value as the kernel's `if`. Wrap the @ttl.jit call
+    in a factory that takes the flag and returns the specialized kernel.
+    """
+    N = dim("BiasN", 16)
+    BLOCK = 16
+
+    X_arr = torch.randn(N.size, device="cuda")
+    bias_arr = torch.randn(N.size, device="cuda")
+    X = ttensor(X_arr, N, name="X")
+    bias = ttensor(bias_arr, N, name="bias")
+
+    def make_kernel(use_bias : bool):
+        spec = "X:BiasN + bias:BiasN" if use_bias else "X:BiasN"
+
+        @ttl.jit(
+            spec=spec,
+            inputs={"X_ptr": "X:BiasN", "BIAS_ptr": "bias:BiasN"},
+            out_shape=(N,), out_dtype=torch.float32,
+            consts={"BLOCK": BLOCK, "USE_BIAS": use_bias},
+        )
+        def kernel(
+            X_ptr, BIAS_ptr, O_ptr,
+            BLOCK: tl.constexpr, USE_BIAS: tl.constexpr,
+        ):
+            pid = tl.program_id(0)
+            x = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
+            if USE_BIAS:
+                b = ttl.load(BIAS_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
+                x = x + b
+            ttl.store(O_ptr, x, N[pid * BLOCK : (pid + 1) * BLOCK])
+
+        return kernel
+
+    # USE_BIAS=True: the True-branch is walked, env[x] = X + bias.
+    k_true = make_kernel(True)
+    result_true = k_true[(1,)](X, bias)
+    assert torch.allclose(result_true.tensor, X_arr + bias_arr, atol=1e-5)
+
+    # USE_BIAS=False: the True-branch is skipped, env[x] stays as X.
+    # Bias is still passed positionally (the kernel signature has the
+    # arg) but Triton's own constexpr-if specialization compiles it
+    # out, so the load never happens.
+    k_false = make_kernel(False)
+    result_false = k_false[(1,)](X, bias)
+    assert torch.allclose(result_false.tensor, X_arr, atol=1e-5)
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
 def test_matmul_with_invariant(reset):
     """
     Same tiled matmul, but the K-loop is wrapped in `ttl.range(...,

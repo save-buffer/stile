@@ -594,6 +594,53 @@ def maximum(x : Type | float, y : Type | float) -> Type:
     return type_from_binary_op(x, y, "max")
 
 
+def substitute_tensor_in_et(
+    et : "ExprType", name_to_replacement : dict,
+) -> "ExprType":
+    """
+    Walk `et` and replace every `Tensor(name=N, …)` leaf whose `N` is
+    in `name_to_replacement` with the corresponding replacement ET.
+    Used by the typed-Triton launcher for kernel composition: kernel B
+    was verified against `Tensor("Y", …)` (a bare named tensor), but
+    at launch time `Y_ptr` actually carries kernel A's output ET; the
+    substituted ET expresses kernel B's output in terms of kernel A's
+    inputs, giving a typed pipeline that downstream code can
+    `assert_equivalent` against an end-to-end spec.
+
+    The substitution is purely structural — it doesn't try to unify
+    or re-typecheck the replacement against the leaf's declared dims.
+    Callers are expected to pass replacements whose shape matches the
+    leaf's, which holds when kernel A's output spec and kernel B's
+    input spec agree on dim names (the natural case).
+    """
+    def walk(e):
+        match e:
+            case Constant():
+                return e
+            case Tensor(name=n) if n in name_to_replacement:
+                return name_to_replacement[n]
+            case Tensor():
+                return e
+            case UnaryOp(op, child):
+                return UnaryOp(op, walk(child))
+            case BinaryOp(op, lhs, rhs):
+                return BinaryOp(op, walk(lhs), walk(rhs))
+            case Repeat(dim, child):
+                return Repeat(dim, walk(child))
+            case Reduce(op, dim, child):
+                return Reduce(op, dim, walk(child))
+            case Gather(source, dim_in_source, idx):
+                return Gather(walk(source), dim_in_source, walk(idx))
+            case Scatter(source, dim_in_dest, idx):
+                return Scatter(walk(source), dim_in_dest, walk(idx))
+            case _:
+                raise ValueError(
+                    f"substitute_tensor_in_et: unhandled ExprType "
+                    f"{type(e).__name__}"
+                )
+    return walk(et)
+
+
 def override_dims_in_type(type : Type, *dim_override : Dim) -> Type:
     dim_override_by_name = { dim_name(d) : d for d in dim_override }
 
