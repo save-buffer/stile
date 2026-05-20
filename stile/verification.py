@@ -37,22 +37,26 @@ def make_tag_cond(
     domain : Domain, if_true : "NormalizedTagTree", if_false : "NormalizedTagTree",
 ) -> "NormalizedTagTree":
     """
-    Canonical constructor for `NormalizedTagCond`. Applies same-predicate
-    collapse: inside the `if_true` branch, `domain` is true, so any
-    nested `Cond(domain, A, B)` resolves to `A`; symmetrically in
-    `if_false`. This collapses arbitrarily deep nestings of the same
-    predicate to a single `Cond`, which is what makes
-    `mask^k = mask` (boolean idempotence under multiplication) — the
-    `_distribute_binop_through_tag` step nests Conds when masks are
-    multiplied; this rule then flattens them back.
+    Canonical constructor for `NormalizedTagCond`. Two collapse rules:
 
-    Caller-equivalent: `NormalizedTagCond(domain, if_true, if_false)`
-    with the collapse rule applied at the construction site.
+    1. **Same-predicate**: inside the `if_true` branch, `domain` is true,
+       so any nested `Cond(domain, A, B)` resolves to `A`; symmetrically
+       in `if_false`. This collapses arbitrarily deep nestings of the
+       same predicate to a single `Cond`, giving `mask^k = mask`
+       (boolean idempotence under multiplication).
+    2. **Trivial branches**: when `if_true == if_false`, the value is
+       independent of `domain` — return the leaf directly. Combined
+       with constant propagation through `max`/`+`/`*`/etc., this
+       collapses e.g. `max(Cond(P, 0, -inf), 0)` → `Cond(P, 0, 0)` →
+       `0`. The return type widens to `NormalizedTagTree` so the leaf
+       can flow back out of the construction site.
     """
     if isinstance(if_true, NormalizedTagCond) and if_true.domain == domain:
         if_true = if_true.if_true
     if isinstance(if_false, NormalizedTagCond) and if_false.domain == domain:
         if_false = if_false.if_false
+    if if_true == if_false:
+        return if_true
     return NormalizedTagCond(domain, if_true, if_false)
 
 
@@ -1341,9 +1345,10 @@ def _common_positive_scalar(children) -> "float | None":
 
 def make_max(children) -> "NormalizedExpr":
     """Build a canonical NormalizedMax. Flattens nested maxes, drops -inf terms
-    (identity for max), merges max-Reduce children that share dim and child by
-    unioning their intervals, absorbs boundary terms into ParametricMax, dedupes,
-    and collapses singletons.
+    (identity for max), distributes max through tagged-tensor branches,
+    merges max-Reduce children that share dim and child by unioning their
+    intervals, absorbs boundary terms into ParametricMax, dedupes, and
+    collapses singletons.
     """
     flat : list[NormalizedExpr] = []
     for c in children:
@@ -1357,6 +1362,37 @@ def make_max(children) -> "NormalizedExpr":
 
     # Drop -inf children — they are the identity for max.
     flat = [c for c in flat if not (_is_pure_const(c) and c.num.const == float("-inf"))]
+
+    # Distribute max through any tagged-tensor child: `max(Cond(P, a, b), x,
+    # …) = Cond(P, max(a, x, …), max(b, x, …))`. The recursive `make_max`
+    # call propagates constant values from x into both branches of P,
+    # giving `max(bias_mask, 0) → Cond(P, max(0, 0), max(-inf, 0)) →
+    # Cond(P, 0, 0) → 0` and `max(mult_mask, 0) → mult_mask`. Mirrors the
+    # `+/-/*//` propagation done by `_distribute_binop_through_tag`.
+    for i, c in enumerate(flat):
+        tagged = _single_tagged_tensor(c)
+        if tagged is not None and isinstance(tagged.tag, NormalizedTagCond):
+            others = flat[:i] + flat[i + 1:]
+            return _push_through_tag(
+                lambda leaf: make_max([leaf, *others]),
+                tagged,
+            )
+
+    # Fold pure-constant children into a single constant via builtin
+    # `max`. Required for mask-propagation to reach its full simplification
+    # — after pushing the surrounding `max(..., c)` into a `Cond`'s
+    # branches, each branch contains `max(leaf, c)` of two constants
+    # which needs constant folding to collapse to a single constant.
+    const_children = [c for c in flat if _is_pure_const(c)]
+    if len(const_children) > 1:
+        max_const = const_children[0].num.const
+        for c in const_children[1:]:
+            if c.num.const > max_const:
+                max_const = c.num.const
+        flat = [c for c in flat if not _is_pure_const(c)]
+        flat.append(
+            NormalizedExpr.of(NormalizedProduct(const=max_const))
+        )
 
     # Pull a common positive scalar out: `Max(c*A, c*B, …) = c*Max(A, B, …)`
     # when `c > 0`. Lets per-tile reduces with a shared scaling
@@ -1747,8 +1783,16 @@ def _push_through_tag(
                 if_false=apply(tag.if_false),
             )
         return transform(tag)
+    new_tag = apply(tensor.tag)
+    # If the tag collapsed to a pure-constant leaf (no factors), the
+    # tensor's value is independent of position — return the constant
+    # directly instead of a degenerate `Tensor(tag=Constant)`. This is
+    # what makes `max(bias_mask, 0) → Cond(P, 0, 0) → 0` actually land
+    # at `0` after the `if_true == if_false` collapse in `make_tag_cond`.
+    if isinstance(new_tag, NormalizedExpr) and _is_pure_const(new_tag):
+        return new_tag
     return NormalizedExpr.of(
-        NormalizedTensor(dims=tensor.dims, tag=apply(tensor.tag), name=tensor.name)
+        NormalizedTensor(dims=tensor.dims, tag=new_tag, name=tensor.name)
     )
 
 

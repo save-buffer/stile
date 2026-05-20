@@ -198,6 +198,43 @@ def test_tensors_with_different_tags_compare_unequal(reset):
     assert tagged_a != tagged_b
 
 
+def test_max_propagates_through_mask(reset):
+    """
+    Constant propagation through `max` and a `Cond` mask:
+      - `max(Cond(P, 0, -inf), 0) ≡ 0`: max with 0 pulls into both
+        branches, collapses to `Cond(P, 0, 0)`, then to bare `0`.
+      - `max(Cond(P, 1, 0), 0) ≡ Cond(P, 1, 0)`: max(1,0)=1 and
+        max(0,0)=0 in the two branches, so the result is the mask
+        itself.
+    """
+    from stile.indexing import domain, lt, LoopVariable
+    from stile.verification import verify_exprs_equivalent
+
+    N = dim("MaxMaskN", 8)
+    v = LoopVariable("MaxMaskN")
+    P = domain([v], [lt(v, 4)])
+
+    bias = Tensor(
+        dims=(N,),
+        tag=TagCond(P, Constant(0.0), Constant(float("-inf"))),
+        name="_mask",
+    )
+    assert verify_exprs_equivalent(
+        BinaryOp(op="max", lhs=bias, rhs=Constant(0.0)),
+        Constant(0.0),
+    )
+
+    mult = Tensor(
+        dims=(N,),
+        tag=TagCond(P, Constant(1.0), Constant(0.0)),
+        name="_mask",
+    )
+    assert verify_exprs_equivalent(
+        BinaryOp(op="max", lhs=mult, rhs=Constant(0.0)),
+        mult,
+    )
+
+
 def test_mask_squared_idempotent(reset):
     """
     Boolean idempotence under multiplication: `mask * mask = mask`
