@@ -720,12 +720,10 @@ def active_loop_domain() -> Domain | None:
     """
     if not _active_loop_scopes:
         return None
-    variables : set[LoopVariable] = set()
-    constraints : set = set()
-    for scope in _active_loop_scopes:
-        variables |= scope.domain.variables
-        constraints |= scope.domain.constraints
-    return Domain(frozenset(variables), frozenset(constraints))
+    result = _active_loop_scopes[0].domain
+    for scope in _active_loop_scopes[1:]:
+        result = and_domains(result, scope.domain)
+    return result
 
 
 def active_loop_vars() -> frozenset[LoopVariable]:

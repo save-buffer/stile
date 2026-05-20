@@ -1304,6 +1304,66 @@ def test_x_to_carries_dtype(reset):
 
 @_REQUIRES_TRITON
 @_REQUIRES_TORCH
+def test_symbolic_loop_with_accumulator_requires_invariant(reset):
+    """
+    Symbolic-bound `ttl.range` with no invariant rejects bodies that
+    accumulate into outer-scope names. The verifier walks the body
+    just once with a symbolic loop var, so per-iteration accumulation
+    would silently lose all but one contribution.
+    """
+    N = dim("AccN", 32)
+    BLOCK = 8
+
+    with pytest.raises(ValueError, match="symbolic trip count"):
+        @ttl.jit(
+            spec="2 * X:AccN",
+            inputs={"X_ptr": "X:AccN"},
+            out_shape=(N,), out_dtype=torch.float32,
+            consts={"BLOCK": BLOCK, "NUM_TILES": N.size // BLOCK},
+        )
+        def kernel(
+            X_ptr, O_ptr, BLOCK: tl.constexpr, NUM_TILES: tl.constexpr,
+        ):
+            pid = tl.program_id(0)
+            num_pid = tl.num_programs(0)
+            acc = ttl.zeros(N[0:BLOCK])
+            for tile_id in ttl.range(pid, NUM_TILES, num_pid):
+                x = ttl.load(X_ptr, N[tile_id * BLOCK : (tile_id + 1) * BLOCK])
+                acc += x  # ← inter-iteration accumulation w/o invariant
+            ttl.store(O_ptr, acc, N[0:BLOCK])
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
+def test_non_affine_loop_bound_raises(reset):
+    """
+    Loop bounds must be expressible as affine combinations of dims,
+    consts, program_id, num_programs, and concrete ints. Anything
+    else (e.g. an unbound name) now raises at the `ttl.range` /
+    `range` site rather than propagating `None` into a `LoopScope`
+    and crashing deep in domain construction.
+    """
+    N = dim("AffN", 32)
+    BLOCK = 8
+
+    with pytest.raises(ValueError, match="affine-resolvable"):
+        @ttl.jit(
+            spec="2 * X:AffN",
+            inputs={"X_ptr": "X:AffN"},
+            out_shape=(N,), out_dtype=torch.float32,
+            consts={"BLOCK": BLOCK},
+        )
+        def kernel(X_ptr, O_ptr, BLOCK: tl.constexpr):
+            pid = tl.program_id(0)
+            # `tl.somethingthatdoesntexist(...)` isn't recognized by
+            # the symindex evaluator — should raise affine-resolvable.
+            for tile_id in ttl.range(pid, tl.atomic_xchg(pid, BLOCK)):
+                x = ttl.load(X_ptr, N[tile_id * BLOCK : (tile_id + 1) * BLOCK])
+                ttl.store(O_ptr, x * 2, N[tile_id * BLOCK : (tile_id + 1) * BLOCK])
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
 def test_matmul_with_invariant(reset):
     """
     Same tiled matmul, but the K-loop is wrapped in `ttl.range(...,

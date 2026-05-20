@@ -2059,6 +2059,17 @@ def binary_op(op : BinaryOpType, nlhs : NormalizedExpr, nrhs : NormalizedExpr) -
         case "/":
             return div(nlhs, nrhs)
         case "max":
+            # Route through the same tag-distribution path as +/-/*//
+            # before falling back to `make_max`. Without this, `max(Cond_P,
+            # Cond_P)` would nest via `make_max`'s per-child propagation
+            # — same-pred would never collapse because the inner Cond
+            # ends up wrapped in a `NormalizedExpr`, not exposed at the
+            # outer `make_tag_cond`'s branch.
+            distributed = _distribute_binop_through_tag(
+                lambda a, b: make_max([a, b]), nlhs, nrhs,
+            )
+            if distributed is not None:
+                return distributed
             return make_max([nlhs, nrhs])
 
 def repeat(dims : frozenset[FullDim], x : ExprType) -> NormalizedExpr:
@@ -2106,6 +2117,28 @@ def repeat(dims : frozenset[FullDim], x : ExprType) -> NormalizedExpr:
                 )
             return NormalizedExpr.of(NormalizedRepeat(dims, child_normalized))
 
+def _tag_varies_with_dim(tag, dim : FullDim) -> bool:
+    """A `NormalizedTagTree` "varies with `dim`" iff its domain
+    constraints reference a variable named after `dim`, or either
+    branch (recursively) varies with `dim`. Critical for the
+    hoisting / Repeat-pushdown rules in `make_expr` /
+    `_pull_common_outer_reduce`: a tagged tensor synthesized with
+    `dims=frozenset()` (e.g. `_leaf_to_expr` wrapping a `Cond(P, …)`
+    where `P` references a free dim variable) would otherwise be
+    reported as dim-invariant and get incorrectly moved outside a
+    Reduce / Repeat over that dim."""
+    if isinstance(tag, NormalizedTagCond):
+        if any(v.name == dim.name for v in tag.domain.variables):
+            return True
+        return (
+            _tag_varies_with_dim(tag.if_true, dim)
+            or _tag_varies_with_dim(tag.if_false, dim)
+        )
+    if isinstance(tag, NormalizedExpr):
+        return varies_with_dim(tag, dim)
+    return False
+
+
 def varies_with_dim(e : NormalizedFactor | NormalizedProduct | NormalizedExpr, dim : FullDim) -> bool:
     """True iff the value of `e` changes as you move along `dim`.
 
@@ -2113,8 +2146,12 @@ def varies_with_dim(e : NormalizedFactor | NormalizedProduct | NormalizedExpr, d
     Reduce(dim, x) eliminates dim, so the result is also constant along dim — returns False.
     """
     match e:
-        case NormalizedTensor(dims):
-            return dim in dims
+        case NormalizedTensor(dims=dims, tag=tag):
+            if dim in dims:
+                return True
+            if tag is not None:
+                return _tag_varies_with_dim(tag, dim)
+            return False
         case NormalizedExp(child):
             return varies_with_dim(child, dim)
         case NormalizedUnaryOp(_, child):

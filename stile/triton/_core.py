@@ -408,6 +408,21 @@ def _unroll_for(
 
     bounds_int = [_eval_int(a, env, dim_atoms) for a in iter_call.args]
     bounds_sym = [_eval_symindex(a, env, dim_atoms) for a in iter_call.args]
+    # Catch non-affine bounds before they propagate as `None` into a
+    # `LoopScope` (where they crash deep in `range_domain`) or into
+    # `_verify_for_with_invariant` (where they fail invariant substitution
+    # with an unhelpful trace).
+    for i, (arg, sym) in enumerate(zip(iter_call.args, bounds_sym)):
+        if sym is None:
+            raise ValueError(
+                f"loop bound `{ast.unparse(arg)}` (arg #{i} of "
+                f"`{ast.unparse(iter_call.func)}`) isn't affine-resolvable "
+                f"in the verifier's symbolic-index grammar. Expected an "
+                f"integer constant, dim size, kernel `consts={{…}}` value, "
+                f"`tl.program_id(...)`, `tl.num_programs(...)`, or an "
+                f"affine combination of those (e.g. `pid * BLOCK`, "
+                f"`NUM_TILES`, `K // BLOCK_K`)."
+            )
     if len(iter_call.args) == 1:
         lo_i, hi_i, step_i = 0, bounds_int[0], 1
         lo_s, hi_s, step_s = 0, bounds_sym[0], 1
@@ -444,6 +459,27 @@ def _unroll_for(
                 f"can bind the loop var symbolically, optionally with "
                 f"`invariant=…` if there's an inter-iteration accumulator."
             )
+        # Persistent-grid / symbolic-bound `ttl.range` without an
+        # invariant: the body is walked ONCE with the loop var bound
+        # as a symbolic int. Inter-iteration accumulators
+        # (`acc += chunk` etc.) would only register one iteration's
+        # contribution — silently wrong. Detect AugAssign to any
+        # outer-scope name and error.
+        outer_names = set(env.keys())
+        for stmt in node.body:
+            for sub in ast.walk(stmt):
+                if (
+                    isinstance(sub, ast.AugAssign)
+                    and isinstance(sub.target, ast.Name)
+                    and sub.target.id in outer_names
+                ):
+                    raise ValueError(
+                        f"loop with symbolic trip count accumulates into "
+                        f"`{sub.target.id}`. Loops with symbolic trip "
+                        f"counts need an invariant to be verified — pass "
+                        f"`ttl.range(lo, hi, step, invariant={{'{sub.target.id}': "
+                        f"'<spec>'}})`."
+                    )
         var = node.target.id
         saved = env.get(var, None)
         with LoopScope(var, lo_s, hi_s) as k_var:
@@ -802,6 +838,15 @@ def _eval_symindex(node, env, dim_atoms):
             if l_int is not None and r_int is not None and r_int != 0:
                 return l_int // r_int
             return None
+    if _is_tl_call(node, "cdiv") and len(node.args) == 2:
+        # `tl.cdiv(a, b)` — ceiling division. As with FloorDiv, only
+        # meaningful when both args are concrete ints; common in loop
+        # bounds like `range(0, tl.cdiv(N, BLOCK))`.
+        a = _eval_int(node.args[0], env, dim_atoms)
+        b = _eval_int(node.args[1], env, dim_atoms)
+        if a is not None and b is not None and b != 0:
+            return -(-a // b)
+        return None
     return None
 
 

@@ -262,6 +262,57 @@ def test_mask_minus_mask_is_zero(reset):
     )
 
 
+def test_max_of_two_masks_collapses(reset):
+    """
+    `max(mask, mask) ≡ mask`. Without routing `binary_op("max", ...)`
+    through `_distribute_binop_through_tag`, this used to nest as
+    `Cond(P, 1, Cond(P, 1, 0))` — the inner same-P Cond stayed wrapped
+    in a NormalizedExpr instead of being exposed at the outer's
+    branch, so the `make_tag_cond` same-pred collapse never fired.
+    """
+    from stile.indexing import domain, lt, LoopVariable
+    from stile.verification import verify_exprs_equivalent
+
+    N = dim("MaxTwoMasksN", 8)
+    v = LoopVariable("MaxTwoMasksN")
+    P = domain([v], [lt(v, 4)])
+    m = Tensor(
+        dims=(N,),
+        tag=TagCond(P, Constant(1.0), Constant(0.0)),
+        name="_mask",
+    )
+    assert verify_exprs_equivalent(BinaryOp(op="max", lhs=m, rhs=m), m)
+
+
+def test_varies_with_dim_consults_tag_domain(reset):
+    """
+    `varies_with_dim` for a `NormalizedTensor` must also consider
+    the tag's free dim variables, not just `dims`. Regression: a
+    tagged tensor synthesized with `dims=frozenset()` (from
+    `_leaf_to_expr` wrapping a `Cond(P, …)`) was reported as
+    dim-invariant, which could lead `_hoist_invariants_from_repeat`
+    or `_pull_common_outer_reduce` to incorrectly move that tensor
+    out of a Reduce / Repeat over `P`'s dim.
+    """
+    from stile.indexing import domain, lt, LoopVariable
+    from stile.verification import (
+        normalize, varies_with_dim, NormalizedTensor, NormalizedTagCond,
+        NormalizedExpr, NormalizedProduct,
+    )
+
+    N = dim("VWDN", 8)
+    v = LoopVariable("VWDN")
+    P = domain([v], [lt(v, 4)])
+    tag = NormalizedTagCond(
+        domain=P,
+        if_true=NormalizedExpr.of(NormalizedProduct(const=1.0)),
+        if_false=NormalizedExpr.of(NormalizedProduct(const=0.0)),
+    )
+    # Crucially: dims=frozenset() but tag references N.
+    synthetic = NormalizedTensor(dims=frozenset(), tag=tag, name="_mask")
+    assert varies_with_dim(synthetic, N)
+
+
 def test_mask_squared_idempotent(reset):
     """
     Boolean idempotence under multiplication: `mask * mask = mask`
