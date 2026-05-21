@@ -1,22 +1,22 @@
 - Consider adding a `Masks` class that automatically broadcasts up to the desired shape
 
-- Triton-side output coverage tracking. Today we check that every
-  declared output ptr receives at least one `ttl.store` (the bare
-  vacuous-pass guard in `stile/triton/_core.py::_verify_kernel`).
-  We don't yet prove the *union* of stores covers the full declared
-  output shape. The jax-side `TypedResult.assign` already does this:
-  every assignment of a sliced typed value gets accumulated, and a
-  final check confirms the union equals the declared shape.
+- Decoration-time coverage check via opt-in `grid=` in `@ttl.jit`.
+  Today coverage tracking lives at launch time: `_Launcher.__call__`
+  substitutes the grid + loop ranges, unions per-axis, raises on
+  mismatch. That catches the footguns but the failure shows up on
+  first call rather than at decoration. If a user knows the grid at
+  decoration (the common case for shape-specialized kernels), we
+  could let them declare it via `grid=(M.size // BM, N.size // BN)`
+  and run the check immediately. Reuse `_check_coverage_at_launch`,
+  just call it inside `decorate(...)` when `grid=` is present.
 
-  For Triton we'd need the same shape of pattern adapted to:
-    - grid dims (`pid_m * BM : (pid_m + 1) * BM` symbolic in `pid_m ∈ [0, grid_m)`),
-    - inner `ttl.range` loop vars (range substitution),
-    - static `if` branches (per-branch tracking unioned at the join).
-
-  Hooks: `_eval_symindex` already lifts slice bounds to `AffineExpr`;
-  `_split_reduce_domain` / interval-union helpers in `verification.py`
-  know how to merge contiguous intervals. Catches off-by-one in slice
-  bounds and grid sizing that the "at least one store" check misses.
+- Coverage check generalization to coupled axes. Today the check is
+  per-axis: union the interval set along each dim independently and
+  compare to `[0, dim.size)`. Works when stores write axis-aligned
+  rectangles whose axes vary independently — the typical pattern.
+  Fails to verify (false positives) when different (pid_m, pid_n)
+  combinations write different sub-rectangles in a diagonal pattern.
+  Generalization would need true N-D interval-union math.
 
 - `tl.reshape` is intentionally rejected by the typed-Triton verifier
   (`stile/triton/_core.py` raises on encounter). Reasoning:

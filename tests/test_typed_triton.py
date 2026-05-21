@@ -1364,6 +1364,67 @@ def test_non_affine_loop_bound_raises(reset):
 
 @_REQUIRES_TRITON
 @_REQUIRES_TORCH
+def test_coverage_catches_const_slice_footgun(reset):
+    """
+    Kernel writes only to `M[0:BM]` (forgets to vary by `pid_m`).
+    Verification passes the spec equality for that one tile, but the
+    launch-time coverage check fires because the union [(0, BM)]
+    doesn't cover [(0, M.size)].
+    """
+    M = dim("CovM", 32)
+    BM = 8
+
+    X_arr = torch.randn(M.size, device="cuda")
+    X = ttensor(X_arr, M, name="X")
+
+    @ttl.jit(
+        spec="2 * X:CovM",
+        inputs={"X_ptr": "X:CovM"},
+        out_shape=(M,), out_dtype=torch.float32,
+        consts={"BM": BM},
+    )
+    def kernel(X_ptr, O_ptr, BM: tl.constexpr):
+        # Note: pid is unused — the store writes to a constant slice.
+        pid = tl.program_id(0)
+        x = ttl.load(X_ptr, M[0:BM])
+        ttl.store(O_ptr, x * 2, M[0:BM])
+
+    # Verification passes: M[0:BM]'s ET equals the spec restricted to M[0:BM].
+    # The coverage check at launch should catch the incomplete coverage.
+    with pytest.raises(ValueError, match="stores cover"):
+        kernel[(M.size // BM,)](X)
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
+def test_coverage_passes_for_correct_tiling(reset):
+    """
+    Sanity: a kernel that tiles its grid correctly passes the coverage
+    union check (no false positives).
+    """
+    M = dim("CovM2", 32)
+    BM = 8
+
+    X_arr = torch.randn(M.size, device="cuda")
+    X = ttensor(X_arr, M, name="X")
+
+    @ttl.jit(
+        spec="2 * X:CovM2",
+        inputs={"X_ptr": "X:CovM2"},
+        out_shape=(M,), out_dtype=torch.float32,
+        consts={"BM": BM},
+    )
+    def kernel(X_ptr, O_ptr, BM: tl.constexpr):
+        pid = tl.program_id(0)
+        x = ttl.load(X_ptr, M[pid * BM : (pid + 1) * BM])
+        ttl.store(O_ptr, x * 2, M[pid * BM : (pid + 1) * BM])
+
+    result = kernel[(M.size // BM,)](X)
+    assert torch.allclose(result.tensor, X_arr * 2, atol=1e-5)
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
 def test_matmul_with_invariant(reset):
     """
     Same tiled matmul, but the K-loop is wrapped in `ttl.range(...,

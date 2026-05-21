@@ -20,7 +20,7 @@ import inspect
 import os
 import tempfile
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import stile.type as t
 from ..type import (
@@ -132,8 +132,10 @@ def jit(
 
         # Verification: abstract-interpret the body. Raises if any
         # `tl.store` writes a value whose stile ET doesn't match the
-        # declared spec for that output pointer.
-        _verify_kernel(
+        # declared spec for that output pointer. Returns coverage
+        # metadata that the launcher uses to check store-union vs
+        # declared shape.
+        verify_meta = _verify_kernel(
             fn_def, inputs, outputs, fn, consts=consts or {},
         )
 
@@ -147,17 +149,24 @@ def jit(
             triton_fn, inputs, outputs,
             consts=consts or {},
             single_output=not is_multi,
+            stored_slices=verify_meta["stored_slices"],
+            pid_axes=verify_meta["pid_axes"],
+            loop_var_ranges=verify_meta["loop_var_ranges"],
         )
 
     return decorate
 
 
+@dataclass(frozen=True)
 class _ProgramIdMarker:
     """Sentinel returned by `_interpret_expr` for `tl.program_id(N)`.
-    The surrounding `Assign(target=Name, value=ProgramId)` binds the
-    target name as a fresh `SymbolicInt` in env so subsequent
-    `target * BLOCK` arithmetic resolves symbolically."""
-    pass
+    Carries `axis` (the `N` from `tl.program_id(N)`); the surrounding
+    `Assign(target=Name, value=ProgramId)` binds the target name as a
+    fresh `SymbolicInt` in env so subsequent `target * BLOCK`
+    arithmetic resolves symbolically, and the verifier stashes
+    `target → axis` in `pid_axes` so the launcher can later
+    substitute the grid range for coverage checking."""
+    axis : int
 
 
 # Module-level scratch slot: the function currently under verification.
@@ -200,6 +209,18 @@ def _verify_kernel(
     # Track which output pointers received a verified store. Anything
     # missing from this set after the walk is a vacuous-pass risk.
     stored_outputs : set[str] = set()
+    # Per-store symbolic slice tuples, one entry per `ttl.store` site.
+    # Each entry is a tuple of `Sliced` (one per output dim) with
+    # AffineExpr/SymbolicInt/int bounds. The launcher substitutes the
+    # grid + loop ranges and checks that the union covers the declared
+    # output shape — see `_check_coverage_at_launch`.
+    stored_slices : dict[str, list[tuple]] = {ptr: [] for ptr in out_specs}
+    # Maps for resolving the symbolic vars at launch time. `pid_axes`
+    # records each `tl.program_id(N)` assignment as `<pyname> → N`;
+    # `loop_var_ranges` records each enclosing `for v in [ttl.]range`
+    # as `<v> → (lo_sym, hi_sym, step_sym)`.
+    pid_axes : dict[str, int] = {}
+    loop_var_ranges : dict[str, tuple] = {}
 
     input_types : dict[str, Type] = {}
     for ptr_name, ptr_spec in inputs.items():
@@ -234,6 +255,7 @@ def _verify_kernel(
             if isinstance(val, _ProgramIdMarker):
                 from ..indexing import SymbolicInt
                 env[target] = SymbolicInt(name=target)
+                pid_axes[target] = val.axis
             elif val is not None:
                 env[target] = val
         elif isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name):
@@ -249,6 +271,7 @@ def _verify_kernel(
             _unroll_for(
                 stmt, env, visit, dim_atoms, input_types,
                 original_fn, fstr_eval_locals,
+                loop_var_ranges=loop_var_ranges,
             )
         elif isinstance(stmt, ast.If):
             # Static branch resolution. Triton already specializes the
@@ -288,6 +311,10 @@ def _verify_kernel(
                         spec_type, slices=None, out_shape=out_shape,
                     )
                     stored_outputs.add(base)
+                    # Untyped raw store — no slice info. Mark as
+                    # "opaque full coverage" so launch-time check
+                    # doesn't flag this output.
+                    stored_slices[base].append(None)
             elif _is_ttl_call(call, "store"):
                 store_ptr = call.args[0]
                 store_val = call.args[1]
@@ -302,6 +329,14 @@ def _verify_kernel(
                         spec_type, slices=slices, out_shape=out_shape,
                     )
                     stored_outputs.add(store_ptr.id)
+                    # Snapshot the symbolic slice shape for this store
+                    # — the launcher will substitute the grid + loop
+                    # ranges and union per-axis.
+                    sliced_shape = _resolve_store_slices(
+                        slices, env, dim_atoms,
+                    )
+                    if sliced_shape is not None:
+                        stored_slices[store_ptr.id].append(sliced_shape)
 
     global _current_fn
     saved_fn = _current_fn
@@ -325,6 +360,40 @@ def _verify_kernel(
             f"must have a matching `ttl.store(ptr, value, …)` "
             f"(or `tl.store(ptr + …, value, …)`) somewhere in the body."
         )
+
+    return {
+        "stored_slices": stored_slices,
+        "pid_axes": pid_axes,
+        "loop_var_ranges": loop_var_ranges,
+    }
+
+
+def _resolve_store_slices(
+    slice_nodes, env, dim_atoms,
+) -> "tuple[Sliced, ...] | None":
+    """
+    Convert a sequence of `DIM[lo:hi]` AST nodes (the trailing args
+    of `ttl.store(O_ptr, val, DIM_0[lo_0:hi_0], …)`) into a tuple of
+    `Sliced` shapes whose bounds are AffineExpr/SymbolicInt/int. The
+    launcher uses these for coverage union math; returns None if any
+    slice can't be resolved (in which case coverage is treated as
+    unknown rather than incomplete).
+    """
+    out : list[Sliced] = []
+    for s in slice_nodes:
+        if not (isinstance(s, ast.Subscript) and isinstance(s.slice, ast.Slice)):
+            return None
+        if not isinstance(s.value, ast.Name):
+            return None
+        dim_atom = dim_atoms.get(s.value.id)
+        if dim_atom is None:
+            return None
+        lo = _eval_symindex(s.slice.lower, env, dim_atoms)
+        hi = _eval_symindex(s.slice.upper, env, dim_atoms)
+        if lo is None or hi is None:
+            return None
+        out.append(Sliced(dim_atom, lo, hi))
+    return tuple(out)
 
 
 def _runtime_scalar_names() -> set[str]:
@@ -365,6 +434,7 @@ def _collect_dim_atoms(fn) -> dict:
 def _unroll_for(
     node, env, visit, dim_atoms, input_types,
     original_fn=None, fstr_eval_locals=None,
+    loop_var_ranges=None,
 ):
     """
     Interpret a Python `for <var> in <iter>:` over the kernel body.
@@ -436,6 +506,8 @@ def _unroll_for(
         return
 
     if invariants_dict is not None:
+        if loop_var_ranges is not None:
+            loop_var_ranges[node.target.id] = (lo_s, hi_s, step_s)
         _verify_for_with_invariant(
             node, env, visit, dim_atoms, input_types,
             invariants_dict, lo_s, hi_s, step_s,
@@ -482,6 +554,8 @@ def _unroll_for(
                     )
         var = node.target.id
         saved = env.get(var, None)
+        if loop_var_ranges is not None:
+            loop_var_ranges[var] = (lo_s, hi_s, step_s)
         with LoopScope(var, lo_s, hi_s) as k_var:
             env[var] = k_var
             for stmt in node.body:
@@ -910,8 +984,10 @@ def _interpret_expr(node, env, input_types, dim_atoms):
         # `pid_x = tl.program_id(N)` — a runtime grid coord. Treat as
         # an opaque `SymbolicInt`; the variable name (from the
         # surrounding `Assign`) is used as the atom's identity. Caller
-        # handles the binding in env.
-        return _ProgramIdMarker()
+        # handles the binding in env and records `pid_axes[target] = N`
+        # for launch-time coverage substitution.
+        axis = _eval_int(node.args[0], env, dim_atoms) if node.args else 0
+        return _ProgramIdMarker(axis=axis or 0)
     if _is_tl_call(node, "load"):
         # `tl.load(ptr + arithmetic)` — fall through to the input's
         # declared full type. The shape of the actual loaded tile (e.g.
@@ -2192,11 +2268,165 @@ class TypedTritonKernel:
     outputs : "list[_OutputDecl]"
     consts : dict
     single_output : bool = True
+    # Coverage-check metadata. `stored_slices[ptr_name]` is a list of
+    # per-store symbolic-Sliced shape tuples; each entry is either a
+    # tuple of `Sliced` (typed `ttl.store`) or `None` (raw `tl.store`
+    # — opaque, treated as "covers everything" at launch). `pid_axes`
+    # maps Python identifier → grid axis index; `loop_var_ranges`
+    # maps loop-var Python identifier → (lo, hi, step) symbolic
+    # range. The launcher substitutes these to compute coverage.
+    stored_slices : "dict[str, list]" = field(default_factory=dict)
+    pid_axes : "dict[str, int]" = field(default_factory=dict)
+    loop_var_ranges : "dict[str, tuple]" = field(default_factory=dict)
 
     def __getitem__(self, grid):
         if isinstance(grid, int):
             grid = (grid,)
         return _Launcher(self, grid)
+
+
+def _check_coverage_at_launch(
+    kernel : "TypedTritonKernel", grid : tuple, launch_kwargs : dict,
+) -> None:
+    """
+    Verify that the union of per-store slices covers the declared
+    output shape for each output ptr. Substitutes:
+      - `pid_<axis>` SymbolicInts over their grid range `[0, grid[axis])`,
+      - loop-var SymbolicInts (from `ttl.range` / persistent grid) over
+        their `(lo, hi, step)` declared range.
+
+    Raises `ValueError` on mismatch. Outputs with ANY `None` entry in
+    `stored_slices` (raw `tl.store(...)` with unparsed offsets) are
+    treated as opaque-fully-covered and skipped — we don't have slice
+    info for them.
+
+    The check is axis-independent: for each declared output dim, the
+    union of `[lo_resolved, hi_resolved)` intervals over all stores
+    and all substitutions must equal `[0, dim.size)`. This catches
+    the constant-slice footgun (`ttl.store(O, val, M[0:BM])` forgot
+    to vary by pid_m), off-by-one grid bounds, and stride mismatches.
+    """
+    from ..indexing import to_affine, AffineExpr, SymbolicInt
+    consts = {**kernel.consts, **launch_kwargs}
+
+    def _resolve(expr, substitutions : dict) -> "int | None":
+        """Resolve an AffineExpr/SymbolicInt/int to a concrete int
+        under `substitutions: SymbolicInt → int`. Returns None if any
+        atom in `expr.terms` isn't substituted and isn't a known dim."""
+        if isinstance(expr, int):
+            return expr
+        a = to_affine(expr)
+        total = a.const
+        for atom, coeff in a.terms:
+            if atom in substitutions:
+                total += coeff * substitutions[atom]
+            else:
+                # Maybe it's a const declared at launch / decoration time?
+                if atom.name in consts:
+                    total += coeff * consts[atom.name]
+                else:
+                    return None
+        return total
+
+    def _enumerate_substitutions(sym_vars : list) -> "list[dict]":
+        """All concrete `{SymbolicInt: int}` substitutions for the
+        given symbolic vars under their declared ranges. Handles pids
+        (range `[0, grid[axis])`) and loop vars (`(lo, hi, step)`)."""
+        results = [{}]
+        for sym in sym_vars:
+            name = sym.name
+            if name in kernel.pid_axes:
+                axis = kernel.pid_axes[name]
+                if axis >= len(grid):
+                    return []  # invalid grid; defer
+                values = list(range(int(grid[axis])))
+            elif name in kernel.loop_var_ranges:
+                lo, hi, step = kernel.loop_var_ranges[name]
+                lo_i = _resolve(lo, {})
+                hi_i = _resolve(hi, {})
+                step_i = _resolve(step, {}) if not isinstance(step, int) else step
+                if lo_i is None or hi_i is None or step_i is None:
+                    return []
+                values = list(range(lo_i, hi_i, step_i))
+            else:
+                return []  # unknown var → can't enumerate
+            results = [{**s, sym: v} for s in results for v in values]
+        return results
+
+    for output in kernel.outputs:
+        ptr = output.ptr_name
+        all_slices = kernel.stored_slices.get(ptr, [])
+        if any(s is None for s in all_slices):
+            # Opaque raw `tl.store` — assume the user did the right
+            # thing; we can't statically verify coverage of a
+            # pointer-arithmetic store. (The "at least one store"
+            # check has already fired by now.)
+            continue
+        # Per-axis interval-union over all stores × all substitutions.
+        per_axis_intervals : dict[str, list[tuple[int, int]]] = {
+            d.name: [] for d in output.shape
+        }
+        for sliced_tuple in all_slices:
+            # Symbolic atoms appearing across all bounds of this store.
+            atoms = set()
+            for sliced in sliced_tuple:
+                for bound in (sliced.start, sliced.end):
+                    if isinstance(bound, int):
+                        continue
+                    for atom, _ in to_affine(bound).terms:
+                        atoms.add(atom)
+            sym_vars = sorted(
+                (a for a in atoms if a.name not in consts),
+                key=lambda x: x.name,
+            )
+            substitutions_list = _enumerate_substitutions(sym_vars)
+            if not substitutions_list and sym_vars:
+                # Can't enumerate (e.g., loop var depends on unknown).
+                # Treat this store as opaque — bail on coverage for
+                # this output.
+                per_axis_intervals = None
+                break
+            for sub in substitutions_list:
+                for sliced in sliced_tuple:
+                    lo_i = _resolve(sliced.start, sub)
+                    hi_i = _resolve(sliced.end, sub)
+                    if lo_i is None or hi_i is None:
+                        continue
+                    per_axis_intervals[sliced.dim.name].append((lo_i, hi_i))
+        if per_axis_intervals is None:
+            continue
+        # Compare the union for each axis to [0, dim.size).
+        for declared_dim in output.shape:
+            intervals = per_axis_intervals.get(declared_dim.name, [])
+            if not intervals:
+                continue  # axis not constrained by any store — skip
+            merged = _union_intervals(intervals)
+            if merged != [(0, declared_dim.size)]:
+                raise ValueError(
+                    f"output `{ptr}`: stores cover {merged!r} along "
+                    f"dim `{declared_dim.name}` (size {declared_dim.size}); "
+                    f"expected [(0, {declared_dim.size})]. Either widen "
+                    f"the slice bounds in `ttl.store(...)` or adjust "
+                    f"the grid / loop range so every position in "
+                    f"`{declared_dim.name}` is written exactly once."
+                )
+
+
+def _union_intervals(
+    intervals : "list[tuple[int, int]]",
+) -> "list[tuple[int, int]]":
+    """Union of half-open `[lo, hi)` intervals over ints. Returns a
+    sorted list of disjoint intervals."""
+    if not intervals:
+        return []
+    sorted_iv = sorted(intervals)
+    merged : list[list[int]] = [list(sorted_iv[0])]
+    for lo, hi in sorted_iv[1:]:
+        if lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return [tuple(iv) for iv in merged]
 
 
 class _Launcher:
@@ -2210,6 +2440,13 @@ class _Launcher:
                 "Triton is not installed; cannot launch the verified "
                 "kernel. Install triton or run on a GPU host."
             )
+        # Coverage check: substitute the grid and loop ranges into the
+        # per-store symbolic slices and verify the union covers the
+        # declared output shape on each axis. Raises before the kernel
+        # is launched if any output is incompletely covered.
+        _check_coverage_at_launch(
+            self.kernel, self.grid, kwargs,
+        )
         # Spec-composition substitution map: each declared input pointer
         # was verified against its named `Tensor(name=…)`; at launch
         # time the actual TypedTorchTensor carries an ET that may be
