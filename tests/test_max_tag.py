@@ -24,12 +24,6 @@ from stile.indexing import LoopVariable, domain, le
 from stile.verification import verify_exprs_equivalent
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def _bias_tag(N, Q, n, q):
     return Tensor(
         dims=(N, Q),

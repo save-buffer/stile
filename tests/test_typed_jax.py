@@ -8,12 +8,6 @@ import stile.jax as tjax
 
 from stile import expr_simplifies, reset_stile, dim
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def test_simple_expression(reset):
     key = jax.random.PRNGKey(0)
     M, N = dim('M', 10), dim('N', 10)

@@ -8,12 +8,6 @@ import stile.torch as ttorch
 from stile import expr_simplifies, reset_stile, dim
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def test_simple_expression(reset):
     M, N = dim('M', 10), dim('N', 10)
     a = ttorch.random.randn(M, N)

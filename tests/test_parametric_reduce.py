@@ -19,12 +19,6 @@ from stile.type import FullDim
 from stile import dim, reset_stile
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def _leaf(d : FullDim) -> NormalizedExpr:
     return NormalizedExpr.of(NormalizedTensor(dims=frozenset({d})))
 

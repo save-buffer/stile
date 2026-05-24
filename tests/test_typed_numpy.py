@@ -7,12 +7,6 @@ import stile.numpy as tnp
 
 from stile import expr_simplifies, reset_stile, dim
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def test_simple_expression(reset):
     M, N = dim('M', 10), dim('N', 10)
     a = tnp.random.randn(M, N)

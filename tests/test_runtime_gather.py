@@ -19,12 +19,6 @@ from stile.verification import verify_exprs_equivalent
 import pytest
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def test_gather_same_idx_structural_equality(reset):
     """
     Two `gather`s with the same source, dim, and idx tensor produce

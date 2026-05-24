@@ -14,12 +14,6 @@ from stile import dim, reset_stile
 from stile.type import dim_name
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def _causal_flash_attention_jnp(q, k, v):
     """
     Causal softmax attention reference for the decode-shaped layout

@@ -19,12 +19,6 @@ from stile.type import ParametricReduce
 from stile.verification import verify_exprs_equivalent
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def test_fused_moe_single_block(reset):
     """One per-expert iteration of fused MoE versus the per-token
     spec sliced to that block. The kernel uses `W[g]` (singleton

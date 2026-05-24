@@ -20,12 +20,6 @@ from stile.specification import parse_spec_into_type
 from stile.verification import verify_exprs_equivalent
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def test_scalar_sum_invariant(reset):
     """A scalar accumulator: `acc[k+1] = acc[k] + X[k]`. Invariant is
     `sum over n in [0, k) of X[n]`."""

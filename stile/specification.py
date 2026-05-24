@@ -393,7 +393,7 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
             dim = _parse_dim(lex)
             pred_domain = None
             if lex.maybe_consume_keyword("where"):
-                pred_domain = _parse_predicate(lex)
+                pred_domain = parse_predicate(lex)
             lex.expect(']')
             lex.expect('(')
             st, et = _parse_paren_expr(lex)
@@ -540,7 +540,7 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
 
             dim_annotation = _parse_dim(lex)
             if lex.maybe_consume_keyword("where"):
-                pred_domain = _parse_predicate(lex)
+                pred_domain = parse_predicate(lex)
             lex.expect(']')
 
         lex.expect('(')
@@ -669,7 +669,7 @@ def _parse_atomic_predicate(lex : LexState) -> Domain:
     return _indexing_domain(variables, constraints)
 
 
-def _parse_predicate(lex : LexState) -> Domain:
+def parse_predicate(lex : LexState) -> Domain:
     """
     A `where`-clause predicate in DNF form: `<conj> [|| <conj>]*`
     where each `<conj>` is `<atom> [&& <atom>]*`. `&&` binds tighter
@@ -825,7 +825,7 @@ def _apply_iteration_restriction(
 def _parse_spec(lex : LexState) -> tuple[ShapeType, ExprType]:
     result_st, result_et = _parse_expr(lex)
     while lex.maybe_consume_keyword("where"):
-        pred_domain = _parse_predicate(lex)
+        pred_domain = parse_predicate(lex)
         result_et = _apply_where_mask(result_st, result_et, pred_domain)
     return result_st, result_et
 

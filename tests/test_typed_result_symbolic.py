@@ -19,12 +19,6 @@ import stile.jax as tjax
 from stile import dim, reset_stile
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def test_done_through_symbolic_block_loop(reset):
     """fori_loop over experts, per iter assigns a slice of X
     bounded by `(offsets[g], offsets[g+1])` to the output buffer.

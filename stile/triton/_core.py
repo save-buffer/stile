@@ -28,15 +28,14 @@ from ..type import (
     dim_size, dim_full_dim, dim_name, as_int,
     substitute_tensor_in_et,
 )
-from ..specification import parse_spec_into_type, _parse_predicate, LexState
+from ..specification import parse_spec_into_type, parse_predicate, LexState
 from ..verification import (
-    verify_exprs_equivalent, normalize as _normalize, _substitute_lv_in_expr,
+    verify_exprs_equivalent, normalize as _normalize, substitute_lv_in_expr,
     substitute_loop_var_in_et,
     simplify_under_active_loop_scope as _simplify_under_loop_scope,
 )
 from ..indexing import (
-    SymbolicInt, to_affine, LoopScope,
-    _g_symint_metadata,
+    SymbolicInt, to_affine, LoopScope, runtime_scalar_names,
 )
 from ..torch._core import TypedTorchTensor
 
@@ -200,7 +199,7 @@ def _verify_kernel(
     # Any `runtime_scalar(name, max)` declared by the user appears in
     # the spec as a free affine identifier; make sure the parser knows
     # to accept those names rather than rejecting them as unknown dims.
-    rt_names = _runtime_scalar_names()
+    rt_names = runtime_scalar_names()
     out_specs : dict[str, tuple] = {}
     for o in outputs:
         out_specs[o.ptr_name] = (
@@ -301,20 +300,20 @@ def _verify_kernel(
         elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
             call = stmt.value
             if _is_tl_call(call, "store"):
-                store_ptr = call.args[0]
-                store_val = call.args[1]
-                base = _peel_pointer_base(store_ptr)
-                if base in out_specs:
-                    spec_type, out_shape = out_specs[base]
-                    _verify_stored_value(
-                        store_val, env, input_types, dim_atoms,
-                        spec_type, slices=None, out_shape=out_shape,
-                    )
-                    stored_outputs.add(base)
-                    # Untyped raw store — no slice info. Mark as
-                    # "opaque full coverage" so launch-time check
-                    # doesn't flag this output.
-                    stored_slices[base].append(None)
+                # Raw `tl.store(ptr + offs, val, ...)` is rejected for
+                # the same reason as `tl.load`: the verifier can't see
+                # which slice of the output is being written, so
+                # coverage tracking would have to mark the output as
+                # opaque-fully-covered (silently disabling the
+                # off-by-one / wrong-grid check) and the value check
+                # would fall back to the full unsliced spec.
+                raise ValueError(
+                    "tl.store is not supported by the typed-Triton "
+                    "verifier. Use `ttl.store(O_ptr, value, DIM_0[lo:hi], "
+                    "DIM_1[lo:hi], ...)` so the verifier sees the slice "
+                    "shape and the coverage check can confirm the full "
+                    "output is written."
+                )
             elif _is_ttl_call(call, "store"):
                 store_ptr = call.args[0]
                 store_val = call.args[1]
@@ -396,15 +395,6 @@ def _resolve_store_slices(
     return tuple(out)
 
 
-def _runtime_scalar_names() -> set[str]:
-    """All currently-registered `runtime_scalar(...)` names. Used so
-    the Triton spec parser accepts those names as affine identifiers
-    in input / output spec strings (otherwise the spec parser rejects
-    them as unknown dim names)."""
-    return {
-        atom.name for atom in _g_symint_metadata
-        if atom.source is None
-    }
 
 
 def _collect_dim_atoms(fn) -> dict:
@@ -726,7 +716,7 @@ def _verify_for_with_invariant(
                 )
             before = env[var_name]
             inv_at_lo = _simplify_under_loop_scope(
-                _substitute_lv_in_expr(_normalize(inv_t.et), k_var, lo),
+                substitute_lv_in_expr(_normalize(inv_t.et), k_var, lo),
             )
             actual = _simplify_under_loop_scope(_normalize(before.et))
             if actual != inv_at_lo:
@@ -753,7 +743,7 @@ def _verify_for_with_invariant(
         )
         for var_name, inv_t in inv_types.items():
             inv_at_kp1 = _simplify_under_loop_scope(
-                _substitute_lv_in_expr(
+                substitute_lv_in_expr(
                     _normalize(inv_t.et), k_var, k_plus_step,
                 ),
             )
@@ -989,33 +979,18 @@ def _interpret_expr(node, env, input_types, dim_atoms):
         axis = _eval_int(node.args[0], env, dim_atoms) if node.args else 0
         return _ProgramIdMarker(axis=axis or 0)
     if _is_tl_call(node, "load"):
-        # `tl.load(ptr + arithmetic)` — fall through to the input's
-        # declared full type. The shape of the actual loaded tile (e.g.
-        # what `i[:, None] * stride + j[None, :]` selects) isn't
-        # inferred here; if the user wants per-tile slice information
-        # in the verifier, they should use `ttl.load(ptr, DIM[lo:hi],
-        # ...)`. Raise loudly if we can't even find the base pointer,
-        # rather than silently returning a None that confuses downstream.
-        ptr_base = _peel_pointer_base(node.args[0])
-        if ptr_base is None:
-            raise ValueError(
-                f"tl.load({ast.unparse(node.args[0])}): couldn't find a "
-                f"declared input-pointer name in the offset expression. "
-                f"Either start the offset with one of {sorted(input_types)} "
-                f"as the leftmost operand, or use the typed-slice form "
-                f"`ttl.load(ptr, DIM[lo:hi], ...)` to declare the tile "
-                f"shape explicitly."
-            )
-        if ptr_base not in input_types:
-            raise ValueError(
-                f"tl.load(...): peeled base pointer `{ptr_base}` isn't "
-                f"declared in `inputs={{...}}`. Known input pointers: "
-                f"{sorted(input_types)}. If `{ptr_base}` is a derived "
-                f"pointer variable (e.g. `{ptr_base} = X_ptr + …`), use "
-                f"`ttl.load(X_ptr, DIM[lo:hi], ...)` instead so the "
-                f"verifier sees the original pointer and the tile shape."
-            )
-        return input_types[ptr_base]
+        # Raw `tl.load(ptr + arithmetic)` is a hole in the verifier —
+        # the loaded tile's shape isn't typed (we'd just return the
+        # input's full declared type, which is wrong for any sliced
+        # access) and the coverage tracker can't see which slice was
+        # read. Reject and direct to the typed form.
+        raise ValueError(
+            "tl.load is not supported by the typed-Triton verifier. "
+            "Use `ttl.load(ptr, DIM_0[lo:hi], DIM_1[lo:hi], ...)` — the "
+            "verifier needs the per-dim slice shape to type the loaded "
+            "tile (and to track coverage of subsequent stores). For "
+            "indirect loads, use `ttl.gather(loaded_tile, DIM, idx)`."
+        )
     if _is_ttl_call(node, "load"):
         # `ttl.load(ptr, DIM_0[lo:hi], DIM_1[lo:hi], …)`. Restrict the
         # input's Type to the slice: each `DIM[lo:hi]` becomes
@@ -1254,7 +1229,7 @@ def _interpret_expr(node, env, input_types, dim_atoms):
             if lo is None or hi is None:
                 return None
             overrides.append(Sliced(dim_atom, lo, hi))
-        pred_domain = _parse_predicate(LexState(pred_kw.value.value))
+        pred_domain = parse_predicate(LexState(pred_kw.value.value))
         full_dims = tuple(dim_full_dim(d) for d in overrides)
         mask_et = Tensor(
             dims=full_dims,
@@ -2013,7 +1988,7 @@ def _parse_simple_predicate(s : str) -> "list[list[tuple[_PredTerm, str, _PredTe
     is `<atom> [&& <atom>]*` and each `<atom>` is `<term> <op> <term>`.
     A term is a bare identifier, bare integer, or `<name> ± <int>` /
     `<int> + <name>`. `&&` binds tighter than `||`. The verifier side
-    handles the full grammar via stile's `_parse_predicate`; the
+    handles the full grammar via stile's `parse_predicate`; the
     runtime codegen lifts to AND of `&` (BitAnd) inside each conjunct
     and OR of `|` (BitOr) across conjuncts.
 
@@ -2142,7 +2117,7 @@ def _emit_triton_fn(
     # offsets + masks computed from the slice info + row-major strides
     # derived from the declared input + output shapes. Multi-output
     # kernels have one entry per output pointer.
-    rt_names = _runtime_scalar_names()
+    rt_names = runtime_scalar_names()
     ptr_types : dict[str, Type] = {
         ptr_name: parse_spec_into_type(ptr_spec, loop_vars=rt_names)
         for ptr_name, ptr_spec in inputs.items()
@@ -2454,7 +2429,7 @@ class _Launcher:
         # the kernel's output ET and substituting `Tensor(name=N) →
         # input_et` lets a `y = ka(x); z = kb(y)` chain produce z with
         # a composed end-to-end ET.
-        rt_names = _runtime_scalar_names()
+        rt_names = runtime_scalar_names()
         name_to_replacement : dict = {}
         for ptr_name, typed_input in zip(self.kernel.inputs.keys(), typed_inputs):
             input_spec = self.kernel.inputs[ptr_name]

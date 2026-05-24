@@ -14,12 +14,6 @@ from stile import dim, reset_stile
 from stile.verification import verify_exprs_equivalent
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def test_mult_mask_via_intrinsic(reset):
     qctx = dim('mqctx', 4)
     nctx = dim('mnctx', 4)

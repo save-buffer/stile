@@ -204,6 +204,14 @@ def runtime_scalar_max(atom_or_name) -> int | None:
     return info.max if info is not None else None
 
 
+def runtime_scalar_names() -> set[str]:
+    """All currently-registered `runtime_scalar(...)` names. Public
+    accessor for the verifier-side spec parser (and any DSL that
+    wants to extend `loop_vars=` in `parse_spec_into_type`). Bare
+    atoms only (skips `tensor_element` lookups which carry `source`)."""
+    return {atom.name for atom in _g_symint_metadata if atom.source is None}
+
+
 def tensor_element(tensor_name : str, position) -> SymbolicInt:
     """
     A `SymbolicInt` representing the runtime value of `tensor_name`'s

@@ -12,12 +12,6 @@ import stile.jax as tjax
 from stile import dim, reset_stile
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def test_rms_norm(reset):
     """
     RMSNorm: `y_i = x_i * scale_i / sqrt(mean_j(x_j^2) + eps)` along

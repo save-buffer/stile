@@ -671,7 +671,7 @@ def _domain_is_empty(domain : Domain) -> bool:
     return all(_conjunction_is_infeasible(c) for c in domain.disjuncts)
 
 
-def _substitute_lv_in_expr(
+def substitute_lv_in_expr(
     expr : "NormalizedExpr",
     loop_var : LoopVariable,
     value : SymbolicIndex,
@@ -725,7 +725,7 @@ def _substitute_lv_in_factor_to_expr(
             if _domain_is_empty(new_domain):
                 identity = 0.0 if op == "sum" else float("-inf")
                 return NormalizedExpr.of(NormalizedProduct(const=identity))
-            new_child = _substitute_lv_in_expr(child, loop_var, value)
+            new_child = substitute_lv_in_expr(child, loop_var, value)
             # Inner reduce-of-identity collapses through: `sum_d 0 = 0`
             # and `max_d -inf = -inf`. Without this, a nested empty
             # reduce (whose substitution returned a const-identity
@@ -758,7 +758,7 @@ def _substitute_lv_in_factor_to_expr(
                 return NormalizedExpr.of(NormalizedParametricReduce(
                     inner_var, new_lo, new_hi, op, body,
                 ))
-            new_body = _substitute_lv_in_expr(body, loop_var, value)
+            new_body = substitute_lv_in_expr(body, loop_var, value)
             return make_parametric_reduce(inner_var, new_lo, new_hi, op, new_body)
     # All other factor kinds: substitute via the factor-returning helper
     # (no identity-collapse needed) and wrap.
@@ -796,24 +796,24 @@ def _substitute_lv_in_factor(
         case NormalizedTensor(_):
             return factor
         case NormalizedExp(child):
-            return NormalizedExp(_substitute_lv_in_expr(child, loop_var, value))
+            return NormalizedExp(substitute_lv_in_expr(child, loop_var, value))
         case NormalizedUnaryOp(op, child):
-            return NormalizedUnaryOp(op, _substitute_lv_in_expr(child, loop_var, value))
+            return NormalizedUnaryOp(op, substitute_lv_in_expr(child, loop_var, value))
         case NormalizedSum(children):
             return NormalizedSum(frozenset(
                 _substitute_lv_in_product(c, loop_var, value) for c in children
             ))
         case NormalizedMax(children):
             return NormalizedMax(frozenset(
-                _substitute_lv_in_expr(c, loop_var, value) for c in children
+                substitute_lv_in_expr(c, loop_var, value) for c in children
             ))
         case NormalizedRepeat(dims, child):
-            return NormalizedRepeat(dims, _substitute_lv_in_expr(child, loop_var, value))
+            return NormalizedRepeat(dims, substitute_lv_in_expr(child, loop_var, value))
         case NormalizedReduce(dim, op, domain, child):
             new_domain = _substitute_lv_in_domain(domain, loop_var, value)
             return make_reduce(
                 dim, op, new_domain,
-                _substitute_lv_in_expr(child, loop_var, value),
+                substitute_lv_in_expr(child, loop_var, value),
             )
         case NormalizedParametricReduce(inner_var, lo, hi, op, body):
             new_lo = _substitute_loop_var(lo, loop_var, value)
@@ -821,19 +821,19 @@ def _substitute_lv_in_factor(
             if inner_var == loop_var:
                 # `loop_var` is shadowed inside body by this node's own binder.
                 return NormalizedParametricReduce(inner_var, new_lo, new_hi, op, body)
-            new_body = _substitute_lv_in_expr(body, loop_var, value)
+            new_body = substitute_lv_in_expr(body, loop_var, value)
             return NormalizedParametricReduce(inner_var, new_lo, new_hi, op, new_body)
         case NormalizedGather(source, dim_in_source, idx):
             return NormalizedGather(
-                source=_substitute_lv_in_expr(source, loop_var, value),
+                source=substitute_lv_in_expr(source, loop_var, value),
                 dim_in_source=dim_in_source,
-                idx=_substitute_lv_in_expr(idx, loop_var, value),
+                idx=substitute_lv_in_expr(idx, loop_var, value),
             )
         case NormalizedScatter(source, dim_in_dest, idx):
             return NormalizedScatter(
-                source=_substitute_lv_in_expr(source, loop_var, value),
+                source=substitute_lv_in_expr(source, loop_var, value),
                 dim_in_dest=dim_in_dest,
-                idx=_substitute_lv_in_expr(idx, loop_var, value),
+                idx=substitute_lv_in_expr(idx, loop_var, value),
             )
 
 def _as_single_factor(product : "NormalizedProduct") -> "NormalizedFactor | None":
@@ -1301,7 +1301,7 @@ def _absorb_max_boundaries(children : list["NormalizedExpr"]) -> list["Normalize
         changed = True
         while changed and others:
             changed = False
-            expected_hi = _substitute_lv_in_expr(body, loop_var, hi)
+            expected_hi = substitute_lv_in_expr(body, loop_var, hi)
             for i, sib in enumerate(others):
                 if sib == expected_hi:
                     hi = to_affine(hi) + 1
@@ -1310,7 +1310,7 @@ def _absorb_max_boundaries(children : list["NormalizedExpr"]) -> list["Normalize
                     break
             if changed:
                 continue
-            expected_lo = _substitute_lv_in_expr(body, loop_var, to_affine(lo) - 1)
+            expected_lo = substitute_lv_in_expr(body, loop_var, to_affine(lo) - 1)
             for i, sib in enumerate(others):
                 if sib == expected_lo:
                     lo = to_affine(lo) - 1
@@ -1472,7 +1472,7 @@ def _absorb_sum_boundaries(terms : list["NormalizedProduct"]) -> list["Normalize
         changed = True
         while changed and others:
             changed = False
-            expected_hi = _substitute_lv_in_expr(body, loop_var, hi)
+            expected_hi = substitute_lv_in_expr(body, loop_var, hi)
             for i, sib in enumerate(others):
                 if sib.const == 1.0:
                     sib_expr = NormalizedExpr.of(NormalizedProduct(1.0, sib.factors))
@@ -1483,7 +1483,7 @@ def _absorb_sum_boundaries(terms : list["NormalizedProduct"]) -> list["Normalize
                         break
             if changed:
                 continue
-            expected_lo = _substitute_lv_in_expr(body, loop_var, to_affine(lo) - 1)
+            expected_lo = substitute_lv_in_expr(body, loop_var, to_affine(lo) - 1)
             for i, sib in enumerate(others):
                 if sib.const == 1.0:
                     sib_expr = NormalizedExpr.of(NormalizedProduct(1.0, sib.factors))

@@ -29,22 +29,22 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: Implementation :: CPython",
 ]
-dependencies = [
-    "einops>=0.8.1",
-    "numpy>=1.24.4",
-]
+dependencies = []
 
 [project.optional-dependencies]
-jax = ["jax>=0.4.0"]
-torch = ["torch>=2.0.0"]
+jax = ["jax>=0.4.0", "einops>=0.8.1"]
+torch = ["torch>=2.0.0", "einops>=0.8.1"]
 triton = [
     "torch>=2.0.0",
     "triton>=3.0.0",
 ]
+numpy = ["numpy>=1.24.4"]
 all = [
     "jax>=0.4.0",
     "torch>=2.0.0",
     "triton>=3.0.0",
+    "numpy>=1.24.4",
+    "einops>=0.8.1",
 ]
 
 [project.urls]

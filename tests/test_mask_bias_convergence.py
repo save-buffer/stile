@@ -28,12 +28,6 @@ from stile.verification import (
 )
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def _multiplicative(score_tensor, mask_domain):
     return BinaryOp(
         op="*",

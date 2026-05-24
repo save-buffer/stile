@@ -14,12 +14,6 @@ from stile.verification import (
 )
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def test_tensor_without_tag_unchanged(reset):
     """Default `tag=None` means a tagged-tensor-aware IR is backwards-compat."""
     N = dim("TT_N_plain", 64)

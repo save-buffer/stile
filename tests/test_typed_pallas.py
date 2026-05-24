@@ -15,12 +15,6 @@ import stile.jax.pallas as tpl
 from stile import dim, reset_stile
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def test_scalar_multiply(reset):
     """The smallest possible typed-pallas kernel: load the input, scale
     by 2, store. Spec says `2 * TPN`. Verifier must accept and the

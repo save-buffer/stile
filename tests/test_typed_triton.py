@@ -27,12 +27,6 @@ else:
     tl = None
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 _REQUIRES_TORCH = pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
 _REQUIRES_TRITON = pytest.mark.skipif(
     not ttl.HAS_TRITON, reason="Triton not installed",
@@ -45,7 +39,7 @@ def test_scalar_multiply_verification(reset):
     """
     Verification half only — runnable locally without a GPU. The
     `@ttl.jit` decorator reads the kernel's source, abstract-
-    interprets the body, and checks the `tl.store`d value matches
+    interprets the body, and checks the `ttl.store`d value matches
     `2 * X:N`. No GPU work happens at decoration time.
     """
     N = dim("TTN", 128)
@@ -58,11 +52,9 @@ def test_scalar_multiply_verification(reset):
     )
     def double(X_ptr, o_ptr, BLOCK : tl.constexpr):
         pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < N
-        X = tl.load(X_ptr + offs, mask=mask)
+        X = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
         result = X * 2
-        tl.store(o_ptr + offs, result, mask=mask)
+        ttl.store(o_ptr, result, N[pid * BLOCK : (pid + 1) * BLOCK])
 
     # Reaching here means abstract interpretation accepted the body
     # against the spec. (`TypedTritonKernel` is returned regardless of
@@ -88,11 +80,9 @@ def test_scalar_multiply(reset):
     )
     def double(X_ptr, o_ptr, BLOCK : tl.constexpr):
         pid = tl.program_id(0)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < N
-        X = tl.load(X_ptr + offs, mask=mask)
+        X = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
         result = X * 2
-        tl.store(o_ptr + offs, result, mask=mask)
+        ttl.store(o_ptr, result, N[pid * BLOCK : (pid + 1) * BLOCK])
 
     x_arr = torch.randn(N.size, device="cuda")
     x_type = Type(st=(N,), et=Tensor(dims=(N,), name="X"))
@@ -1421,6 +1411,48 @@ def test_coverage_passes_for_correct_tiling(reset):
 
     result = kernel[(M.size // BM,)](X)
     assert torch.allclose(result.tensor, X_arr * 2, atol=1e-5)
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
+def test_raw_tl_load_raises(reset):
+    """
+    `tl.load(ptr + offs, ...)` is rejected by the verifier — the
+    tile shape isn't typed and coverage tracking would have to
+    mark the input as opaque. The check points at `ttl.load`.
+    """
+    N = dim("RawN", 16)
+    with pytest.raises(ValueError, match="tl.load is not supported"):
+        @ttl.jit(
+            spec="X:RawN",
+            inputs={"X_ptr": "X:RawN"},
+            out_shape=(N,), out_dtype=torch.float32,
+            consts={"BLOCK": 16},
+        )
+        def kernel(X_ptr, O_ptr, BLOCK: tl.constexpr):
+            pid = tl.program_id(0)
+            offs = pid * BLOCK + tl.arange(0, BLOCK)
+            x = tl.load(X_ptr + offs, mask=offs < N)
+            ttl.store(O_ptr, x, N[pid * BLOCK : (pid + 1) * BLOCK])
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
+def test_raw_tl_store_raises(reset):
+    """Same for `tl.store(ptr + offs, val, ...)`."""
+    N = dim("RawN2", 16)
+    with pytest.raises(ValueError, match="tl.store is not supported"):
+        @ttl.jit(
+            spec="X:RawN2",
+            inputs={"X_ptr": "X:RawN2"},
+            out_shape=(N,), out_dtype=torch.float32,
+            consts={"BLOCK": 16},
+        )
+        def kernel(X_ptr, O_ptr, BLOCK: tl.constexpr):
+            pid = tl.program_id(0)
+            x = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
+            offs = pid * BLOCK + tl.arange(0, BLOCK)
+            tl.store(O_ptr + offs, x, mask=offs < N)
 
 
 @_REQUIRES_TRITON

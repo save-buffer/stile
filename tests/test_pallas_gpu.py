@@ -35,12 +35,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 @pytest.fixture(scope="module")
 def gpu_compiler_params():
     """Mosaic-GPU CompilerParams — required for `interpret=False` on a

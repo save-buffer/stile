@@ -15,12 +15,6 @@ from stile.verification import (
 from stile.indexing import LoopVariable
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def _single_factor(expr):
     normalized = normalize(expr)
     assert len(normalized.num.factors) == 1

@@ -11,12 +11,6 @@ from stile.specification import parse_spec_into_type
 from stile.verification import verify_exprs_equivalent
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def assert_not_equivalent(a : str, b : str):
     ta = parse_spec_into_type(a)
     tb = parse_spec_into_type(b)

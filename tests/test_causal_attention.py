@@ -26,12 +26,6 @@ import stile.jax as tjax
 from stile import reset_stile, dim
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def _softmax_jnp(x, axis=-1):
     ex = jnp.exp(x - jnp.max(x, axis=axis, keepdims=True))
     return ex / jnp.sum(ex, axis=axis, keepdims=True)

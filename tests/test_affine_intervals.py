@@ -20,12 +20,6 @@ def _iv(dim : FullDim, *pairs) -> "Domain":
     return interval_domain(LoopVariable(dim.name), list(pairs))
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def _leaf_expr(d : FullDim) -> NormalizedExpr:
     return NormalizedExpr.of(NormalizedTensor(dims=frozenset({d})))
 

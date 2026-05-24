@@ -16,12 +16,6 @@ from stile.specification import parse_spec_into_type
 from stile.verification import verify_exprs_equivalent
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def _softmax_attention_jnp(q, k, v, *, causal : bool):
     """
     Reference softmax attention used by the paged-attention numerical

@@ -12,10 +12,10 @@ import math
 
 import stile.type as t
 from ..type import *
-from ..specification import parse_spec_into_type, _parse_predicate, LexState
+from ..specification import parse_spec_into_type, parse_predicate, LexState
 from ..verification import (
     verify_types_equivalent, verify_exprs_equivalent, verify_dims_equivalent,
-    normalize as _normalize, _substitute_lv_in_expr,
+    normalize as _normalize, substitute_lv_in_expr,
     simplify_under_active_loop_scope as _simplify_under_loop_scope,
     substitute_loop_var_in_et,
 )
@@ -428,7 +428,7 @@ def mask(
     `.where(predicate)` is sugar for `self * mask(self.type.st, p)`.
     """
     lex = LexState(predicate_str)
-    pred_domain = _parse_predicate(lex)
+    pred_domain = parse_predicate(lex)
     dim_names_in_shape = {dim_name(d) for d in shape}
     for v in pred_domain.variables:
         if v.name not in dim_names_in_shape:
@@ -933,7 +933,7 @@ def _fori_loop_with_invariant(lower, upper, body_fn, init_val, invariant):
 
     # 1. Base case: init_val == invariant[k=0].
     for inv_t, init_leaf in zip(inv_types, state_leaves):
-        inv_at_0 = _substitute_lv_in_expr(_normalize(inv_t.et), k_var, 0)
+        inv_at_0 = substitute_lv_in_expr(_normalize(inv_t.et), k_var, 0)
         init_norm = _normalize_state_leaf(init_leaf)
         if init_norm != inv_at_0:
             raise AssertionError(
@@ -962,7 +962,7 @@ def _fori_loop_with_invariant(lower, upper, body_fn, init_val, invariant):
                 "the invariant."
             )
         for idx, (inv_t, next_leaf) in enumerate(zip(inv_types, next_leaves)):
-            inv_at_kplus1 = _simplify_under_loop_scope(_substitute_lv_in_expr(
+            inv_at_kplus1 = _simplify_under_loop_scope(substitute_lv_in_expr(
                 _normalize(inv_t.et), k_var, to_affine(k_var) + 1,
             ))
             if not isinstance(next_leaf, TypedJaxArray):

@@ -25,12 +25,6 @@ from stile.specification import parse_spec_into_type
 from stile.verification import verify_exprs_equivalent
 
 
-@pytest.fixture
-def reset():
-    yield
-    reset_stile()
-
-
 def _expect_rejection(kernel_call, *args, **kwargs):
     """Run `kernel_call(*args, **kwargs)` and assert it raises (the
     verifier rejected it). The two assertion shapes that bubble up are
