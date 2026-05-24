@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "stile-verifier"
-version = "0.1.2"
+version = "0.1.3"
 description = "A type system for numerical programs: write a spec, get a structural proof your code computes it."
 readme = "README.md"
 requires-python = ">=3.11"
