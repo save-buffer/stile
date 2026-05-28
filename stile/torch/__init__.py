@@ -11,6 +11,7 @@ from ._core import (
     relu,
     einsum,
     zeros,
+    tensor,
 )
 
 from . import random

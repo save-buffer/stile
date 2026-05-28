@@ -6,6 +6,9 @@ import pytest
 
 import stile
 from stile import dim, scope, reset_stile, declare_index_properties, runtime_scalar
+from stile.numerical import (
+    active_hardware, WORST_CASE, NVIDIA_TENSOR_CORE_TF32, TPU_MXU,
+)
 
 
 def test_additive_scope_drops_new_dims(reset):
@@ -84,6 +87,58 @@ def test_scope_restores_runtime_scalars_and_index_props(reset):
     # Outer ones survive.
     assert "OuterScalar" in stile.runtime_scalar_names()
     assert stile.index_has_property("OuterPerm", "permutation")
+
+
+def test_verified_as_context_manager_with_hardware(reset):
+    """`with stile.verified(hardware=…):` activates BOTH a fresh scope
+    AND a numerical_context. Inside, `active_hardware()` returns the
+    passed model; outside, it falls back to WORST_CASE."""
+    assert active_hardware() is WORST_CASE
+    with stile.verified(hardware=NVIDIA_TENSOR_CORE_TF32):
+        assert active_hardware() is NVIDIA_TENSOR_CORE_TF32
+        dim("VHDim", 8)
+        assert "VHDim" in stile.g_dim_registry
+    # Dim cleaned up, hardware restored.
+    assert "VHDim" not in stile.g_dim_registry
+    assert active_hardware() is WORST_CASE
+
+
+def test_verified_bare_decorator(reset):
+    """`@stile.verified` (no parens) works as a decorator."""
+    @stile.verified
+    def body():
+        dim("VBareDim", 4)
+        return active_hardware()
+    hw = body()
+    assert hw is WORST_CASE
+    assert "VBareDim" not in stile.g_dim_registry
+
+
+def test_verified_parens_decorator_with_hardware(reset):
+    """`@stile.verified(hardware=…)` works as a parameterized decorator."""
+    @stile.verified(hardware=TPU_MXU)
+    def body():
+        return active_hardware()
+    assert body() is TPU_MXU
+
+
+def test_verified_passes_args_through_decorator(reset):
+    """Decorator wrapper preserves args/kwargs/return."""
+    @stile.verified
+    def f(a, b, *, c):
+        return (a, b, c)
+    assert f(1, 2, c=3) == (1, 2, 3)
+
+
+def test_verified_restores_on_exception(reset):
+    """An exception inside the `with verified(...)` block still
+    restores the numerical context AND the scope."""
+    with pytest.raises(RuntimeError, match="boom"):
+        with stile.verified(hardware=NVIDIA_TENSOR_CORE_TF32):
+            dim("VExcDim", 4)
+            raise RuntimeError("boom")
+    assert active_hardware() is WORST_CASE
+    assert "VExcDim" not in stile.g_dim_registry
 
 
 def test_nested_scopes(reset):

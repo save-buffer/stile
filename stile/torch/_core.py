@@ -9,18 +9,75 @@ import stile.type as t
 from ..type import *
 from ..specification import parse_spec_into_type
 from ..verification import verify_types_equivalent, verify_exprs_equivalent
+from ..numerical import (
+    AffineForm, leaf_aa_from_array, active_hardware,
+    compose_binary, compose_unary, compose_einsum,
+    dtype_name_of,
+)
 
 import einops
 
 
+# Sentinel: `aa` defaults to "compute from tensor"; explicit `None` opts
+# out. Distinguishes "caller passed None" from "caller didn't pass."
+_NO_AA_DEFAULT = object()
+
+
+# String-name → torch.dtype, for the `astype(dtype_str)` path used by
+# `sensitivity_analysis`. Keys match `MACHINE_EPS` (so the same dtype
+# string round-trips through eps lookup and the cast).
+_TORCH_DTYPE_MAP = {
+    "float64":  torch.float64,
+    "float32":  torch.float32,
+    "float16":  torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+# FP8 variants exist on newer torch versions; add them when present so
+# import doesn't break on older installs without them.
+for _name, _attr in [
+    ("fp8_e4m3", "float8_e4m3fn"),
+    ("fp8_e5m2", "float8_e5m2"),
+]:
+    if hasattr(torch, _attr):
+        _TORCH_DTYPE_MAP[_name] = getattr(torch, _attr)
+
+
+def _aa_of(value) -> "AffineForm | None":
+    """Pull the `.aa` off a TypedTorchTensor, or wrap a numeric
+    scalar as a zero-radius constant form."""
+    if isinstance(value, TypedTorchTensor):
+        return value.aa
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return AffineForm.constant(float(value))
+    return None
+
+
 class TypedTorchTensor:
-    def __init__(self, tensor : torch.Tensor, type : Type):
+    def __init__(
+        self, tensor : torch.Tensor, type : Type,
+        *, aa : "AffineForm | None" = _NO_AA_DEFAULT,
+    ):
+        # `aa` is the always-on affine-form bound on this value.
+        # Defaults to a leaf form derived from `tensor.min()/max()` at
+        # construction; per-op handlers (step 5) compose new AAs from
+        # input AAs as values flow through typed ops.
         self.tensor = tensor
         self.type = type
+        if aa is _NO_AA_DEFAULT:
+            aa = leaf_aa_from_array(tensor)
+        self.aa = aa
 
     @property
     def data_ptr(self) -> int:
         return self.tensor.data_ptr()
+
+    def astype(self, dtype : str) -> "TypedTorchTensor":
+        """Recast the underlying tensor to `dtype` (a `MACHINE_EPS`
+        key such as `"bfloat16"` / `"fp8_e4m3"`); used by
+        `sensitivity_analysis` to swap a named input's precision
+        without changing shape or stile type."""
+        torch_dtype = _TORCH_DTYPE_MAP[dtype]
+        return TypedTorchTensor(self.tensor.to(torch_dtype), self.type)
 
     def slice(self, dim : FullDim, start : int, end : int) -> "TypedTorchTensor":
         slice_expr = []
@@ -150,31 +207,42 @@ def _binary_op_helper(
         case _:
             raise ValueError(f"Unknown op {op}")
 
-    return TypedTorchTensor(new_tensor, new_type)
+    new_aa = compose_binary(
+        op, _aa_of(slf), _aa_of(other), dtype_name_of(new_tensor),
+    )
+    return TypedTorchTensor(new_tensor, new_type, aa=new_aa)
 
 
 def exp(x : TypedTorchTensor) -> TypedTorchTensor:
-    new_type = t.exp(x.type)
     new_tensor = torch.exp(x.tensor)
-    return TypedTorchTensor(new_tensor, new_type)
+    return TypedTorchTensor(
+        new_tensor, t.exp(x.type),
+        aa=compose_unary("exp", x.aa, dtype_name_of(new_tensor)),
+    )
 
 
 def sin(x : TypedTorchTensor) -> TypedTorchTensor:
-    new_type = t.sin(x.type)
     new_tensor = torch.sin(x.tensor)
-    return TypedTorchTensor(new_tensor, new_type)
+    return TypedTorchTensor(
+        new_tensor, t.sin(x.type),
+        aa=compose_unary("sin", x.aa, dtype_name_of(new_tensor)),
+    )
 
 
 def cos(x : TypedTorchTensor) -> TypedTorchTensor:
-    new_type = t.cos(x.type)
     new_tensor = torch.cos(x.tensor)
-    return TypedTorchTensor(new_tensor, new_type)
+    return TypedTorchTensor(
+        new_tensor, t.cos(x.type),
+        aa=compose_unary("cos", x.aa, dtype_name_of(new_tensor)),
+    )
 
 
 def sqrt(x : TypedTorchTensor) -> TypedTorchTensor:
-    new_type = t.sqrt(x.type)
     new_tensor = torch.sqrt(x.tensor)
-    return TypedTorchTensor(new_tensor, new_type)
+    return TypedTorchTensor(
+        new_tensor, t.sqrt(x.type),
+        aa=compose_unary("sqrt", x.aa, dtype_name_of(new_tensor)),
+    )
 
 
 def maximum(x : TypedTorchTensor, y : TypedTorchTensor) -> TypedTorchTensor:
@@ -209,7 +277,11 @@ def relu(x : TypedTorchTensor) -> TypedTorchTensor:
 def einsum(x : TypedTorchTensor, y : TypedTorchTensor, einstr : str) -> TypedTorchTensor:
     new_tensor = einops.einsum(x.tensor, y.tensor, einstr)
     new_type = t.einsum(x.type, y.type, einstr)
-    return TypedTorchTensor(new_tensor, new_type)
+    new_aa = compose_einsum(
+        x.aa, y.aa, x.type, y.type, einstr, active_hardware(),
+        x_dtype=dtype_name_of(x.tensor), y_dtype=dtype_name_of(y.tensor),
+    )
+    return TypedTorchTensor(new_tensor, new_type, aa=new_aa)
 
 
 class TypedResult:

@@ -8,6 +8,7 @@ from ._core import (
     maximum,
     einsum,
     zeros,
+    tensor,
 )
 
 from . import random

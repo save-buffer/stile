@@ -57,6 +57,16 @@ from .indexing import (
 )
 from .tracing import _g_runtime_arrs
 
+# --- Numerical analysis -------------------------------------------------
+# Reexport the active-hardware accessor + context so `stile.verified`
+# can wrap a numerical context without inline imports. The full
+# `stile.numerical.*` surface (AffineForm, evaluator, presets) stays
+# in the submodule.
+from .numerical import (
+    WORST_CASE as _DEFAULT_NUMERICS,
+    numerical_context as _numerical_context,
+)
+
 def dim(name : str, size : int) -> FullDim:
     return FullDim(name, size)
 
@@ -137,25 +147,76 @@ import contextlib
 import functools
 
 
-def verified(fn):
+class _Verified:
     """
-    Decorator: run `fn` inside a `stile.scope()`. Any dims, runtime
-    scalars, or index properties the function declares are scoped to
-    its execution and rolled back on return (or exception). Sugar
-    for the most common use of `scope()`:
+    The object behind `stile.verified` — works as both a context
+    manager (`with stile.verified(...):`) and a decorator
+    (`@stile.verified`). Bundles `stile.scope()` (so dim / runtime-
+    scalar / index-property registrations are rolled back on exit)
+    with `stile.numerical.numerical_context(hardware=...)` (so AA
+    ops use the matching hardware-numerics model).
 
-        @stile.verified
-        def my_kernel_setup():
-            M = stile.dim("M", 32)
-            ...verify here...
-
-    The dim `M` only exists for the duration of `my_kernel_setup()`.
+    Don't construct directly; use the `verified` factory below.
     """
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        with scope():
-            return fn(*args, **kwargs)
-    return wrapper
+    def __init__(self, *, hardware=None, clear : bool = False):
+        self._hardware = hardware if hardware is not None else _DEFAULT_NUMERICS
+        self._clear = clear
+        self._scope_ctx = None
+        self._numerics_ctx = None
+
+    def __enter__(self):
+        self._scope_ctx = scope(clear=self._clear)
+        self._numerics_ctx = _numerical_context(hardware=self._hardware)
+        self._scope_ctx.__enter__()
+        self._numerics_ctx.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._numerics_ctx.__exit__(exc_type, exc, tb)
+        self._scope_ctx.__exit__(exc_type, exc, tb)
+        return False
+
+    def __call__(self, fn):
+        hardware = self._hardware
+        clear = self._clear
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with _Verified(hardware=hardware, clear=clear):
+                return fn(*args, **kwargs)
+        return wrapper
+
+
+def verified(fn=None, *, hardware=None, clear : bool = False):
+    """
+    Unified verification entry — works as decorator, parameterized
+    decorator, or context manager. Bundles `stile.scope()` (dim /
+    runtime-scalar / index-property cleanup) with
+    `numerical_context(hardware=...)` (AA ops use the matching
+    hardware-numerics model). Defaults to `WORST_CASE` numerics
+    when no `hardware=` is given.
+
+    Four call shapes, all equivalent up to defaults:
+
+        @stile.verified                              # bare decorator
+        @stile.verified()                            # parens, no args
+        @stile.verified(hardware=NVIDIA_TF32_MATMUL) # with hardware
+        with stile.verified(hardware=...): ...       # context manager
+
+    Inside the block:
+      - dims declared via `stile.dim(...)` are dropped on exit;
+      - runtime scalars, index properties, etc. are restored;
+      - AA on typed values uses `hardware`'s numerics (matmul
+        accumulator dtype, reduction order, …).
+    """
+    if fn is None:
+        return _Verified(hardware=hardware, clear=clear)
+    if callable(fn):
+        return _Verified(hardware=hardware, clear=clear)(fn)
+    raise TypeError(
+        f"verified: positional arg must be a callable to decorate; "
+        f"got {type(fn).__name__}. Did you mean to pass `hardware=` "
+        f"as a keyword? `verified(hardware=...)`."
+    )
 
 
 @contextlib.contextmanager

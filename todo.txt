@@ -1,5 +1,21 @@
 - Consider adding a `Masks` class that automatically broadcasts up to the desired shape
 
+- KV-writeback / in-place update doesn't have a clean spec form yet.
+  Paged-attention and streaming-decode kernels write the new K/V at
+  a runtime-determined position into a cache tensor; semantically:
+      out[..., p] = new_value
+      out[..., q] = cache[..., q]  for all q ≠ p
+  The current `Scatter` ET is the wrong shape — it produces a tensor
+  that's zero outside the scatter's range, not "cache values
+  everywhere else." Options for the right primitive:
+    (a) `Update(cache, idx, new_value)` ET: "cache except idx position
+        is new_value." Direct match for the writeback semantics.
+    (b) Express via `where`-clause: `out = (idx == p) ? new_value : cache`,
+        but our spec parser doesn't have a value-conditional form yet.
+  Pick (a) — distinct ET node, dedicated normalization rule
+  `Update(Update(c, p, v), p, w) → Update(c, p, w)` and similar.
+  Tag for "needs spec primitive."
+
 - Decoration-time coverage check via opt-in `grid=` in `@ttl.jit`.
   Today coverage tracking lives at launch time: `_Launcher.__call__`
   substitutes the grid + loop ranges, unions per-axis, raises on

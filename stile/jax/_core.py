@@ -33,6 +33,28 @@ from .. import LoopScope, _active_loop_scopes
 
 import einops
 
+from ..numerical import (
+    AffineForm, leaf_aa_from_array, active_hardware,
+    compose_binary, compose_unary, compose_einsum,
+    dtype_name_of,
+)
+
+# Sentinel: `aa` defaults to "compute from arr"; explicit `None` opts
+# out. Avoids ambiguity between "caller passed None" and "caller
+# didn't pass anything."
+_NO_AA_DEFAULT = object()
+
+
+def _aa_of(value) -> "AffineForm | None":
+    """Pull the `.aa` off a TypedJaxArray, or wrap a numeric scalar
+    as a zero-radius constant form, or return None for anything else
+    (e.g. a raw JAX tracer)."""
+    if isinstance(value, TypedJaxArray):
+        return value.aa
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return AffineForm.constant(float(value))
+    return None
+
 
 # Module-level registry of `LoopVariable` name → JAX value, used by
 # tjax internals (notably `_build_predicate_array`) to evaluate symbolic
@@ -108,14 +130,27 @@ def _resolve_to_runtime(symbolic, var_resolver):
 
 
 class TypedJaxArray:
-    def __init__(self, arr : jax.Array | None, type : Type):
+    def __init__(
+        self, arr : jax.Array | None, type : Type,
+        *, aa : "AffineForm | None" = _NO_AA_DEFAULT,
+    ):
         # `arr` is None when this TypedJaxArray was produced inside a rolled
         # loop (or any context where slice bounds / reduction sizes aren't
         # concrete ints). Type/verification still propagate normally; the
         # concrete computation is skipped and every downstream op forwards
         # None.
+        #
+        # `aa` is the always-on affine-form bound on this value. Defaults
+        # to a leaf form derived from `arr.min()/max()` at construction;
+        # per-op handlers (step 5) compose new AAs from input AAs as
+        # values flow through tjax ops. Pass an explicit `aa=None` to
+        # opt out (e.g., for huge arrays where the leaf computation
+        # would be expensive and the caller doesn't need AA tracking).
         self.arr = arr
         self.type = type
+        if aa is _NO_AA_DEFAULT:
+            aa = leaf_aa_from_array(arr)
+        self.aa = aa
 
     # JAX pytree registration: the `arr` is the leaf (so jax.lax.fori_loop
     # and friends can thread the array through their traced graph), the
@@ -123,6 +158,16 @@ class TypedJaxArray:
     # Since each tjax op derives its output type deterministically from
     # input types, a verified loop body — whose carry-type is a fixed
     # point — produces matching aux on every iteration.
+    def astype(self, dtype : str) -> "TypedJaxArray":
+        """Recast the underlying array to `dtype` (a `MACHINE_EPS`
+        key such as `"bfloat16"` / `"fp8_e4m3"`); used by
+        `sensitivity_analysis` to swap a named input's precision
+        without changing its shape or stile type. The new typed value
+        gets a fresh leaf AA derived from the cast array's range."""
+        if self.arr is None:
+            return TypedJaxArray(None, self.type)
+        return TypedJaxArray(self.arr.astype(dtype), self.type)
+
     def tree_flatten(self):
         return (self.arr,), self.type
 
@@ -482,7 +527,10 @@ def _binary_op_helper(
     lhs = slf.arr if isinstance(slf, TypedJaxArray) else slf
     rhs = other.arr if isinstance(other, TypedJaxArray) else other
     if lhs is None or rhs is None:
-        return TypedJaxArray(None, new_type)
+        # Symbolic-only path: at least one operand has no concrete
+        # array, so its `.aa` already came in as None and the chain
+        # would collapse anyway. Short-circuit to None.
+        return TypedJaxArray(None, new_type, aa=None)
     match op:
         case "+":
             new_arr = lhs + rhs
@@ -497,25 +545,44 @@ def _binary_op_helper(
         case _:
             raise ValueError(f"Unknown op {op}")
 
-    return TypedJaxArray(new_arr, new_type)
+    # Eps comes off the *output* dtype (JAX's promotion rule already
+    # baked in). Pointwise ops don't need the hardware model.
+    new_aa = compose_binary(
+        op, _aa_of(slf), _aa_of(other), dtype_name_of(new_arr),
+    )
+    return TypedJaxArray(new_arr, new_type, aa=new_aa)
 
 
-def _apply_unary(x : TypedJaxArray, new_type : Type, jnp_fn) -> TypedJaxArray:
+def _apply_unary(
+    x : TypedJaxArray, new_type : Type, jnp_fn,
+    *, aa_op : str | None = None,
+) -> TypedJaxArray:
+    """
+    Concrete-array path. `aa_op` is the matching `compose_unary` op
+    name (`exp`, `sin`, `cos`, `sqrt`); when set, the result carries
+    a composed AA. Defaults to `None` for ops that don't have an AA
+    handler yet (the result's `.aa` stays `None`).
+    """
     if x.arr is None:
-        return TypedJaxArray(None, new_type)
-    return TypedJaxArray(jnp_fn(x.arr), new_type)
+        return TypedJaxArray(None, new_type, aa=None)
+    new_arr = jnp_fn(x.arr)
+    new_aa = (
+        compose_unary(aa_op, x.aa, dtype_name_of(new_arr))
+        if aa_op is not None else None
+    )
+    return TypedJaxArray(new_arr, new_type, aa=new_aa)
 
 
 def exp(x : TypedJaxArray) -> TypedJaxArray:
-    return _apply_unary(x, t.exp(x.type), jnp.exp)
+    return _apply_unary(x, t.exp(x.type), jnp.exp, aa_op="exp")
 
 
 def sin(x : TypedJaxArray) -> TypedJaxArray:
-    return _apply_unary(x, t.sin(x.type), jnp.sin)
+    return _apply_unary(x, t.sin(x.type), jnp.sin, aa_op="sin")
 
 
 def cos(x : TypedJaxArray) -> TypedJaxArray:
-    return _apply_unary(x, t.cos(x.type), jnp.cos)
+    return _apply_unary(x, t.cos(x.type), jnp.cos, aa_op="cos")
 
 
 def sigmoid(x : TypedJaxArray) -> TypedJaxArray:
@@ -534,7 +601,7 @@ def sqrt(x):
 
 
 def _sqrt_typed(x : TypedJaxArray) -> TypedJaxArray:
-    return _apply_unary(x, t.sqrt(x.type), jnp.sqrt)
+    return _apply_unary(x, t.sqrt(x.type), jnp.sqrt, aa_op="sqrt")
 
 
 def maximum(x : TypedJaxArray, y : TypedJaxArray) -> TypedJaxArray:
@@ -569,9 +636,15 @@ def relu(x : TypedJaxArray) -> TypedJaxArray:
 
 def einsum(x : TypedJaxArray, y : TypedJaxArray, einstr : str) -> TypedJaxArray:
     new_type = t.einsum(x.type, y.type, einstr)
+    new_aa = compose_einsum(
+        x.aa, y.aa, x.type, y.type, einstr, active_hardware(),
+        x_dtype=dtype_name_of(x.arr), y_dtype=dtype_name_of(y.arr),
+    )
     if x.arr is None or y.arr is None:
-        return TypedJaxArray(None, new_type)
-    return TypedJaxArray(einops.einsum(x.arr, y.arr, einstr), new_type)
+        return TypedJaxArray(None, new_type, aa=new_aa)
+    return TypedJaxArray(
+        einops.einsum(x.arr, y.arr, einstr), new_type, aa=new_aa,
+    )
 
 
 def fori_loop(lower, upper, body_fn, init_val, *, invariant=None):

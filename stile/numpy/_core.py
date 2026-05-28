@@ -2,15 +2,52 @@ import stile.type as t
 from ..type import *
 from ..specification import parse_spec_into_type
 from ..verification import verify_types_equivalent, verify_exprs_equivalent
+from ..numerical import (
+    AffineForm, leaf_aa_from_array, active_hardware,
+    compose_binary, compose_unary, compose_einsum,
+    dtype_name_of,
+)
 
 import numpy as np
 import einops
 
 
+# Sentinel: `aa` defaults to "compute from arr"; explicit `None` opts out.
+_NO_AA_DEFAULT = object()
+
+
+def _aa_of(value) -> "AffineForm | None":
+    """Pull the `.aa` off a TypedNumpyArray, or wrap a numeric scalar
+    as a zero-radius constant form."""
+    if isinstance(value, TypedNumpyArray):
+        return value.aa
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return AffineForm.constant(float(value))
+    return None
+
+
 class TypedNumpyArray:
-    def __init__(self, arr : np.ndarray, type : Type):
+    def __init__(
+        self, arr : np.ndarray, type : Type,
+        *, aa : "AffineForm | None" = _NO_AA_DEFAULT,
+    ):
+        # `aa` is the always-on affine-form bound. Defaults to a leaf
+        # form derived from `arr.min()/max()`; per-op handlers (step 5)
+        # compose new AAs from input AAs as values flow through ops.
         self.arr = arr
         self.type = type
+        if aa is _NO_AA_DEFAULT:
+            aa = leaf_aa_from_array(arr)
+        self.aa = aa
+
+    def astype(self, dtype : str) -> "TypedNumpyArray":
+        """Recast the underlying array to `dtype` (a `MACHINE_EPS` key
+        such as `"bfloat16"` / `"float32"`); used by
+        `sensitivity_analysis` to swap a named input's precision
+        without changing shape or stile type. Note: numpy doesn't
+        natively support bfloat16 / fp8 dtypes, so those callers
+        should stay on jax / torch backends."""
+        return TypedNumpyArray(self.arr.astype(dtype), self.type)
 
     def slice(self, dim : FullDim, start : int, end : int) -> "TypedNumpyArray":
         slice_expr = []
@@ -132,41 +169,71 @@ def _binary_op_helper(
         case _:
             raise ValueError(f"Unknown op {op}")
 
-    return TypedNumpyArray(new_arr, new_type)
+    new_aa = compose_binary(
+        op, _aa_of(slf), _aa_of(other), dtype_name_of(new_arr),
+    )
+    return TypedNumpyArray(new_arr, new_type, aa=new_aa)
 
 
 def exp(x : TypedNumpyArray) -> TypedNumpyArray:
-    new_type = t.exp(x.type)
     new_arr = np.exp(x.arr)
-    return TypedNumpyArray(new_arr, new_type)
+    return TypedNumpyArray(
+        new_arr, t.exp(x.type),
+        aa=compose_unary("exp", x.aa, dtype_name_of(new_arr)),
+    )
 
 
 def sin(x : TypedNumpyArray) -> TypedNumpyArray:
-    new_type = t.sin(x.type)
     new_arr = np.sin(x.arr)
-    return TypedNumpyArray(new_arr, new_type)
+    return TypedNumpyArray(
+        new_arr, t.sin(x.type),
+        aa=compose_unary("sin", x.aa, dtype_name_of(new_arr)),
+    )
 
 
 def cos(x : TypedNumpyArray) -> TypedNumpyArray:
-    new_type = t.cos(x.type)
     new_arr = np.cos(x.arr)
-    return TypedNumpyArray(new_arr, new_type)
+    return TypedNumpyArray(
+        new_arr, t.cos(x.type),
+        aa=compose_unary("cos", x.aa, dtype_name_of(new_arr)),
+    )
 
 
 def sqrt(x : TypedNumpyArray) -> TypedNumpyArray:
-    new_type = t.sqrt(x.type)
     new_arr = np.sqrt(x.arr)
-    return TypedNumpyArray(new_arr, new_type)
+    return TypedNumpyArray(
+        new_arr, t.sqrt(x.type),
+        aa=compose_unary("sqrt", x.aa, dtype_name_of(new_arr)),
+    )
 
 
 def maximum(x : TypedNumpyArray, y : TypedNumpyArray) -> TypedNumpyArray:
     return _binary_op_helper(x, y, "max")
 
 
+def tensor(
+    arr : np.ndarray, *shape : FullDim, name : str,
+) -> TypedNumpyArray:
+    """
+    Wrap `arr` as a typed numpy array with the given dim shape and a
+    stile `Tensor(name=...)` ET. Mirrors `tjax.tensor` / `ttorch.tensor`
+    for the numpy host."""
+    full_dims = tuple(dim_full_dim(d) for d in shape)
+    return TypedNumpyArray(
+        arr, Type(st=full_dims, et=t.Tensor(dims=full_dims, name=name)),
+    )
+
+
 def einsum(x : TypedNumpyArray, y : TypedNumpyArray, einstr : str) -> TypedNumpyArray:
-    new_arr = einops.einsum(x.arr, y.arr, einstr)
-    new_type = t.einsum(x.type, y.type, einstr)
-    return TypedNumpyArray(new_arr, new_type)
+    new_aa = compose_einsum(
+        x.aa, y.aa, x.type, y.type, einstr, active_hardware(),
+        x_dtype=dtype_name_of(x.arr), y_dtype=dtype_name_of(y.arr),
+    )
+    return TypedNumpyArray(
+        einops.einsum(x.arr, y.arr, einstr),
+        t.einsum(x.type, y.type, einstr),
+        aa=new_aa,
+    )
 
 
 class TypedResult:
