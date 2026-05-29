@@ -1415,6 +1415,88 @@ def test_coverage_passes_for_correct_tiling(reset):
 
 @_REQUIRES_TRITON
 @_REQUIRES_TORCH
+def test_decoration_grid_catches_const_slice_footgun(reset):
+    """
+    Same const-slice footgun as the launch-time test, but the grid is
+    declared at decoration via `grid=`. The coverage check now fires
+    during `@ttl.jit` decoration — at import — instead of on first
+    launch.
+    """
+    M = dim("DecCovM", 32)
+    BM = 8
+
+    with pytest.raises(ValueError, match="stores cover"):
+        @ttl.jit(
+            spec="2 * X:DecCovM",
+            inputs={"X_ptr": "X:DecCovM"},
+            out_shape=(M,), out_dtype=torch.float32,
+            consts={"BM": BM},
+            grid=lambda c: (M.size // c["BM"],),
+        )
+        def kernel(X_ptr, O_ptr, BM: tl.constexpr):
+            pid = tl.program_id(0)  # unused — constant-slice store
+            x = ttl.load(X_ptr, M[0:BM])
+            ttl.store(O_ptr, x * 2, M[0:BM])
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
+def test_decoration_grid_passes_for_correct_tiling(reset):
+    """
+    A correctly-tiled kernel with a decoration-time `grid=` decorates
+    without error, and still launches + computes correctly. Also
+    exercises the plain-tuple `grid=` form (not a callable)."""
+    M = dim("DecCovM2", 32)
+    BM = 8
+
+    X_arr = torch.randn(M.size, device="cuda")
+    X = ttensor(X_arr, M, name="X")
+
+    @ttl.jit(
+        spec="2 * X:DecCovM2",
+        inputs={"X_ptr": "X:DecCovM2"},
+        out_shape=(M,), out_dtype=torch.float32,
+        consts={"BM": BM},
+        grid=(M.size // BM,),
+    )
+    def kernel(X_ptr, O_ptr, BM: tl.constexpr):
+        pid = tl.program_id(0)
+        x = ttl.load(X_ptr, M[pid * BM : (pid + 1) * BM])
+        ttl.store(O_ptr, x * 2, M[pid * BM : (pid + 1) * BM])
+
+    assert isinstance(kernel, ttl.TypedTritonKernel)
+    result = kernel[(M.size // BM,)](X)
+    assert torch.allclose(result.tensor, X_arr * 2, atol=1e-5)
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
+def test_decoration_grid_catches_off_by_one(reset):
+    """
+    An off-by-one grid (too few programs) leaves the tail of the
+    output unwritten; the decoration-time check catches it. Here the
+    correct grid is `M.size // BM == 4`, but we declare `3` — so
+    positions `[24, 32)` are never stored.
+    """
+    M = dim("DecCovM3", 32)
+    BM = 8
+
+    with pytest.raises(ValueError, match="stores cover"):
+        @ttl.jit(
+            spec="2 * X:DecCovM3",
+            inputs={"X_ptr": "X:DecCovM3"},
+            out_shape=(M,), out_dtype=torch.float32,
+            consts={"BM": BM},
+            grid=(3,),  # should be 4
+        )
+        def kernel(X_ptr, O_ptr, BM: tl.constexpr):
+            pid = tl.program_id(0)
+            x = ttl.load(X_ptr, M[pid * BM : (pid + 1) * BM])
+            ttl.store(O_ptr, x * 2, M[pid * BM : (pid + 1) * BM])
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
 def test_raw_tl_load_raises(reset):
     """
     `tl.load(ptr + offs, ...)` is rejected by the verifier — the

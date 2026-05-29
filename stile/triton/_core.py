@@ -58,6 +58,7 @@ def jit(
     out_shape : "tuple | list",
     out_dtype : "object | list | tuple" = None,
     consts : "dict[str, int | float] | None" = None,
+    grid : "tuple | list | int | callable | None" = None,
 ):
     """
     Decorator producing a typed Triton kernel.
@@ -78,6 +79,22 @@ def jit(
     The kernel signature has N output pointer args after the inputs,
     in declaration order. The launcher returns a tuple of N
     `TypedTorchTensor`s in the same order.
+
+    `grid`, when given, runs the store-coverage check immediately at
+    decoration rather than waiting for the first launch. This is the
+    common case for shape-specialized kernels, where the grid is known
+    up front from the dim sizes and block consts:
+
+        @ttl.jit(spec=..., inputs=..., out_shape=(M, N),
+                 consts={"BM": 64, "BN": 64},
+                 grid=lambda c: (M.size // c["BM"], N.size // c["BN"]))
+
+    `grid` may be a concrete int / tuple of ints, or a callable taking
+    the consts dict and returning one (Triton's `grid(meta)` shape).
+    The same `_check_coverage_at_launch` logic runs — so an off-by-one
+    grid or a constant-slice footgun raises at import time, with the
+    full kernel context, instead of on first call. Launches may still
+    use any grid; this is an extra early check, not a constraint.
     """
     def decorate(fn):
         src = textwrap.dedent(inspect.getsource(fn))
@@ -144,7 +161,7 @@ def jit(
             fn_def, fn, inputs, outputs, consts=consts or {},
         )
 
-        return TypedTritonKernel(
+        kernel = TypedTritonKernel(
             triton_fn, inputs, outputs,
             consts=consts or {},
             single_output=not is_multi,
@@ -153,7 +170,35 @@ def jit(
             loop_var_ranges=verify_meta["loop_var_ranges"],
         )
 
+        # Opt-in early coverage check: if the caller declared the grid
+        # at decoration, run the same store-coverage verification the
+        # launcher does — so footguns surface at import, not first call.
+        if grid is not None:
+            resolved_grid = _resolve_decoration_grid(grid, kernel.consts)
+            _check_coverage_at_launch(kernel, resolved_grid, {})
+
+        return kernel
+
     return decorate
+
+
+def _resolve_decoration_grid(grid, consts : dict) -> tuple:
+    """Resolve a decoration-time `grid=` to a concrete int tuple. A
+    callable is invoked with the consts dict (Triton's `grid(meta)`
+    convention); a bare int becomes a 1-tuple; every entry is coerced
+    to `int` (dim sizes / const arithmetic are concrete at
+    decoration)."""
+    if callable(grid):
+        grid = grid(dict(consts))
+    if isinstance(grid, int):
+        grid = (grid,)
+    try:
+        return tuple(int(g) for g in grid)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"@ttl.jit `grid=` must resolve to ints (got {grid!r}); pass "
+            f"a tuple of ints or a callable `consts -> tuple[int, ...]`."
+        ) from e
 
 
 @dataclass(frozen=True)
