@@ -462,10 +462,13 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
             idx=idx_et,
         )
     elif lex.maybe_consume_keyword("scatter"):
-        # scatter[dim_in_dest](source_expr, idx_expr)
+        # scatter[dim_in_dest](source_expr, idx_expr [, base_expr])
         # Dual of gather: source has idx's dim in its shape; the result
         # replaces that dim with `dim_in_dest`. Positions of the output
-        # not addressed by `idx` are zero.
+        # not addressed by `idx` take their value from `base` (a third
+        # argument with the output's shape), or zero if `base` is
+        # omitted. A non-zero `base` expresses a writeback / conditional
+        # update — see `Scatter` in type.py.
         lex.expect('[')
         dim_in_dest = _parse_dim(lex)
         lex.expect(']')
@@ -473,6 +476,10 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
         source_st, source_et = _parse_spec(lex)
         lex.expect(',')
         idx_st, idx_et = _parse_spec(lex)
+        base_et = Constant(0.0)
+        base_st = None
+        if lex.maybe_consume(','):
+            base_st, base_et = _parse_spec(lex)
         lex.expect(')')
         if len(idx_st) != 1:
             raise ValueError(
@@ -489,10 +496,16 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
             dim_in_dest if dim_name(d) == dim_name(idx_dim) else d
             for d in source_st
         )
+        if base_st is not None and tuple(dim_name(d) for d in base_st) != tuple(dim_name(d) for d in out_st):
+            raise ValueError(
+                f"scatter base shape {[dim_name(d) for d in base_st]} must "
+                f"match the scattered output shape {[dim_name(d) for d in out_st]}"
+            )
         return out_st, Scatter(
             source=source_et,
             dim_in_dest=dim_full_dim(dim_in_dest),
             idx=idx_et,
+            base=base_et,
         )
     elif binary_fn := lex.maybe_consume_keyword("maximum", "minimum"):
         # `maximum(<spec1>, <spec2>)` → BinaryOp(max, et1, et2).
@@ -824,10 +837,78 @@ def _apply_iteration_restriction(
 
 def _parse_spec(lex : LexState) -> tuple[ShapeType, ExprType]:
     result_st, result_et = _parse_expr(lex)
-    while lex.maybe_consume_keyword("where"):
-        pred_domain = parse_predicate(lex)
-        result_et = _apply_where_mask(result_st, result_et, pred_domain)
+    while True:
+        if lex.maybe_consume_keyword("where"):
+            pred_domain = parse_predicate(lex)
+            result_et = _apply_where_mask(result_st, result_et, pred_domain)
+        elif lex.maybe_consume_keyword("except"):
+            result_st, result_et = _parse_except(lex, result_st, result_et)
+        else:
+            break
     return result_st, result_et
+
+
+def _parse_except(
+    lex : LexState,
+    base_st : ShapeType,
+    base_et : ExprType,
+) -> tuple[ShapeType, ExprType]:
+    """
+    TLA+-style writeback: `<base> except [<dim> @ <idx>] = <values>`.
+
+    Reads as "the base tensor, except along `<dim>` at the positions
+    given by the 1-d index `<idx>`, where it takes `<values>`."
+    Lowers to `Scatter(source=values, dim_in_dest=dim, idx=idx,
+    base=base)` — the same ET as the `scatter[dim](values, idx, base)`
+    function form, just written in the shape kernel authors think in
+    for KV-cache writeback:
+
+        K_cache_out = K_cache_in except [Seq @ write_pos] = K_proj
+
+    The result shape is the base's shape (the scatter replaces the
+    `idx`-dim of `values` with `dim`, which must reproduce `base`'s
+    shape).
+    """
+    lex.expect('[')
+    dim_in_dest = _parse_dim(lex)
+    lex.expect('@')
+    idx_st, idx_et = _parse_spec(lex)
+    lex.expect(']')
+    lex.expect('=')
+    values_st, values_et = _parse_expr(lex)
+
+    if len(idx_st) != 1:
+        raise ValueError(f"`except` index must be 1-d; got shape={idx_st}")
+    idx_dim = idx_st[0]
+    if not any(dim_name(d) == dim_name(idx_dim) for d in values_st):
+        raise ValueError(
+            f"`except` values must have the index's dim "
+            f"{dim_name(idx_dim)!r} in shape "
+            f"{[dim_name(d) for d in values_st]}"
+        )
+    if not any(dim_name(d) == dim_name(dim_in_dest) for d in base_st):
+        raise ValueError(
+            f"`except` writeback dim {dim_name(dim_in_dest)!r} is not in "
+            f"the base shape {[dim_name(d) for d in base_st]}"
+        )
+    # Output shape = values' shape with the idx-dim replaced by dim_in_dest;
+    # that must reproduce the base's shape.
+    produced_st = tuple(
+        dim_in_dest if dim_name(d) == dim_name(idx_dim) else d
+        for d in values_st
+    )
+    if tuple(dim_name(d) for d in produced_st) != tuple(dim_name(d) for d in base_st):
+        raise ValueError(
+            f"`except` produces shape "
+            f"{[dim_name(d) for d in produced_st]} but base has "
+            f"{[dim_name(d) for d in base_st]}"
+        )
+    return base_st, Scatter(
+        source=values_et,
+        dim_in_dest=dim_full_dim(dim_in_dest),
+        idx=idx_et,
+        base=base_et,
+    )
 
 def parse_spec_into_type(
     spec : str,

@@ -313,31 +313,48 @@ class TypedJaxArray:
         )
         return TypedJaxArray(jnp.take(self.arr, idx.arr, axis=axis), new_type)
 
-    def scatter(self, dim : FullDim, idx : "TypedJaxArray") -> "TypedJaxArray":
+    def scatter(
+        self, dim : FullDim, idx : "TypedJaxArray",
+        base : "TypedJaxArray | None" = None,
+    ) -> "TypedJaxArray":
         """
-        Dual of `gather`: write `self` into a zero-initialized output
-        whose `dim` axis is populated at positions given by `idx`. The
-        output's shape replaces `self`'s `idx`-dim with `dim`. Other
-        positions of the output (those not addressed by any `idx[m]`)
-        are zero.
+        Dual of `gather`: write `self` into an output whose `dim` axis is
+        populated at positions given by `idx`. The output's shape
+        replaces `self`'s `idx`-dim with `dim`. Output positions not
+        addressed by any `idx[m]` take their value from `base` (which
+        must have the output's shape); `base` defaults to zero — the
+        original "scatter into zeros" behavior.
+
+        A non-zero `base` is a writeback / conditional update: keep the
+        base everywhere the scatter didn't touch. The runtime uses
+        `base.at[idx].set(self)` so a written position takes the new
+        value outright (not added to the base).
         """
-        new_type = self.type.scatter(dim, idx.type)
-        if self.arr is None or idx.arr is None:
+        new_type = self.type.scatter(
+            dim, idx.type, base.type if base is not None else None,
+        )
+        if self.arr is None or idx.arr is None or (
+            base is not None and base.arr is None
+        ):
             return TypedJaxArray(None, new_type)
         idx_dim_name = dim_name(idx.type.st[0])
         axis = next(
             i for i, d in enumerate(self.type.st)
             if dim_name(d) == idx_dim_name
         )
-        out_shape = list(self.arr.shape)
-        out_shape[axis] = as_int(dim_size(dim))
-        result = jnp.zeros(tuple(out_shape), dtype=self.arr.dtype)
-        # Move the scatter axis to position 0 for `at[].add()` semantics.
+        # Move the scatter axis to position 0 for `at[].set()` semantics.
         moved = jnp.moveaxis(self.arr, axis, 0)
-        out_moved = jnp.zeros(
-            (as_int(dim_size(dim)),) + moved.shape[1:], dtype=self.arr.dtype,
-        )
-        out_moved = out_moved.at[idx.arr].add(moved)
+        if base is not None:
+            out_moved = jnp.moveaxis(base.arr, axis, 0)
+            # Writeback: written positions take the new value outright.
+            out_moved = out_moved.at[idx.arr].set(moved)
+        else:
+            out_moved = jnp.zeros(
+                (as_int(dim_size(dim)),) + moved.shape[1:],
+                dtype=self.arr.dtype,
+            )
+            # Plain scatter into zeros: accumulate (matches prior behavior).
+            out_moved = out_moved.at[idx.arr].add(moved)
         result = jnp.moveaxis(out_moved, 0, axis)
         return TypedJaxArray(result, new_type)
 

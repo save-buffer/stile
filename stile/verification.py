@@ -212,18 +212,21 @@ class NormalizedGather:
 @dataclass(frozen=True)
 class NormalizedScatter:
     """
-    `source.scatter(dim_in_dest, idx)` in normalized form. Dual of
-    `NormalizedGather`. Same opaque-leaf treatment.
+    `source.scatter(dim_in_dest, idx, base)` in normalized form. Dual of
+    `NormalizedGather`. Same opaque-leaf treatment. `base` is the value
+    at output positions the scatter didn't address (normalized `0` for
+    a plain scatter; an arbitrary expression for a writeback).
     """
     source : "NormalizedExpr"
     dim_in_dest : FullDim
     idx : "NormalizedExpr"
+    base : "NormalizedExpr"
 
     def __hash__(self) -> int:
         cached = getattr(self, '_h', None)
         if cached is not None:
             return cached
-        h = hash((self.source, self.dim_in_dest, self.idx))
+        h = hash((self.source, self.dim_in_dest, self.idx, self.base))
         object.__setattr__(self, '_h', h)
         return h
 
@@ -829,11 +832,12 @@ def _substitute_lv_in_factor(
                 dim_in_source=dim_in_source,
                 idx=substitute_lv_in_expr(idx, loop_var, value),
             )
-        case NormalizedScatter(source, dim_in_dest, idx):
+        case NormalizedScatter(source, dim_in_dest, idx, base):
             return NormalizedScatter(
                 source=substitute_lv_in_expr(source, loop_var, value),
                 dim_in_dest=dim_in_dest,
                 idx=substitute_lv_in_expr(idx, loop_var, value),
+                base=substitute_lv_in_expr(base, loop_var, value),
             )
 
 def _as_single_factor(product : "NormalizedProduct") -> "NormalizedFactor | None":
@@ -992,12 +996,13 @@ def simplify_under_active_loop_scope(expr : "NormalizedExpr") -> "NormalizedExpr
                 if new_source is source and new_idx is idx:
                     return f
                 return NormalizedGather(new_source, dim_in_source, new_idx)
-            case NormalizedScatter(source, dim_in_dest, idx):
+            case NormalizedScatter(source, dim_in_dest, idx, base):
                 new_source = walk_expr(source)
                 new_idx = walk_expr(idx)
-                if new_source is source and new_idx is idx:
+                new_base = walk_expr(base)
+                if new_source is source and new_idx is idx and new_base is base:
                     return f
-                return NormalizedScatter(new_source, dim_in_dest, new_idx)
+                return NormalizedScatter(new_source, dim_in_dest, new_idx, new_base)
             case _:
                 return f
 
@@ -2176,14 +2181,20 @@ def varies_with_dim(e : NormalizedFactor | NormalizedProduct | NormalizedExpr, d
             if dim == dim_in_source:
                 return False
             return varies_with_dim(source, dim) or varies_with_dim(idx, dim)
-        case NormalizedScatter(source, dim_in_dest, idx):
+        case NormalizedScatter(source, dim_in_dest, idx, base):
             # Dual of gather: source's idx-dim is replaced by `dim_in_dest`
             # in the output. Output varies along `dim_in_dest` (a fresh
             # dim from the scatter's perspective) and along source's
-            # other dims; idx's dim is consumed.
+            # other dims; idx's dim is consumed. The `base` fills the
+            # untouched positions and carries the full output shape, so
+            # it contributes its own dim-variance too.
             if dim == dim_in_dest:
                 return True
-            return varies_with_dim(source, dim) or varies_with_dim(idx, dim)
+            return (
+                varies_with_dim(source, dim)
+                or varies_with_dim(idx, dim)
+                or varies_with_dim(base, dim)
+            )
         case NormalizedParametricReduce(_, _, _, _, body):
             return varies_with_dim(body, dim)
         case NormalizedProduct(_, factors):
@@ -2262,11 +2273,12 @@ def strip_repeats_from_factor(factor : NormalizedFactor, dim : FullDim) -> Norma
                 dim_in_source=dim_in_source,
                 idx=strip_repeats_from_expr(idx, dim),
             ))
-        case NormalizedScatter(source, dim_in_dest, idx):
+        case NormalizedScatter(source, dim_in_dest, idx, base):
             return NormalizedExpr.of(NormalizedScatter(
                 source=strip_repeats_from_expr(source, dim),
                 dim_in_dest=dim_in_dest,
                 idx=strip_repeats_from_expr(idx, dim),
+                base=strip_repeats_from_expr(base, dim),
             ))
         case NormalizedParametricReduce(_, _, _, _, _):
             return NormalizedExpr.of(factor)
@@ -2608,12 +2620,13 @@ def _walk_expr_replacing_factors(
                 if new_source is source and new_idx is idx:
                     return f
                 return NormalizedGather(new_source, dim_in_source, new_idx)
-            case NormalizedScatter(source, dim_in_dest, idx):
+            case NormalizedScatter(source, dim_in_dest, idx, base):
                 new_source = walk_expr(source)
                 new_idx = walk_expr(idx)
-                if new_source is source and new_idx is idx:
+                new_base = walk_expr(base)
+                if new_source is source and new_idx is idx and new_base is base:
                     return f
-                return NormalizedScatter(new_source, dim_in_dest, new_idx)
+                return NormalizedScatter(new_source, dim_in_dest, new_idx, new_base)
             case NormalizedParametricReduce(loop_var, lo, hi, op, body):
                 new_body = walk_expr(body)
                 if new_body is body:
@@ -2812,12 +2825,15 @@ def normalize(expr : ExprType) -> NormalizedExpr:
                 dim_in_source=dim_in_source,
                 idx=norm_idx,
             ))
-        case Scatter(source, dim_in_dest, idx):
+        case Scatter(source, dim_in_dest, idx, base):
             dim_in_dest = dim_full_dim(dim_in_dest)
             norm_source = normalize(source)
             norm_idx = normalize(idx)
+            norm_base = normalize(base)
             # Dual round-trip: `scatter(gather(Y, dim, perm), dim, perm) = Y`
-            # when `perm` is a permutation.
+            # when `perm` is a permutation. A permutation writes every
+            # output position exactly once, so the entire `base` is
+            # overwritten — the identity holds regardless of `base`.
             inner = _as_gather_factor(norm_source)
             if (
                 inner is not None
@@ -2830,6 +2846,7 @@ def normalize(expr : ExprType) -> NormalizedExpr:
                 source=norm_source,
                 dim_in_dest=dim_in_dest,
                 idx=norm_idx,
+                base=norm_base,
             ))
 
 

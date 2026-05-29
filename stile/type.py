@@ -258,20 +258,34 @@ class Gather:
 @dataclass(frozen=True)
 class Scatter:
     """
-    `source.scatter(dim_in_dest, idx)`: dual of `Gather`. The output
-    shape replaces source's `idx`-dim with `dim_in_dest`; element
+    `source.scatter(dim_in_dest, idx, base=...)`: dual of `Gather`. The
+    output shape replaces source's `idx`-dim with `dim_in_dest`; element
     `output[..., idx[m], ...]` receives `source[..., m, ...]`. Positions
-    of the output not covered by any value of `idx` are zero. Opaque
-    to the verifier: two `Scatter`s with the same `source`,
-    `dim_in_dest`, and `idx` are equal; otherwise structurally
-    distinct.
+    of the output *not* addressed by any value of `idx` take their value
+    from `base` (same shape as the output).
 
-    Same slice-propagation story as `Gather` — the `Sliced` dim of any
-    surrounding `Reduce`/`Repeat` flows in through the type's shape.
+    `base` defaults to the constant `0.0`, recovering the original
+    "scatter into zeros" semantics — so `Y.scatter(dim, idx)` is
+    unchanged. An explicit `base` expresses a *conditional update* /
+    writeback: the output is `base` everywhere except the scattered
+    positions. This is what KV-cache writeback needs —
+
+        K_cache_out = K_proj.scatter(SeqLen, write_pos, base=K_cache_in)
+
+    means "place the freshly-projected K at the write positions; keep
+    the old cache everywhere else." (Plain `Scatter` with `base=0` would
+    zero out the rest of the cache, which is wrong.)
+
+    Opaque to the verifier: two `Scatter`s with the same `source`,
+    `dim_in_dest`, `idx`, and `base` are equal; otherwise structurally
+    distinct. Same slice-propagation story as `Gather` — the `Sliced`
+    dim of any surrounding `Reduce`/`Repeat` flows in through the
+    type's shape.
     """
     source : "ExprType"
     dim_in_dest : FullDim
     idx : "ExprType"
+    base : "ExprType" = Constant(0.0)
 
 ExprType = (
     Constant | Tensor | UnaryOp | BinaryOp | Repeat
@@ -407,12 +421,17 @@ class Type:
             self.dt,
         )
 
-    def scatter(self, dim : FullDim, idx : "Type") -> "Type":
+    def scatter(self, dim : FullDim, idx : "Type", base : "Type | None" = None) -> "Type":
         """
-        `self.scatter(dim, idx)`: dual of `gather`. `self` has `idx`'s
-        sole dim in its shape; the result replaces that dim with `dim`.
-        Element `result[..., idx[m], ...] = self[..., m, ...]`; other
-        positions of `result` are zero.
+        `self.scatter(dim, idx, base=...)`: dual of `gather`. `self` has
+        `idx`'s sole dim in its shape; the result replaces that dim with
+        `dim`. Element `result[..., idx[m], ...] = self[..., m, ...]`.
+
+        Positions of `result` not addressed by `idx` take their value
+        from `base` (which must have the result's shape). `base`
+        defaults to zero — the original scatter semantics. Pass a
+        `base` to express a writeback / conditional update (keep the
+        base everywhere the scatter didn't touch).
         """
         if len(idx.st) != 1:
             raise ValueError(
@@ -428,9 +447,18 @@ class Type:
         new_st = tuple(
             dim if dim_name(d) == dim_name(idx_dim) else d for d in self.st
         )
+        if base is not None and tuple(dim_name(d) for d in base.st) != tuple(dim_name(d) for d in new_st):
+            raise ValueError(
+                f"scatter base shape {[dim_name(d) for d in base.st]} must "
+                f"match the scattered output shape {[dim_name(d) for d in new_st]}"
+            )
+        base_et = base.et if base is not None else Constant(0.0)
         return Type(
             new_st,
-            Scatter(source=self.et, dim_in_dest=dim_full_dim(dim), idx=idx.et),
+            Scatter(
+                source=self.et, dim_in_dest=dim_full_dim(dim),
+                idx=idx.et, base=base_et,
+            ),
             self.dt,
         )
 
@@ -657,8 +685,8 @@ def substitute_tensor_in_et(
                 return Reduce(op, dim, walk(child))
             case Gather(source, dim_in_source, idx):
                 return Gather(walk(source), dim_in_source, walk(idx))
-            case Scatter(source, dim_in_dest, idx):
-                return Scatter(walk(source), dim_in_dest, walk(idx))
+            case Scatter(source, dim_in_dest, idx, base):
+                return Scatter(walk(source), dim_in_dest, walk(idx), walk(base))
             case _:
                 raise ValueError(
                     f"substitute_tensor_in_et: unhandled ExprType "
@@ -712,11 +740,12 @@ def override_dims_in_type(type : Type, *dim_override : Dim) -> Type:
                     dim_in_source=get_overridden(dim_in_source),
                     idx=recursively_replace(idx),
                 )
-            case Scatter(source, dim_in_dest, idx):
+            case Scatter(source, dim_in_dest, idx, base):
                 return Scatter(
                     source=recursively_replace(source),
                     dim_in_dest=get_overridden(dim_in_dest),
                     idx=recursively_replace(idx),
+                    base=recursively_replace(base),
                 )
             case _:
                 raise ValueError(

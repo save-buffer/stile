@@ -1,20 +1,43 @@
 - Consider adding a `Masks` class that automatically broadcasts up to the desired shape
 
-- KV-writeback / in-place update doesn't have a clean spec form yet.
-  Paged-attention and streaming-decode kernels write the new K/V at
-  a runtime-determined position into a cache tensor; semantically:
-      out[..., p] = new_value
-      out[..., q] = cache[..., q]  for all q ≠ p
-  The current `Scatter` ET is the wrong shape — it produces a tensor
-  that's zero outside the scatter's range, not "cache values
-  everywhere else." Options for the right primitive:
-    (a) `Update(cache, idx, new_value)` ET: "cache except idx position
-        is new_value." Direct match for the writeback semantics.
-    (b) Express via `where`-clause: `out = (idx == p) ? new_value : cache`,
-        but our spec parser doesn't have a value-conditional form yet.
-  Pick (a) — distinct ET node, dedicated normalization rule
-  `Update(Update(c, p, v), p, w) → Update(c, p, w)` and similar.
-  Tag for "needs spec primitive."
+- Static lint pass for common error-prone kernel patterns. Cheaper +
+  more directly useful than full AA-bound quantization analysis, and
+  more discoverable for kernel authors. Candidate patterns:
+    * Reduction without explicit `keepdims` or axis (silent broadcast
+      surprises).
+    * Pointwise op on tensors with the same shape but mismatched dim
+      names (verifier would catch this, but lint can flag before
+      verification).
+    * `tl.load` of a tile that exceeds the dim's `size` without a
+      mask — masks aren't required by stile but are usually the
+      author's intent.
+    * `exp(x)` immediately followed by `sum(...)` without a stable-
+      softmax max-subtract (overflow risk in fp16 / fp8).
+    * Accumulator declared at the same dtype as the operand (no
+      upcast) — flagged because it's almost always a bug in practice.
+    * Triton kernel body that allocates a `tl.zeros` tile of size
+      `> 4 * native_tile_size` (register-pressure warning).
+  Implementation shape: walk the typed-ET / kernel body in
+  `stile/triton/_core.py` post-verification, accumulate findings,
+  surface as a `lint(kernel_fn)` API or auto-print during `verify`.
+
+- Quantization-aware AA / first-class `quantize(x, scheme=...)` op.
+  Back-burner — see memory `project-aa-quantization`. The
+  `astype(dtype_str)` path captures IEEE rounding but not the
+  calibration-dependent error from real quantizers (per-tensor /
+  per-channel / per-tile fp8). Sensitivity-ranking is good enough for
+  now; revisit when a concrete user need surfaces.
+
+- DONE (2026-05-28): KV-writeback. Generalized `Scatter` to carry an
+  explicit `base` (the value at untouched positions; defaults to 0 =
+  old "scatter into zeros"). Writeback is `base except [dim @ idx] =
+  values` (TLA+-style surface syntax) or `scatter[dim](values, idx,
+  base)` (function form), both lowering to `Scatter(source=values,
+  dim_in_dest=dim, idx=idx, base=base)`. Verifier keeps scatter opaque;
+  base is part of its identity (writeback ≠ zero-scatter). Permutation
+  round-trip ignores base (full overwrite). See test_scatter_writeback.py.
+  NOTE: only jax backend has a runtime `.scatter()`; torch/numpy would
+  need one if a kernel test targets them.
 
 - Decoration-time coverage check via opt-in `grid=` in `@ttl.jit`.
   Today coverage tracking lives at launch time: `_Launcher.__call__`
