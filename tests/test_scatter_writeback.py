@@ -124,3 +124,77 @@ def test_writeback_permutation_round_trip_ignores_base(reset):
     perm = tjax.runtime_index("perm", N, values_in=N, permutation=True)
     round_trip = V.scatter(N, perm, base=cache).gather(N, perm)
     assert verify_exprs_equivalent(round_trip.type.et, V.type.et)
+
+
+# --- jax-style `.at[...]` accessor (friendly surface over gather/scatter)
+
+def test_at_set_matches_scatter_writeback(reset):
+    """`cache.at[N, idx].set(vals)` lowers to the same `Scatter` ET as the
+    explicit `vals.scatter(N, idx, base=cache)` writeback."""
+    M = dim("M", 8)
+    N = dim("N", 32)
+    D = dim("D", 4)
+    vals = tjax.random.normal(jax.random.PRNGKey(0), M, D, name="V")
+    cache = tjax.random.normal(jax.random.PRNGKey(1), N, D, name="C")
+    idx = tjax.runtime_index("idx", M, values_in=N)
+    via_at = cache.at[N, idx].set(vals)
+    via_scatter = vals.scatter(N, idx, base=cache)
+    assert verify_exprs_equivalent(via_at.type.et, via_scatter.type.et)
+
+
+def test_at_set_matches_except_spec(reset):
+    """`.at[N, idx].set(...)` matches the TLA+-style `except` writeback
+    spec — the clean end-to-end check that the ergonomic surface lands
+    the right ET."""
+    M = dim("M", 8)
+    N = dim("N", 32)
+    D = dim("D", 4)
+    vals = tjax.random.normal(jax.random.PRNGKey(0), M, D, name="V")
+    cache = tjax.random.normal(jax.random.PRNGKey(1), N, D, name="C")
+    idx = tjax.runtime_index("idx", M, values_in=N)
+    out = cache.at[N, idx].set(vals)
+    spec = parse_spec_into_type("C:N D except [N @ idx:M] = V:M D -> N D")
+    assert verify_exprs_equivalent(out.type.et, spec.et)
+
+
+def test_at_get_matches_gather(reset):
+    """`table.at[N, idx].get()` lowers to `table.gather(N, idx)`."""
+    M = dim("M", 8)
+    N = dim("N", 32)
+    D = dim("D", 4)
+    table = tjax.random.normal(jax.random.PRNGKey(0), N, D, name="T")
+    idx = tjax.runtime_index("idx", M, values_in=N)
+    via_at = table.at[N, idx].get()
+    via_gather = table.gather(N, idx)
+    assert verify_exprs_equivalent(via_at.type.et, via_gather.type.et)
+
+
+def test_at_defaults_to_leading_axis(reset):
+    """`base.at[idx]` (no explicit dim) indexes the leading axis, like
+    jax — `cache.at[idx].set(v)` writes along the first dim."""
+    M = dim("M", 8)
+    N = dim("N", 32)
+    D = dim("D", 4)
+    vals = tjax.random.normal(jax.random.PRNGKey(0), M, D, name="V")
+    cache = tjax.random.normal(jax.random.PRNGKey(1), N, D, name="C")
+    idx = tjax.runtime_index("idx", M, values_in=N)
+    implicit = cache.at[idx].set(vals)          # leading axis = N
+    explicit = cache.at[N, idx].set(vals)
+    assert verify_exprs_equivalent(implicit.type.et, explicit.type.et)
+
+
+def test_at_set_numerically_writes_back(reset):
+    """Runtime check: `.set` keeps the base everywhere except the written
+    positions (jax `.at[idx].set` semantics)."""
+    M = dim("M", 4)
+    N = dim("N", 16)
+    D = dim("D", 4)
+    v_arr = jax.random.normal(jax.random.PRNGKey(0), (M.size, D.size))
+    c_arr = jax.random.normal(jax.random.PRNGKey(1), (N.size, D.size))
+    pos = jnp.array([2, 5, 7, 11])
+    vals = tjax.tensor(v_arr, M, D, name="V")
+    cache = tjax.tensor(c_arr, N, D, name="C")
+    idx = tjax.runtime_index("idx", M, values_in=N, arr=pos)
+    out = cache.at[N, idx].set(vals)
+    expected = c_arr.at[pos].set(v_arr)
+    assert jnp.allclose(out.arr, expected)

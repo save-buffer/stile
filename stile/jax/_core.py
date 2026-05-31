@@ -129,6 +129,46 @@ def _resolve_to_runtime(symbolic, var_resolver):
     return result
 
 
+class _AtUpdate:
+    """The result of `base.at[dim, idx]` — a jax `.at[]`-style updater
+    that lowers to stile's verified `gather` / `scatter`. `dim` is the
+    axis being indexed; `idx` is a 1-d runtime index tensor."""
+
+    def __init__(self, base : "TypedJaxArray", dim : FullDim, idx : "TypedJaxArray"):
+        self._base = base
+        self._dim = dim
+        self._idx = idx
+
+    def get(self) -> "TypedJaxArray":
+        """`base[idx]` along `dim` — a gather."""
+        return self._base.gather(self._dim, self._idx)
+
+    def set(self, values : "TypedJaxArray") -> "TypedJaxArray":
+        """`base` with `values` written at `idx` along `dim`, the base
+        kept everywhere else — a writeback scatter (KV-cache update)."""
+        return values.scatter(self._dim, self._idx, base=self._base)
+
+    def add(self, values : "TypedJaxArray") -> "TypedJaxArray":
+        """`base` with `values` scatter-*added* at `idx` along `dim`."""
+        return self._base + values.scatter(self._dim, self._idx)
+
+
+class _AtIndexer:
+    """`base.at` — subscript with `[idx]` (indexes the leading axis, like
+    jax) or `[dim, idx]` (names the axis explicitly). Returns an
+    `_AtUpdate` carrying `.get()` / `.set(v)` / `.add(v)`."""
+
+    def __init__(self, base : "TypedJaxArray"):
+        self._base = base
+
+    def __getitem__(self, key) -> "_AtUpdate":
+        if isinstance(key, tuple):
+            dim, idx = key
+        else:
+            dim, idx = self._base.type.st[0], key
+        return _AtUpdate(self._base, dim_full_dim(dim), idx)
+
+
 class TypedJaxArray:
     def __init__(
         self, arr : jax.Array | None, type : Type,
@@ -357,6 +397,22 @@ class TypedJaxArray:
             out_moved = out_moved.at[idx.arr].add(moved)
         result = jnp.moveaxis(out_moved, 0, axis)
         return TypedJaxArray(result, new_type)
+
+    @property
+    def at(self) -> "_AtIndexer":
+        """jax-style indexed-update accessor — the friendly surface over
+        `gather` / `scatter` for jax / Pallas users:
+
+            cache.at[Seq, write_pos].set(new_kv)   # writeback (keep base)
+            table.at[N, idx].get()                 # gather  (= table[idx])
+            buf.at[N, idx].add(contributions)       # scatter-add
+
+        `base.at[idx]` indexes the leading axis (jax's default);
+        `base.at[dim, idx]` names the axis explicitly. `.set(v)` writes
+        `v` at `idx` and keeps `base` elsewhere; `.get()` reads; `.add(v)`
+        scatter-adds. (`gather` / `scatter` remain available underneath.)
+        """
+        return _AtIndexer(self)
 
     def __add__(self, other) -> "TypedJaxArray":
         return _binary_op_helper(self, other, "+")

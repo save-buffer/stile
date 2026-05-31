@@ -81,8 +81,8 @@ def test_causal_paged_flash_attention_via_invariant(reset):
         def body(k, state):
             m, l, o = state
             page_tile = page_table.slice(N_log, k * BN, (k + 1) * BN)
-            k_tile = K_pool.gather(N_phys, page_tile)
-            v_tile = V_pool.gather(N_phys, page_tile)
+            k_tile = K_pool.at[N_phys, page_tile].get()
+            v_tile = V_pool.at[N_phys, page_tile].get()
             qk_tile = tjax.einsum(
                 Q, k_tile, "qctx dhead, N_log dhead -> N_log qctx",
             )
@@ -171,8 +171,8 @@ def test_paged_flash_attention_dynamic_n_used_pages(reset):
         def body(k, state):
             m, l, o = state
             page_tile = page_table.slice(N_log, k * BN, (k + 1) * BN)
-            k_tile = K_pool.gather(N_phys, page_tile)
-            v_tile = V_pool.gather(N_phys, page_tile)
+            k_tile = K_pool.at[N_phys, page_tile].get()
+            v_tile = V_pool.at[N_phys, page_tile].get()
             qk_tile = tjax.einsum(
                 Q, k_tile, "qctx dhead, N_log dhead -> N_log qctx",
             )
@@ -260,8 +260,8 @@ def test_paged_flash_attention_via_invariant(reset):
         def body(k, state):
             m, l, o = state
             page_tile = page_table.slice(N_log, k * BN, (k + 1) * BN)
-            k_tile = K_pool.gather(N_phys, page_tile)
-            v_tile = V_pool.gather(N_phys, page_tile)
+            k_tile = K_pool.at[N_phys, page_tile].get()
+            v_tile = V_pool.at[N_phys, page_tile].get()
             qk_tile = tjax.einsum(
                 Q, k_tile, "qctx dhead, N_log dhead -> N_log qctx",
             )
