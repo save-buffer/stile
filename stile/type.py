@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Literal
 from enum import Enum
 
-from .indexing import SymbolicIndex, AffineExpr, LoopVariable, Domain, to_affine
+from .indexing import SymbolicIndex, AffineExpr, SymbolicInt, LoopVariable, Domain, to_affine
 
 g_dim_registry : dict[str, "FullDim"] = {}
 
@@ -64,6 +64,23 @@ class Sliced:
     dim : "Dim"
     start : SymbolicIndex
     end : SymbolicIndex
+
+    def __post_init__(self):
+        # Validate bounds at construction. A `Sliced` whose start/end is
+        # a foreign object (e.g. a frontend's own tracer) would otherwise
+        # sail through and only blow up much later — inside an unrelated
+        # `__eq__` deep in `type_from_binary_op` / `normalize`, where the
+        # traceback points at stile rather than the bad construction.
+        # Catch it here with a message naming the offending bound.
+        for label, bound in (("start", self.start), ("end", self.end)):
+            if not isinstance(bound, (int, AffineExpr, SymbolicInt)):
+                raise TypeError(
+                    f"Sliced {label} bound must be a SymbolicIndex "
+                    f"(int | AffineExpr | SymbolicInt); got "
+                    f"{type(bound).__name__}: {bound!r}. Translate the "
+                    f"frontend's index expression to a stile AffineExpr "
+                    f"before constructing the slice."
+                )
 
 Dim = FullDim | Sliced
 ShapeType = tuple[Dim, ...]
@@ -217,23 +234,6 @@ class Reduce:
     child : "ExprType"
 
 @dataclass(frozen=True)
-class ParametricReduce:
-    """
-    A sum/max reduction over a rolled loop: `reduce_{k in [lo, hi)} body(k)`.
-
-    `loop_var` is bound by this node — it refers to this reduction's
-    iteration index, and any `SymbolicIndex` inside `body` that mentions
-    `loop_var` picks up that binding. Emitted by `fori_loop` when its
-    `upper` bound is symbolic.
-    """
-    loop_var : LoopVariable
-    lo : SymbolicIndex
-    hi : SymbolicIndex
-    op : ReduceOpType
-    body : "ExprType"
-
-
-@dataclass(frozen=True)
 class Gather:
     """
     `source.gather(dim_in_source, idx)`: read `source` at positions
@@ -289,7 +289,7 @@ class Scatter:
 
 ExprType = (
     Constant | Tensor | UnaryOp | BinaryOp | Repeat
-    | Reduce | ParametricReduce | Gather | Scatter
+    | Reduce | Gather | Scatter
 )
 
 TagTree = ExprType | TagCond
@@ -492,22 +492,35 @@ class Type:
 def type_from_binary_op(slf : Type | float, other : Type | float, op : BinaryOpType) -> Type:
     match slf, other:
         case Type(), Type():
-            if slf.st != other.st:
+            # A scalar-shaped operand (`st == ()`) — a Constant or a
+            # fully-reduced value — broadcasts against any tensor shape.
+            # This is what lets `x * 2`, `max(x, 0)`, `relu` etc. type
+            # without the caller stamping the tensor's shape onto the
+            # scalar first.
+            if slf.st == other.st:
+                new_st = slf.st
+            elif slf.st == ():
+                new_st = other.st
+            elif other.st == ():
+                new_st = slf.st
+            else:
                 raise ValueError("Binary operations can only occur between tensors with the same shapes")
             if (
                 slf.dt is not None
-                and other.dt is not None 
+                and other.dt is not None
                 and slf.dt != other.dt
             ):
                 raise ValueError("Binary operations must occur between tensors of the same type! You may have forgotten an explicit cast.")
 
-            new_st = slf.st
             new_et = BinaryOp(
                 op=op,
                 lhs=slf.et,
                 rhs=other.et,
             )
-            return Type(new_st, new_et, slf.dt)
+            # Keep whichever operand carries a concrete dtype (the scalar
+            # side is typically dtype-less).
+            new_dt = slf.dt if slf.dt is not None else other.dt
+            return Type(new_st, new_et, new_dt)
         case Type(), x:
             new_st = slf.st
             new_et = BinaryOp(
@@ -525,7 +538,78 @@ def type_from_binary_op(slf : Type | float, other : Type | float, op : BinaryOpT
             )
             return Type(new_st, new_et, other.dt)
     assert False
-                
+
+
+def neg(x : Type) -> Type:
+    """
+    `-x`, as `0 - x`. Convenience over `type_from_binary_op(0.0, x,
+    "-")` — the scalar `0` broadcasts to `x`'s shape, so the result
+    keeps `x`'s shape and dtype. Frontends that synthesize unary negate
+    should call this rather than hand-building a shaped zero.
+    """
+    return type_from_binary_op(0.0, x, "-")
+
+
+def mask_tensor(
+    dims : "tuple[Dim, ...]",
+    domain : Domain,
+    *,
+    in_value : float = 1.0,
+    out_value : float = 0.0,
+    name : str = "_mask",
+) -> Tensor:
+    """
+    Build the canonical multiplicative-mask `Tensor` that compares equal
+    to a `where`-clause's lowering.
+
+    A spec written as `X:N where N < K` lowers to
+    `X * mask`, where `mask` is *exactly*::
+
+        Tensor(
+            dims=(N,),
+            tag=TagCond(domain={N < K}, if_true=Constant(1.0),
+                        if_false=Constant(0.0)),
+            name="_mask",
+        )
+
+    Three things have to match for a hand-built mask to canonicalize to
+    the same normalized form as the parsed `where`-clause — and none of
+    them is obvious from the outside, which is why this helper exists:
+
+      1. **`name="_mask"`.** A `Tensor`'s `name` is its leaf *identity*.
+         Two masks with identical tags but different names are distinct
+         leaves and won't compare equal. The `where`-lowering always
+         uses `"_mask"`, so a frontend's mask must too (this helper's
+         default).
+      2. **`TagCond` branch order / values.** The kept region is
+         `if_true` (default `1.0`), the masked-out region is `if_false`
+         (default `0.0`). A bias mask (additive, `-inf` outside) instead
+         uses `in_value=0.0, out_value=-inf` and is *added*, not
+         multiplied — see the softmax lowering.
+      3. **`domain`.** The predicate's `Domain` must be built with the
+         same free `LoopVariable`s (named after the dims they
+         constrain) that `parse_predicate` produces. Use the
+         `stile.indexing` constraint helpers (`lt`, `le`, `domain`,
+         `or_domains`, …) to construct it — e.g.
+         `domain({LoopVariable("N"), LoopVariable("K")},
+                 [lt(LoopVariable("N"), LoopVariable("K"))])`.
+
+    Multiply the result against the value being masked:
+    `type_from_binary_op(value, Type((dims), mask_tensor(...)), "*")`,
+    or build the `BinaryOp("*", value_et, mask)` directly.
+    """
+    full_dims = tuple(dim_full_dim(d) for d in dims)
+    return Tensor(
+        dims=full_dims,
+        tag=TagCond(
+            domain=domain,
+            if_true=Constant(in_value),
+            if_false=Constant(out_value),
+        ),
+        name=name,
+    )
+
+
 def einsum(a : Type, b : Type, einstr : str) -> Type:
     lhs, rhs = einstr.split('->')
     a_str, b_str = lhs.split(',')

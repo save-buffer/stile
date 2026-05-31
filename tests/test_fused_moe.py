@@ -12,10 +12,9 @@ import jax.numpy as jnp
 import pytest
 
 import stile.jax as tjax
-from stile import dim, reset_stile, SymbolicInt, Type
+from stile import dim, reset_stile, SymbolicInt
 from stile.indexing import to_affine
 from stile.specification import parse_spec_into_type
-from stile.type import ParametricReduce
 from stile.verification import verify_exprs_equivalent
 
 
@@ -273,87 +272,3 @@ def test_fused_moe_top_k(reset):
         "nd,nkde->nke", X.arr, W.arr[eid_2d],
     ).sum(axis=1)
     assert jnp.allclose(final.arr, expected, atol=1e-5)
-
-
-def test_fused_moe_fori_loop_scalar(reset):
-    """
-    The full fused-MoE loop, scalar accumulation. fori_loop over
-    experts, each iter slices `X_sorted` to the expert's block via
-    `block_at`, matmuls with `W[g]` (loaded once per expert), and
-    contributes its block's scalar to the running total. The
-    invariant is the parametric sum of per-block contributions for
-    experts `[0, k)`. After the loop, the result is the per-expert
-    blocked sum — same canonical form as a spec written via
-    `ParametricReduce` over the same body. The block-constant
-    rewrite stitches the inductive step together: the per-iter body
-    uses `W[g]`, the spec form uses `gather(W, eid_sorted)`, and
-    within each block they collapse to the same expression.
-    """
-    n_tokens = dim("n_tokens", 16)
-    d_in = dim("d_in", 4)
-    d_out = dim("d_out", 8)
-    n_experts = dim("n_experts", 4)
-    n_offsets = dim("n_offsets", 5)
-
-    k1, k2 = jax.random.split(jax.random.PRNGKey(0), 2)
-    X_sorted = tjax.random.normal(k1, n_tokens, d_in, name="X_sorted")
-    W = tjax.random.normal(k2, n_experts, d_in, d_out, name="W")
-
-    offsets = tjax.runtime_index("offsets", n_offsets, values_in=n_tokens)
-    eid_sorted = tjax.runtime_index(
-        "eid_sorted", n_tokens, values_in=n_experts,
-        block_sorted_paired_with="offsets",
-    )
-
-    def body(g, total):
-        X_block = X_sorted.block_at(n_tokens, offsets, g)
-        W_g = W.slice(n_experts, g, to_affine(g) + 1).sum(n_experts)
-        Y_block = tjax.einsum(
-            X_block, W_g,
-            "n_tokens d_in, d_in d_out -> n_tokens d_out",
-        )
-        return total + Y_block.sum(n_tokens).sum(d_out)
-
-    # Invariant: at step k, total = Σ_{g' ∈ [0, k)} per-block-scalar(g').
-    # Build the per-block contribution at the inner var `g_inner`, then
-    # wrap in a ParametricReduce over g_inner ∈ [0, k).
-    k_sym = SymbolicInt("k")
-    g_inner = SymbolicInt("g_inner")
-    X_block_inner = X_sorted.block_at(n_tokens, offsets, g_inner)
-    W_g_inner = W.slice(
-        n_experts, g_inner, to_affine(g_inner) + 1,
-    ).sum(n_experts)
-    Y_block_inner = tjax.einsum(
-        X_block_inner, W_g_inner,
-        "n_tokens d_in, d_in d_out -> n_tokens d_out",
-    )
-    per_block_scalar = Y_block_inner.sum(n_tokens).sum(d_out)
-
-    inv_type = Type(
-        st=(),
-        et=ParametricReduce(
-            loop_var=g_inner,
-            lo=0,
-            hi=to_affine(k_sym),
-            op="sum",
-            body=per_block_scalar.type.et,
-        ),
-        dt=None,
-    )
-
-    total = tjax.fori_loop(
-        0, n_experts.size, body,
-        init_val=0.0,
-        invariant=inv_type,
-    )
-
-    # Expected form: same ParametricReduce, evaluated at k = n_experts.
-    # Both should be the full-loop per-expert blocked sum.
-    expected_et = ParametricReduce(
-        loop_var=g_inner,
-        lo=0,
-        hi=n_experts.size,
-        op="sum",
-        body=per_block_scalar.type.et,
-    )
-    assert verify_exprs_equivalent(total.type.et, expected_et)

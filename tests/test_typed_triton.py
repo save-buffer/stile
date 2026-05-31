@@ -469,6 +469,135 @@ def test_flash_attention_causal(reset):
 
 @_REQUIRES_TRITON
 @_REQUIRES_TORCH
+def test_flash_attention_causal_tile_skip(reset):
+    """
+    Per-block *tile-skip* causal flash attention — the performant
+    pattern, and the end-to-end demo for the symbolic-subsumption fix
+    (STILE_BUGS thork #9).
+
+    The K-loop runs only to the diagonal: `ttl.range(0, pid_m + 1)`,
+    where `pid_m` is the program id along the q dimension (a per-block
+    runtime scalar). It never touches key blocks past the diagonal —
+    those are fully masked, so computing them would be wasted work.
+    This is ~2x less work than the dense causal kernel above (which
+    loops the full `nctx` and masks).
+
+    At loop exit `ki = pid_m + 1`, so the accumulator's invariant carries
+    the *walked* bound `nctx < BN*(pid_m+1)`. Matching that against the
+    clean spec `softmax[nctx where nctx <= qctx]` is exactly the #9
+    subsumption: with `BQ == BN`, every kept `nctx <= qctx < (pid_m+1)*BQ
+    = (pid_m+1)*BN`, so the walked bound is redundant and the verifier
+    drops it via `_drop_redundant_natural_bounds`' cross-variable chain.
+
+    The spec stays implementation-agnostic — plain causal softmax
+    attention, no block sizes or tiling leaked in.
+    """
+    qctx = dim("qctx", 32)
+    nctx = dim("nctx", 32)
+    dhead = dim("dhead", 16)
+    BQ = 16
+    BN = 16          # BQ == BN: the diagonal block aligns, subsumption holds
+    BD = dhead.size
+
+    qk_spec = "(Q:qctx dhead, K:nctx dhead -> qctx nctx)"
+    # Invariant predicate: walked tiles `nctx < BN*ki` AND causal `nctx <= qctx`.
+    pred = f"nctx < {BN} * ki && nctx <= qctx"
+    m_inv = f"max[nctx where {pred}]{qk_spec}"
+    l_inv = f"sum[nctx where {pred}](exp({qk_spec} - {m_inv}))"
+    o_inv = (
+        f"sum[nctx where {pred}]"
+        f"(exp({qk_spec} - {m_inv}) * V:nctx dhead)"
+    )
+
+    @ttl.jit(
+        spec=(
+            f"(softmax[nctx where nctx <= qctx]({qk_spec}), "
+            f"V:nctx dhead -> qctx dhead)"
+        ),
+        inputs={
+            "Q_ptr": "Q:qctx dhead",
+            "K_ptr": "K:nctx dhead",
+            "V_ptr": "V:nctx dhead",
+        },
+        out_shape=(qctx, dhead),
+        out_dtype=torch.float32,
+        consts={"BQ": BQ, "BN": BN, "BD": BD},
+    )
+    def attn(
+        Q_ptr, K_ptr, V_ptr, O_ptr,
+        BQ: tl.constexpr, BN: tl.constexpr, BD: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        q = ttl.load(
+            Q_ptr,
+            qctx[pid_m * BQ : (pid_m + 1) * BQ],
+            dhead[0 : BD],
+        )
+        m = ttl.full(qctx[pid_m * BQ : (pid_m + 1) * BQ], value=float("-inf"))
+        l = ttl.zeros(qctx[pid_m * BQ : (pid_m + 1) * BQ])
+        o = ttl.zeros(
+            qctx[pid_m * BQ : (pid_m + 1) * BQ],
+            dhead[0 : BD],
+        )
+        # Tile-skip: walk key blocks 0..pid_m only — stop at the diagonal.
+        for ki in ttl.range(
+            0, pid_m + 1,
+            invariant={"m": m_inv, "l": l_inv, "o": o_inv},
+        ):
+            k = ttl.load(
+                K_ptr,
+                nctx[ki * BN : (ki + 1) * BN],
+                dhead[0 : BD],
+            )
+            v = ttl.load(
+                V_ptr,
+                nctx[ki * BN : (ki + 1) * BN],
+                dhead[0 : BD],
+            )
+            qk = tl.dot(q, tl.trans(k))
+            qk = qk + ttl.mask(
+                qctx[pid_m * BQ : (pid_m + 1) * BQ],
+                nctx[ki * BN : (ki + 1) * BN],
+                predicate="nctx <= qctx",
+                on=0.0, off=float("-inf"),
+            )
+            tile_max = tl.max(qk, axis=1)
+            new_max = tl.maximum(m, tile_max)
+            logits = tl.exp(qk - new_max[:, None])
+            tile_l = tl.sum(logits, axis=1)
+            new_l = tl.exp(m - new_max) * l + tile_l
+            v_proj = tl.dot(logits, v)
+            new_o = tl.exp(m - new_max)[:, None] * o + v_proj
+            m = new_max
+            l = new_l
+            o = new_o
+        attn_out = o / l[:, None]
+        ttl.store(
+            O_ptr, attn_out,
+            qctx[pid_m * BQ : (pid_m + 1) * BQ],
+            dhead[0 : BD],
+        )
+
+    Q_arr = torch.randn(qctx.size, dhead.size, device="cuda")
+    K_arr = torch.randn(nctx.size, dhead.size, device="cuda")
+    V_arr = torch.randn(nctx.size, dhead.size, device="cuda")
+    Q = TypedTorchTensor(Q_arr, Type(st=(qctx, dhead), et=Tensor(dims=(qctx, dhead), name="Q")))
+    K = TypedTorchTensor(K_arr, Type(st=(nctx, dhead), et=Tensor(dims=(nctx, dhead), name="K")))
+    V = TypedTorchTensor(V_arr, Type(st=(nctx, dhead), et=Tensor(dims=(nctx, dhead), name="V")))
+    result = attn[(qctx.size // BQ,)](Q, K, V)
+
+    # Reference: causal-masked softmax attention (the value the tile-skip
+    # kernel must reproduce — skipping masked blocks doesn't change it).
+    qk_full = Q_arr @ K_arr.T
+    q_idx = torch.arange(qctx.size, device="cuda")[:, None]
+    k_idx = torch.arange(nctx.size, device="cuda")[None, :]
+    qk_full = qk_full.masked_fill(k_idx > q_idx, float("-inf"))
+    expected = torch.softmax(qk_full, dim=-1) @ V_arr
+    assert torch.allclose(result.tensor, expected, atol=2e-2, rtol=1e-3)
+
+
+@_REQUIRES_TRITON
+@_REQUIRES_TORCH
 def test_rope(reset):
     """
     Rotary position embedding via the gather formulation (LLaMA's

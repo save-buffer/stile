@@ -6,7 +6,7 @@ accepting rewrites that aren't algebraically valid.
 """
 import pytest
 
-from stile import dim, reset_stile
+from stile import dim, reset_stile, diff_exprs
 from stile.specification import parse_spec_into_type
 from stile.verification import verify_exprs_equivalent
 
@@ -128,3 +128,74 @@ def test_same_label_is_the_same_leaf(reset):
     a = parse_spec_into_type("x:N + x:N")
     b = parse_spec_into_type("2 * x:N")
     assert verify_exprs_equivalent(a.et, b.et)
+
+
+# --- diff_exprs: where two inequivalent ETs structurally diverge -------
+# The companion to the rejection tests above: when `verify_exprs_equivalent`
+# says False, `diff_exprs` reports the first structural divergence.
+
+def test_diff_exprs_reports_wrong_dim(reset):
+    """A transposed / wrong dim shows up as a dims-path divergence."""
+    dim("M", 8); dim("N", 4); dim("K", 6)
+    a = parse_spec_into_type("A:M N")
+    b = parse_spec_into_type("A:M K")
+    msg = diff_exprs(a.et, b.et)
+    assert msg is not None
+    assert ".dims[1]" in msg and "N" in msg and "K" in msg
+
+
+def test_diff_exprs_reports_wrong_op(reset):
+    """A `+` vs `*` divergence is reported at `.op`."""
+    dim("N", 4)
+    a = parse_spec_into_type("X:N + Y:N")
+    b = parse_spec_into_type("X:N * Y:N")
+    msg = diff_exprs(a.et, b.et)
+    assert msg == "at .op: '+' vs '*'"
+
+
+def test_diff_exprs_reports_wrong_constant(reset):
+    """A wrong scalar coefficient surfaces at the constant operand."""
+    dim("N", 4)
+    a = parse_spec_into_type("2 * X:N")
+    b = parse_spec_into_type("3 * X:N")
+    msg = diff_exprs(a.et, b.et)
+    assert msg is not None and "2.0" in msg and "3.0" in msg
+
+
+def test_diff_exprs_none_for_commutative_reorder(reset):
+    """`a * b` vs `b * a` are equivalent — no spurious diff."""
+    dim("N", 4)
+    a = parse_spec_into_type("X:N * Y:N")
+    b = parse_spec_into_type("Y:N * X:N")
+    assert diff_exprs(a.et, b.et) is None
+
+
+def test_diff_exprs_none_for_equivalent_exprs(reset):
+    """When the verifier says equivalent, diff returns None — nothing to
+    chase."""
+    dim("N", 4)
+    a = parse_spec_into_type("X:N + Y:N")
+    b = parse_spec_into_type("Y:N + X:N")
+    assert diff_exprs(a.et, b.et) is None
+
+
+def test_diff_exprs_commutative_aligns_swapped_operands(reset):
+    """With check_equivalent=False, a commutative node still aligns
+    operands order-insensitively, so the diff points at the genuinely
+    different leaf rather than a phantom lhs/rhs swap."""
+    dim("N", 4)
+    # `X * Z` vs `Z * Y`: aligned by the matching `Z`, the real diff is
+    # X vs Y, not a swap.
+    a = parse_spec_into_type("X:N * Z:N")
+    b = parse_spec_into_type("Z:N * Y:N")
+    msg = diff_exprs(a.et, b.et, check_equivalent=False)
+    assert msg is not None and "X" in msg and "Y" in msg
+
+
+def test_diff_exprs_reports_node_type_mismatch(reset):
+    """Different node kinds at the same position report a type mismatch."""
+    dim("N", 4)
+    a = parse_spec_into_type("X:N + Y:N")   # BinaryOp at root
+    b = parse_spec_into_type("X:N")         # Tensor at root
+    msg = diff_exprs(a.et, b.et, check_equivalent=False)
+    assert msg is not None and "BinaryOp" in msg and "Tensor" in msg

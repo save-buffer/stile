@@ -329,6 +329,22 @@ def _maybe_parse_label(lex : LexState) -> str | None:
 def _parse_tensor(lex : LexState) -> tuple[ShapeType, ExprType]:
     name = _maybe_parse_label(lex)
     dims = _parse_shape(lex)
+    if name is None and not dims:
+        # The leading token is a bare alpha identifier that's neither a
+        # `label:dims` tensor nor a registered dim — so `_parse_shape`
+        # consumed nothing. Emitting an anonymous rank-0 tensor here
+        # would ALSO leave the token unparsed, silently dropping the rest
+        # of the expression (`X*X:N` would collapse to a lone `_tensor_1`
+        # and the `*X:N` would vanish). Reject with a clear message.
+        j = 0
+        while j < len(lex.spec) and _is_ident_cont(lex.spec[j]):
+            j += 1
+        bad = lex.spec[:j]
+        raise ValueError(
+            f"tensor reference {bad!r} has no shape annotation; write it "
+            f"as `{bad}:<dims>` (e.g. `{bad}:N`). To square a tensor, "
+            f"spell both operands: `{bad}:N * {bad}:N`."
+        )
     full_dims = tuple(dim_full_dim(d) for d in dims)
     return dims, Tensor(full_dims, name=name)
 
@@ -382,12 +398,49 @@ def _parse_primary(lex : LexState) -> tuple[ShapeType, ExprType]:
         return st, et
     elif (nxt := lex.peek()) is not None:
         if nxt.isalpha():
+            # A name passed in `loop_vars` is an index-space variable
+            # (it's only meaningful in a `where`-clause slice bound), not
+            # a value the expression algebra can hold. If it appears in
+            # operand position — and isn't a `label:dims` tensor — that's
+            # a misparse: `_parse_tensor` would otherwise swallow it into
+            # an anonymous rank-0 tensor and silently verify the wrong
+            # expression. Raise instead.
+            j = 1
+            while j < len(lex.spec) and _is_ident_cont(lex.spec[j]):
+                j += 1
+            word = lex.spec[:j]
+            rest = lex.spec[j:].lstrip()
+            if word in _g_extra_loop_vars and not rest.startswith(":"):
+                raise ValueError(
+                    f"loop variable {word!r} used in expression position; "
+                    f"loop variables are only valid inside a `where`-clause "
+                    f"slice bound (e.g. `sum[N where N < {word}](...)`), "
+                    f"not as a value in the main expression."
+                )
             return _parse_tensor(lex)
         elif nxt.isdigit():
             return _parse_number(lex)
     raise ValueError("Parenthesized expression, tensor, or number expected")
 
 def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
+    if shaped_const := lex.maybe_consume_keyword("zeros", "full"):
+        # `zeros[M N]` / `full[M N](c)` — a shaped constant. The ET is a
+        # scalar `Constant`; the shape rides on the Type's `st`. Gives a
+        # spec string a way to name a zero / constant *tile* (e.g. a
+        # flash-attention or tiled-matmul accumulator's base case)
+        # without dropping to a hand-built `Type(st=..., et=Constant)`.
+        lex.expect('[')
+        shape = _parse_shape(lex)
+        lex.expect(']')
+        value = 0.0
+        if shaped_const == "full":
+            lex.expect('(')
+            neg_sign = lex.maybe_consume('-')
+            _, num_et = _parse_number(lex)
+            value = -num_et.value if neg_sign else num_et.value
+            lex.expect(')')
+        full_dims = tuple(dim_full_dim(d) for d in shape)
+        return full_dims, Constant(float(value))
     if reduction := lex.maybe_consume_keyword("sum", "max"):
         if lex.maybe_consume('['):
             dim = _parse_dim(lex)

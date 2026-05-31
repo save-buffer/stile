@@ -7,12 +7,14 @@ predicate into the reduce's iteration domain.
 import pytest
 
 import stile
-from stile import dim, reset_stile
+from stile import dim, reset_stile, diff_exprs
+import stile.type as st
+from stile.type import Type, Tensor, type_from_binary_op
 from stile.specification import parse_spec_into_type
 from stile.verification import (
     normalize, NormalizedReduce, NormalizedTensor, verify_exprs_equivalent,
 )
-from stile.indexing import LoopVariable
+from stile.indexing import LoopVariable, domain as mkdomain, lt
 
 
 def _single_factor(expr):
@@ -146,3 +148,38 @@ def test_where_equality_predicate(reset):
     # upper and lower bounds per variable.
     # After simplification: `N < 17` (from `N <= 16`) and `N >= 16`.
     assert len(conj) == 2
+
+
+# --- mask_tensor: the canonical mask that compares equal to `where P` --
+
+def test_mask_tensor_matches_where_clause(reset):
+    """`value * mask_tensor(dims, domain)` canonicalizes to the same form
+    as the parsed `where`-clause lowering — the recipe a frontend needs
+    to build a mask that compares equal."""
+    N = dim("N", 8)
+    spec = parse_spec_into_type("X:N where N < 4")
+    dom = mkdomain({LoopVariable("N")}, [lt(LoopVariable("N"), 4)])
+    m = st.mask_tensor((N,), dom)
+    masked = type_from_binary_op(
+        Type(st=(N,), et=Tensor((N,), name="X")),
+        Type(st=(N,), et=m),
+        "*",
+    )
+    assert diff_exprs(spec.et, masked.et) is None
+
+
+def test_mask_tensor_wrong_name_does_not_match(reset):
+    """The `name` is the mask's leaf identity: a mask built with a
+    different name is a distinct leaf and won't compare equal. This is
+    the footgun `mask_tensor`'s `name="_mask"` default protects against.
+    """
+    N = dim("N", 8)
+    spec = parse_spec_into_type("X:N where N < 4")
+    dom = mkdomain({LoopVariable("N")}, [lt(LoopVariable("N"), 4)])
+    wrong = st.mask_tensor((N,), dom, name="my_mask")
+    masked = type_from_binary_op(
+        Type(st=(N,), et=Tensor((N,), name="X")),
+        Type(st=(N,), et=wrong),
+        "*",
+    )
+    assert not verify_exprs_equivalent(spec.et, masked.et)

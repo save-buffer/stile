@@ -33,6 +33,7 @@ from ..verification import (
     verify_exprs_equivalent, normalize as _normalize, substitute_lv_in_expr,
     substitute_loop_var_in_et,
     simplify_under_active_loop_scope as _simplify_under_loop_scope,
+    tile_dim_ranges,
 )
 from ..indexing import (
     SymbolicInt, to_affine, LoopScope, runtime_scalar_names,
@@ -865,11 +866,31 @@ def _verify_stored_value(
             f"to a typed stile expression"
         )
     target_spec = spec_type
+    tile_ranges : dict = {}
     if slices is not None:
         target_spec = _restrict_spec_to_tile(
             spec_type, slices, out_shape, env, dim_atoms,
         )
-    if not verify_exprs_equivalent(val_type.et, target_spec.et):
+        # Surface each store-tile dim's symbolic range (e.g. the q-tile
+        # `qctx[pid_m*BQ:(pid_m+1)*BQ]`) so the subsumption pass can use it
+        # to discharge a per-block walked bound (thork #9). The range lives
+        # on the output slice, not in any reduce/mask domain, so it has to
+        # be threaded in explicitly.
+        for s in slices:
+            if not (isinstance(s, ast.Subscript) and isinstance(s.slice, ast.Slice)):
+                continue
+            dim_node = s.value
+            if not isinstance(dim_node, ast.Name):
+                continue
+            if dim_atoms.get(dim_node.id) is None:
+                continue
+            lo = _eval_symindex(s.slice.lower, env, dim_atoms)
+            hi = _eval_symindex(s.slice.upper, env, dim_atoms)
+            if lo is not None and hi is not None:
+                tile_ranges[dim_node.id] = (lo, hi)
+    with tile_dim_ranges(tile_ranges):
+        matches = verify_exprs_equivalent(val_type.et, target_spec.et)
+    if not matches:
         raise AssertionError(
             f"Triton kernel output does not match spec.\n"
             f"  spec: {target_spec.et}\n"

@@ -666,13 +666,10 @@ def einsum(x : TypedJaxArray, y : TypedJaxArray, einstr : str) -> TypedJaxArray:
 
 def fori_loop(lower, upper, body_fn, init_val, *, invariant=None):
     """
-    Verification-mode analogue of `jax.lax.fori_loop`. Three paths:
+    Verification-mode analogue of `jax.lax.fori_loop`. Two paths:
 
     - **Concrete `lower`/`upper`** (no invariant): fold `body_fn` over
       `range(lower, upper)` with concrete integer indices.
-
-    - **Symbolic `upper`, no invariant**: detect sum (`init=0`) or max
-      (`init=-inf`) accumulators and emit a `ParametricReduce`.
 
     - **Symbolic `upper` with invariant** (Hoare-style): the user
       declares what the loop's state should *be* at iteration `k` as
@@ -748,33 +745,20 @@ def fori_loop(lower, upper, body_fn, init_val, *, invariant=None):
             carry = body_fn(i, carry)
         return carry
 
-    # Symbolic path: dispatch on init_val's identity value.
-    #   init=0     -> sum accumulator, body(k, s) = s + f(k)
-    #   init=-inf  -> max accumulator, body(k, s) = max(s, f(k))
-    # Both are the identity element for their respective op, which lets us
-    # extract the per-iteration contribution cleanly.
-    scalar_init = _init_scalar(init_val)
-    if scalar_init == 0:
-        op = "sum"
-    elif scalar_init is not None and math.isinf(scalar_init) and scalar_init < 0:
-        op = "max"
-    else:
-        raise NotImplementedError(
-            "tjax.fori_loop symbolic path currently supports init=0 (sum "
-            "accumulator) or init=-inf (max accumulator). Other init values "
-            "need explicit op dispatch or loop-invariant annotations."
-        )
-
-    name = f"_fori_{len(_active_loop_scopes)}"
-    with LoopScope(name, lower, upper) as k:
-        first_iter = body_fn(k, init_val)
-        if op == "sum":
-            delta = first_iter - init_val
-            return init_val + _wrap_parametric_reduce(k, lower, upper, "sum", delta)
-        # max: init is -inf (identity), so first_iter = max(-inf, f(k)) = f(k)
-        # after normalization — the outer max(-inf, …) collapses away when
-        # `first_iter` is normalized inside the ParametricReduce.
-        return _wrap_parametric_reduce(k, lower, upper, "max", first_iter)
+    # Symbolic trip count with no invariant. There's no closed form to
+    # infer here — the caller must declare what the carry *is* at step
+    # `k` via `invariant=`, and the verifier discharges base case +
+    # inductive step (Hoare logic). (Tiled reductions over a single dim
+    # — e.g. flash attention — express their invariant as a plain
+    # `Reduce` over a `Sliced` dim with a symbolic bound, no special
+    # loop machinery needed.)
+    raise NotImplementedError(
+        "tjax.fori_loop with a symbolic trip count requires an "
+        "`invariant=` annotation: declare the carry's type at step `k` "
+        "(a stile spec string or Type referencing the loop variable). "
+        "The verifier proves base case + inductive step. Concrete "
+        "integer bounds unroll automatically and need no invariant."
+    )
 
 
 def _carry_has_tracer(init_val) -> bool:
@@ -1095,30 +1079,6 @@ def _normalize_state_leaf(leaf):
         f"Cannot normalize state leaf of type {type(leaf).__name__} for "
         f"invariant base-case verification."
     )
-
-
-def _init_scalar(init_val):
-    """Extract a Python scalar value from init_val if it's scalar-typed."""
-    if isinstance(init_val, (int, float)):
-        return init_val
-    if isinstance(init_val, jax.Array) and init_val.ndim == 0:
-        return init_val.item()
-    return None
-
-
-def _wrap_parametric_reduce(
-    loop_var,
-    lo : SymbolicIndex,
-    hi : SymbolicIndex,
-    op : ReduceOpType,
-    body : TypedJaxArray,
-) -> TypedJaxArray:
-    """
-    Package `body` as a `ParametricReduce` in the `ExprType` layer.
-    """
-    new_et = ParametricReduce(loop_var, lo, hi, op, body.type.et)
-    new_type = Type(body.type.st, new_et, body.type.dt)
-    return TypedJaxArray(None, new_type)
 
 
 class TypedResult(CoverageTracker):

@@ -26,12 +26,13 @@ from .specification import (
 # --- Verifier (normalizer, equality, substitution) ----------------------
 from .verification import (
     verify_exprs_equivalent, verify_types_equivalent, verify_dims_equivalent,
+    diff_exprs,
     normalize, substitute_lv_in_expr, substitute_loop_var_in_et,
     simplify_under_active_loop_scope,
     NormalizedExpr, NormalizedProduct, NormalizedTensor, NormalizedTagCond,
     NormalizedRepeat, NormalizedReduce, NormalizedSum, NormalizedMax,
     NormalizedGather, NormalizedScatter, NormalizedExp, NormalizedUnaryOp,
-    NormalizedParametricReduce, NormalizedFactor,
+    NormalizedFactor,
     make_tag_cond, make_max, make_sum, make_expr, make_reduce,
     varies_with_dim,
 )

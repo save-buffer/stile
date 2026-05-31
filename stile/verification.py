@@ -1,4 +1,5 @@
 import builtins
+import contextlib
 import functools
 import math
 from dataclasses import dataclass, field
@@ -160,31 +161,6 @@ class NormalizedReduce:
         h = hash((self.dim, self.op, self.domain, self.child))
         object.__setattr__(self, '_h', h)
         return h
-
-@dataclass(frozen=True)
-class NormalizedParametricReduce:
-    """
-    A reduction over a loop variable's iteration range: `reduce_{i in [lo, hi)} body(i)`.
-
-    This is the IR primitive for sum/max reductions induced by a rolled loop.
-    The loop variable `loop_var` is *bound* inside `body` — any `AffineExpr`
-    occurrence of it in `body` refers to this parametric reduction's index,
-    not to a free variable in the surrounding scope.
-    """
-    loop_var : LoopVariable
-    lo : SymbolicIndex
-    hi : SymbolicIndex
-    op : ReduceOpType
-    body : "NormalizedExpr"
-
-    def __hash__(self) -> int:
-        cached = getattr(self, '_h', None)
-        if cached is not None:
-            return cached
-        h = hash((self.loop_var, self.lo, self.hi, self.op, self.body))
-        object.__setattr__(self, '_h', h)
-        return h
-
 
 @dataclass(frozen=True)
 class NormalizedGather:
@@ -351,155 +327,10 @@ def _loop_var_coeff(expr : SymbolicIndex, loop_var : LoopVariable) -> int:
     return 0
 
 
-def _expr_depends_on_var(expr : "NormalizedExpr", loop_var : LoopVariable) -> bool:
-    """
-    True iff any `SymbolicIndex` bound inside `expr` (e.g. in a Reduce's
-    intervals or a Sliced dim in a Tensor) contains `loop_var`.
-    """
-    def scan_affine(x : SymbolicIndex) -> bool:
-        return any(v == loop_var for v, _ in to_affine(x).terms)
-
-    def scan_factor(f) -> bool:
-        match f:
-            case NormalizedTensor(_):
-                return False
-            case NormalizedExp(child):
-                return _expr_depends_on_var(child, loop_var)
-            case NormalizedUnaryOp(_, child):
-                return _expr_depends_on_var(child, loop_var)
-            case NormalizedSum(children):
-                return any(scan_product(c) for c in children)
-            case NormalizedMax(children):
-                return any(_expr_depends_on_var(c, loop_var) for c in children)
-            case NormalizedRepeat(_, child):
-                return _expr_depends_on_var(child, loop_var)
-            case NormalizedReduce(_, _, domain, child):
-                for conj in domain.disjuncts:
-                    for constraint in conj:
-                        if scan_affine(constraint.expr):
-                            return True
-                return _expr_depends_on_var(child, loop_var)
-            case NormalizedParametricReduce(inner_var, lo, hi, _, body):
-                if scan_affine(lo) or scan_affine(hi):
-                    return True
-                if inner_var == loop_var:
-                    # shadowed by inner binder
-                    return False
-                return _expr_depends_on_var(body, loop_var)
-            case _:
-                return False
-
-    def scan_product(p : "NormalizedProduct") -> bool:
-        return any(scan_factor(f) for f in p.factors)
-
-    return scan_product(expr.num) or scan_product(expr.den)
-
-
 def _concretize(x : SymbolicIndex) -> SymbolicIndex:
     """If `x` is an AffineExpr with no free variables, return its int value."""
     i = as_int(x)
     return i if i is not None else x
-
-
-def make_parametric_reduce(
-    loop_var : LoopVariable,
-    lo : SymbolicIndex,
-    hi : SymbolicIndex,
-    op : ReduceOpType,
-    body : "NormalizedExpr",
-) -> "NormalizedExpr":
-    """
-    Build a parametric reduction and try to collapse it into a single
-    `NormalizedReduce` when the body's structure allows. Returns a
-    `NormalizedExpr` because the collapsed form usually isn't a single
-    factor.
-
-    Recognised patterns:
-
-    1. Empty range (`lo == hi`, concrete): identity — sum returns 0, max
-       returns -inf.
-    2. Body doesn't depend on `loop_var`: degenerates to a scalar multiple
-       (sum → `(hi - lo) * body`) or to `body` itself (max).
-    3. Body is exactly a single `NormalizedReduce(dim, op, {(s(k), e(k))})`
-       whose interval is affine in `loop_var` with equal `loop_var`
-       coefficient in `s` and `e`, adjacent-tile stride (`e(k) - s(k)`
-       equals the `loop_var` coefficient), and whose inner child doesn't
-       depend on `loop_var`: collapse to `Reduce(dim, op, {(s(lo), e(hi-1))})`.
-
-    Unrecognised patterns fall back to wrapping as `NormalizedParametricReduce`.
-    """
-    lo, hi = _concretize(lo), _concretize(hi)
-    lo_i, hi_i = as_int(lo), as_int(hi)
-
-    # (1) Empty range.
-    if lo_i is not None and hi_i is not None and lo_i >= hi_i:
-        if op == "sum":
-            return NormalizedExpr.of(NormalizedProduct(const=0.0))
-        return NormalizedExpr.of(NormalizedProduct(const=float("-inf")))
-
-    # (2) Loop-invariant body.
-    if not _expr_depends_on_var(body, loop_var):
-        if op == "max":
-            return body
-        # sum of a loop-invariant `body` over `hi - lo` iterations.
-        count = to_affine(hi) - to_affine(lo)
-        count_i = as_int(count)
-        if count_i is not None:
-            scaled = NormalizedProduct(
-                body.num.const * count_i, body.num.factors,
-            )
-            return make_expr(scaled, body.den)
-        # Symbolic count: fall through to the wrapped form.
-
-    # (3) Body is a single inner Reduce over an affine-tiled interval.
-    collapsed = _try_collapse_tiled_reduce(loop_var, lo, hi, op, body)
-    if collapsed is not None:
-        return collapsed
-
-    # Fall back: wrap as-is.
-    return NormalizedExpr.of(
-        NormalizedParametricReduce(loop_var, lo, hi, op, body)
-    )
-
-
-def _try_collapse_tiled_reduce(
-    loop_var : LoopVariable,
-    lo : SymbolicIndex,
-    hi : SymbolicIndex,
-    op : ReduceOpType,
-    body : "NormalizedExpr",
-) -> "NormalizedExpr | None":
-    single = _as_single_factor(body.num)
-    if (
-        body.den.factors
-        or body.num.const != 1.0
-        or body.den.const != 1.0
-        or not isinstance(single, NormalizedReduce)
-        or single.op != op
-    ):
-        return None
-    inner_intervals = _domain_to_intervals(single.domain, single.dim)
-    if inner_intervals is None or len(inner_intervals) != 1:
-        return None
-    ((start, end),) = inner_intervals
-    start_coeff = _loop_var_coeff(start, loop_var)
-    end_coeff = _loop_var_coeff(end, loop_var)
-    if start_coeff == 0 or start_coeff != end_coeff:
-        return None
-    # Tile length must equal stride for adjacency.
-    length = to_affine(end) - to_affine(start)
-    if length != to_affine(start_coeff):
-        return None
-    # Inner child mustn't depend on the loop variable.
-    if _expr_depends_on_var(single.child, loop_var):
-        return None
-
-    # Collapse: union = [start(lo), end(hi - 1)].
-    new_start = _substitute_loop_var(start, loop_var, lo)
-    new_end = _substitute_loop_var(end, loop_var, to_affine(hi) - 1)
-    return NormalizedExpr.of(
-        make_reduce(single.dim, op, [(new_start, new_end)], single.child),
-    )
 
 
 def _substitute_in_symint(
@@ -559,9 +390,6 @@ def substitute_loop_var_in_et(
       - `Sliced` dim bounds (in `Tensor.dims`, `Repeat.dim`,
         `Reduce.dim`, and nested).
       - `TagCond` domain constraints (recursively).
-      - `ParametricReduce` `lo`/`hi` (and inner body, but not when
-        the parametric loop variable matches `loop_var`'s name —
-        that's a binder shadow).
 
     Used by `fori_loop(invariant=...)` to materialize the loop's
     return value as `invariant[k=upper]` at the AST level so
@@ -624,16 +452,6 @@ def substitute_loop_var_in_et(
                 return Repeat(sub_dim(dim), sub_et(child))
             case Reduce(op, dim, child):
                 return Reduce(op, sub_dim(dim), sub_et(child))
-            case ParametricReduce(lv, lo, hi, op, body):
-                if lv.name == loop_var.name:
-                    return et  # shadowed by inner binder
-                return ParametricReduce(
-                    lv,
-                    _substitute_loop_var(lo, loop_var, value),
-                    _substitute_loop_var(hi, loop_var, value),
-                    op,
-                    sub_et(body),
-                )
         return et
 
     return sub_et(et)
@@ -682,8 +500,7 @@ def substitute_lv_in_expr(
     """
     Replace every occurrence of `loop_var` inside `expr` with `value`,
     walking the full expression tree (Reduce intervals, nested children,
-    etc.). Shadowing by an inner `ParametricReduce` binder is respected.
-    Empty-domain reduces collapse to the op's identity (0 for sum,
+    etc.). Empty-domain reduces collapse to the op's identity (0 for sum,
     -inf for max).
     """
     return div(
@@ -748,21 +565,6 @@ def _substitute_lv_in_factor_to_expr(
             return NormalizedExpr.of(
                 NormalizedReduce(dim, op, new_domain, new_child)
             )
-        case NormalizedParametricReduce(inner_var, lo, hi, op, body):
-            # Route ParametricReduce substitution through
-            # `make_parametric_reduce`, which collapses the empty range
-            # `lo == hi` → identity. Without this, a `fori_loop`
-            # invariant of the form
-            # `ParametricReduce(g, 0, k, sum, ...)` doesn't normalize
-            # to `0` at the base case `k = 0`.
-            new_lo = _substitute_loop_var(lo, loop_var, value)
-            new_hi = _substitute_loop_var(hi, loop_var, value)
-            if inner_var == loop_var:
-                return NormalizedExpr.of(NormalizedParametricReduce(
-                    inner_var, new_lo, new_hi, op, body,
-                ))
-            new_body = substitute_lv_in_expr(body, loop_var, value)
-            return make_parametric_reduce(inner_var, new_lo, new_hi, op, new_body)
     # All other factor kinds: substitute via the factor-returning helper
     # (no identity-collapse needed) and wrap.
     return NormalizedExpr.of(_substitute_lv_in_factor(factor, loop_var, value))
@@ -818,14 +620,6 @@ def _substitute_lv_in_factor(
                 dim, op, new_domain,
                 substitute_lv_in_expr(child, loop_var, value),
             )
-        case NormalizedParametricReduce(inner_var, lo, hi, op, body):
-            new_lo = _substitute_loop_var(lo, loop_var, value)
-            new_hi = _substitute_loop_var(hi, loop_var, value)
-            if inner_var == loop_var:
-                # `loop_var` is shadowed inside body by this node's own binder.
-                return NormalizedParametricReduce(inner_var, new_lo, new_hi, op, body)
-            new_body = substitute_lv_in_expr(body, loop_var, value)
-            return NormalizedParametricReduce(inner_var, new_lo, new_hi, op, new_body)
         case NormalizedGather(source, dim_in_source, idx):
             return NormalizedGather(
                 source=substitute_lv_in_expr(source, loop_var, value),
@@ -927,16 +721,195 @@ def _max_in_loop_scope(expr : SymbolicIndex) -> int | None:
     return total
 
 
+def _min_over_ranges(expr : SymbolicIndex) -> "int | None":
+    """
+    Lower bound on `expr` over active `LoopScope` ranges plus free dim /
+    runtime-scalar natural ranges — the min-direction mirror of
+    `_max_in_loop_scope`.
+
+    Unlike that helper, only the endpoint each term actually needs is
+    required: a positive coefficient needs the variable's lower bound, a
+    negative one its upper. So a runtime scalar whose *upper* is unknown
+    (the common case for a grid/program index) still admits a minimum as
+    long as every term that references it has a non-negative coefficient
+    — exactly the situation in the causal subsumption check, where the
+    slack is `(q_blk+1)*(BN - BQ)` and only `q_blk`'s lower bound (0) is
+    needed.
+    """
+    aff = to_affine(expr)
+    total = aff.const
+    scopes_by_var = {s.var : s for s in _active_loop_scopes}
+    for v, c in aff.terms:
+        scope = scopes_by_var.get(v)
+        if scope is not None:
+            lo_int, hi_int = as_int(scope.lo), as_int(scope.hi)
+        else:
+            registered = g_dim_registry.get(v.name)
+            if registered is not None:
+                lo_int, hi_int = 0, registered.size
+            else:
+                lo_int, hi_int = 0, runtime_scalar_max(v.name)
+        if c > 0:
+            if lo_int is None:
+                return None
+            total += c * lo_int
+        elif c < 0:
+            if hi_int is None:
+                return None
+            total += c * (hi_int - 1)
+    return total
+
+
+# Active tile-dim restrictions: a stack of `{dim_name: (lo, hi)}` where
+# `lo`/`hi` are symbolic (exclusive `hi`, slice convention). Pushed
+# during per-tile store verification so the subsumption pass can use a
+# dim's *tile-restricted* range — e.g. `qctx ∈ [pid_m*BQ, (pid_m+1)*BQ)`
+# in causal flash — which lives on the output slice, not in any reduce
+# or mask domain. Empty by default, so every other verification site is
+# unaffected.
+_active_tile_dim_ranges : "list[dict]" = []
+
+
+@contextlib.contextmanager
+def tile_dim_ranges(ranges : dict):
+    """Push `{dim_name: (lo, hi)}` tile restrictions for the duration of
+    a verification (both sides of the comparison see them). Used by the
+    typed-Triton store check to surface the q-tile's range to the
+    symbolic-subsumption pass."""
+    _active_tile_dim_ranges.append(dict(ranges))
+    try:
+        yield
+    finally:
+        _active_tile_dim_ranges.pop()
+
+
+def _tile_dim_upper_inclusive(name : str) -> "SymbolicIndex | None":
+    """Inclusive symbolic upper bound for a tile-restricted dim (`hi - 1`
+    of its `[lo, hi)` slice), or None when the dim isn't restricted."""
+    for frame in reversed(_active_tile_dim_ranges):
+        if name in frame:
+            _, hi = frame[name]
+            return to_affine(hi) - 1
+    return None
+
+
+def _var_upper_inclusive(qvar, constraints) -> "SymbolicIndex | None":
+    """An inclusive upper bound `qvar <= R` (symbolic), drawn from the
+    conjunction (a `coeff(qvar) == -1` constraint) or, failing that, the
+    active tile-dim restriction. None if neither bounds `qvar` above."""
+    for c in constraints:
+        if _loop_var_coeff(c.expr, qvar) == -1:
+            return c.expr + to_affine(qvar)  # residue: qvar <= residue
+    return _tile_dim_upper_inclusive(qvar.name)
+
+
+def _drop_subsumed_symbolic_uppers(constraints : list, candidate_vars) -> list:
+    """
+    Drop a *symbolic* upper bound `V <= R_U` on any candidate variable V
+    when a cross-variable upper `V <= Q` (a single other variable) chains
+    through Q's own upper `Q <= R_Q` — from the conjunction or the active
+    tile-dim range — to prove `R_Q <= R_U` everywhere. That gives
+    `V <= Q <= R_Q <= R_U`, so `V <= R_U` is implied and removable.
+
+    Conservative + sound: only drops on a *proved* `min(R_U - R_Q) >= 0`
+    (`_min_over_ranges`), so a genuinely-active bound is never removed —
+    when the slack can go negative (e.g. BQ > BN in causal flash) the
+    bound is kept. This is the engine behind thork #9: the tile-skip
+    walked bound `nctx < BN*(pid_m+1)` is dropped via the causal
+    `nctx <= qctx` and qctx's q-tile range `qctx < (pid_m+1)*BQ`.
+    """
+    constraints = list(constraints)
+    for V in candidate_vars:
+        idx_uppers = [
+            (c.expr + to_affine(V), c)
+            for c in constraints
+            if _loop_var_coeff(c.expr, V) == -1
+        ]
+        for residue_U, cU in idx_uppers:
+            if not to_affine(residue_U).terms:
+                continue  # constant upper — handled by the natural-bound pass
+            for residue_E, cE in idx_uppers:
+                if cE is cU:
+                    continue
+                e_aff = to_affine(residue_E)
+                # Cross-variable bound `V <= Q` (single var, coeff 1, no const).
+                if e_aff.const != 0 or len(e_aff.terms) != 1:
+                    continue
+                (qvar, qcoeff), = e_aff.terms
+                if qcoeff != 1:
+                    continue
+                r_q = _var_upper_inclusive(qvar, constraints)
+                if r_q is None:
+                    continue
+                slack = _min_over_ranges(to_affine(residue_U) - r_q)
+                if slack is not None and slack >= 0:
+                    if cU in constraints:
+                        constraints.remove(cU)
+                    break
+    return constraints
+
+
+def _domain_vars_from_disjuncts(disjuncts) -> frozenset:
+    """The variables actually referenced by a set of disjuncts. After
+    dropping a constraint, the `Domain.variables` set must be recomputed
+    from what's left — otherwise a variable that only appeared in the
+    dropped constraint (e.g. `pid_m` in a discharged walked bound)
+    lingers in `variables` and breaks `Domain` equality against the
+    spec, even though the live constraints already match."""
+    return frozenset(
+        v for conj in disjuncts for c in conj for v, _ in to_affine(c.expr).terms
+    )
+
+
+def _simplify_mask_domain(domain : Domain) -> Domain:
+    """Drop subsumed symbolic upper bounds from a mask (`TagCond`)
+    predicate domain — the mask-domain counterpart of the reduce-domain
+    `_drop_redundant_natural_bounds`. Tries every variable in the
+    conjunction as the candidate whose upper might be redundant."""
+    new_disjuncts = set()
+    changed = False
+    for conj in domain.disjuncts:
+        candidate_vars = {
+            v for c in conj for v, _ in to_affine(c.expr).terms
+        }
+        kept = _drop_subsumed_symbolic_uppers(list(conj), candidate_vars)
+        if len(kept) != len(conj):
+            changed = True
+        new_disjuncts.add(frozenset(kept))
+    new_disjuncts = frozenset(new_disjuncts)
+    variables = (
+        _domain_vars_from_disjuncts(new_disjuncts) if changed
+        else domain.variables
+    )
+    return Domain(variables, new_disjuncts)
+
+
+def _simplify_tag_domains(tag, walk_expr):
+    """Recursively simplify mask domains in a `NormalizedTagTree`: drop
+    subsumed bounds in each `NormalizedTagCond.domain` and re-walk leaf
+    expressions (which may themselves carry reduces / nested masks)."""
+    if isinstance(tag, NormalizedTagCond):
+        new_domain = _simplify_mask_domain(tag.domain)
+        nt = _simplify_tag_domains(tag.if_true, walk_expr)
+        nf = _simplify_tag_domains(tag.if_false, walk_expr)
+        if new_domain == tag.domain and nt is tag.if_true and nf is tag.if_false:
+            return tag
+        return NormalizedTagCond(new_domain, nt, nf)
+    # Leaf branch: a NormalizedExpr — recurse so nested reduces/masks simplify.
+    return walk_expr(tag)
+
+
 def simplify_under_active_loop_scope(expr : "NormalizedExpr") -> "NormalizedExpr":
     """
     Re-walk `expr` and drop redundant natural bounds from every
-    `NormalizedReduce`'s domain, using the currently-active loop scopes
-    to prove subsumption. Used by `_fori_loop_with_invariant` to compare
-    a body's output against `invariant[k+1]` under the loop scope's
-    bounds; without this step the unmerged invariant form keeps its
-    natural `n < dim.size` constraint, while the merged body output (its
-    interval already supplies a tighter loop-var bound) doesn't, so they
-    canonicalize differently.
+    `NormalizedReduce`'s domain (and subsumed symbolic uppers from every
+    mask `TagCond` domain), using the currently-active loop scopes and
+    tile-dim restrictions to prove subsumption. Used by
+    `_fori_loop_with_invariant` to compare a body's output against
+    `invariant[k+1]` under the loop scope's bounds; without this step the
+    unmerged invariant form keeps its natural `n < dim.size` constraint,
+    while the merged body output (its interval already supplies a tighter
+    loop-var bound) doesn't, so they canonicalize differently.
     """
     def walk_expr(e : NormalizedExpr) -> NormalizedExpr:
         new_num = walk_product(e.num)
@@ -985,11 +958,6 @@ def simplify_under_active_loop_scope(expr : "NormalizedExpr") -> "NormalizedExpr
             case NormalizedRepeat(dim, child):
                 new_child = walk_expr(child)
                 return f if new_child is child else NormalizedRepeat(dim, new_child)
-            case NormalizedParametricReduce(loop_var, lo, hi, op, body):
-                new_body = walk_expr(body)
-                return f if new_body is body else NormalizedParametricReduce(
-                    loop_var, lo, hi, op, new_body,
-                )
             case NormalizedGather(source, dim_in_source, idx):
                 new_source = walk_expr(source)
                 new_idx = walk_expr(idx)
@@ -1003,6 +971,11 @@ def simplify_under_active_loop_scope(expr : "NormalizedExpr") -> "NormalizedExpr
                 if new_source is source and new_idx is idx and new_base is base:
                     return f
                 return NormalizedScatter(new_source, dim_in_dest, new_idx, new_base)
+            case NormalizedTensor(dims, tag, name) if tag is not None:
+                new_tag = _simplify_tag_domains(tag, walk_expr)
+                if new_tag is tag:
+                    return f
+                return NormalizedTensor(dims, new_tag, name)
             case _:
                 return f
 
@@ -1062,8 +1035,23 @@ def _drop_redundant_natural_bounds(
                     if const_c in constraints:
                         constraints.remove(const_c)
                     break
+
+        # Symbolic upper subsumption (one-hop cross-variable chain) on the
+        # reduce index — drops e.g. the tile-skip causal walked bound
+        # `n < BN*(pid_m+1)` when `n <= q` plus q's range proves it
+        # redundant. Shared with the mask-domain simplifier. See
+        # `_drop_subsumed_symbolic_uppers`.
+        constraints = _drop_subsumed_symbolic_uppers(constraints, [index])
+
         new_disjuncts.add(frozenset(constraints))
-    return Domain(domain.variables, frozenset(new_disjuncts))
+    new_disjuncts = frozenset(new_disjuncts)
+    # Recompute the variable set from what survived — a bound that was the
+    # sole mention of a variable (e.g. the discharged walked bound's
+    # `pid_m`) must not linger in `Domain.variables`, or equality against
+    # the spec fails despite matching constraints.
+    new_vars = _domain_vars_from_disjuncts(new_disjuncts)
+    variables = domain.variables if new_vars == domain.variables else new_vars
+    return Domain(variables, new_disjuncts)
 
 
 def _split_reduce_domain(
@@ -1274,58 +1262,6 @@ def _merge_sum_reduces(terms : list["NormalizedProduct"]) -> list["NormalizedPro
 def _is_pure_const(expr : "NormalizedExpr") -> bool:
     return not expr.num.factors and not expr.den.factors
 
-def _pure_parametric_factor(c : "NormalizedExpr", op : ReduceOpType):
-    """
-    If `c` is exactly a wrapped `NormalizedParametricReduce` with the given
-    `op` (const=1, single factor with count 1, empty denominator), return
-    the parametric factor. Else None.
-    """
-    if c.den.factors or c.num.const != 1.0 or c.den.const != 1.0:
-        return None
-    f = _as_single_factor(c.num)
-    if isinstance(f, NormalizedParametricReduce) and f.op == op:
-        return f
-    return None
-
-
-def _absorb_max_boundaries(children : list["NormalizedExpr"]) -> list["NormalizedExpr"]:
-    """
-    `max(ParametricMax(k in [lo, hi), f(k)), f(hi))` → `ParametricMax(k in [lo, hi+1), f(k))`.
-    And symmetrically at the lower bound.
-    """
-    parametrics, others = [], []
-    for c in children:
-        (parametrics if _pure_parametric_factor(c, "max") else others).append(c)
-    if not parametrics:
-        return children
-
-    result : list[NormalizedExpr] = []
-    for p in parametrics:
-        pf = _pure_parametric_factor(p, "max")
-        loop_var, lo, hi, body = pf.loop_var, pf.lo, pf.hi, pf.body
-        changed = True
-        while changed and others:
-            changed = False
-            expected_hi = substitute_lv_in_expr(body, loop_var, hi)
-            for i, sib in enumerate(others):
-                if sib == expected_hi:
-                    hi = to_affine(hi) + 1
-                    others.pop(i)
-                    changed = True
-                    break
-            if changed:
-                continue
-            expected_lo = substitute_lv_in_expr(body, loop_var, to_affine(lo) - 1)
-            for i, sib in enumerate(others):
-                if sib == expected_lo:
-                    lo = to_affine(lo) - 1
-                    others.pop(i)
-                    changed = True
-                    break
-        result.append(make_parametric_reduce(loop_var, lo, hi, "max", body))
-    return others + result
-
-
 def _common_positive_scalar(children) -> "float | None":
     """
     If every child has form `c * single_factor` (`num.const = c`, exactly
@@ -1444,8 +1380,6 @@ def make_max(children) -> "NormalizedExpr":
         merged = _rebuild_reduce_with_extras(d, "max", intervals, extras, child)
         others.append(NormalizedExpr.of(merged))
 
-    others = _absorb_max_boundaries(others)
-
     unique = frozenset(others)
     if not unique:
         return NormalizedExpr.of(NormalizedProduct(const=float("-inf")))
@@ -1453,70 +1387,12 @@ def make_max(children) -> "NormalizedExpr":
         return next(iter(unique))
     return NormalizedExpr.of(NormalizedMax(unique))
 
-def _absorb_sum_boundaries(terms : list["NormalizedProduct"]) -> list["NormalizedProduct"]:
-    """
-    `ParametricSum(k in [lo, hi), f(k)) + f(hi)` → `ParametricSum(k in [lo, hi+1), f(k))`.
-    And symmetrically at the lower bound.
-    """
-    parametrics_and_others : list[tuple[bool, NormalizedProduct]] = []
-    for t in terms:
-        wrapped = NormalizedExpr.of(NormalizedProduct(const=1.0, factors=t.factors))
-        pf = _pure_parametric_factor(wrapped, "sum") if t.const == 1.0 else None
-        parametrics_and_others.append((pf is not None, t))
-
-    parametrics = [t for is_p, t in parametrics_and_others if is_p]
-    others = [t for is_p, t in parametrics_and_others if not is_p]
-    if not parametrics:
-        return terms
-
-    result : list[NormalizedProduct] = []
-    for p in parametrics:
-        wrapped = NormalizedExpr.of(NormalizedProduct(const=1.0, factors=p.factors))
-        pf = _pure_parametric_factor(wrapped, "sum")
-        loop_var, lo, hi, body = pf.loop_var, pf.lo, pf.hi, pf.body
-        changed = True
-        while changed and others:
-            changed = False
-            expected_hi = substitute_lv_in_expr(body, loop_var, hi)
-            for i, sib in enumerate(others):
-                if sib.const == 1.0:
-                    sib_expr = NormalizedExpr.of(NormalizedProduct(1.0, sib.factors))
-                    if sib_expr == expected_hi:
-                        hi = to_affine(hi) + 1
-                        others.pop(i)
-                        changed = True
-                        break
-            if changed:
-                continue
-            expected_lo = substitute_lv_in_expr(body, loop_var, to_affine(lo) - 1)
-            for i, sib in enumerate(others):
-                if sib.const == 1.0:
-                    sib_expr = NormalizedExpr.of(NormalizedProduct(1.0, sib.factors))
-                    if sib_expr == expected_lo:
-                        lo = to_affine(lo) - 1
-                        others.pop(i)
-                        changed = True
-                        break
-        # Rebuild into a NormalizedProduct (wrapping the possibly-collapsed
-        # parametric-reduce result).
-        param_expr = make_parametric_reduce(loop_var, lo, hi, "sum", body)
-        # Fold the expr back into a product term; assumes param_expr is a
-        # singleton-factor expression (true for collapsed-Reduce or parametric).
-        if param_expr.den.factors or param_expr.den.const != 1.0:
-            # Can't cleanly express a fractional result as a sum term; skip absorption.
-            result.append(p)
-            continue
-        result.append(
-            NormalizedProduct(param_expr.num.const, param_expr.num.factors)
-        )
-    return others + result
-
 
 def make_sum(terms) -> "NormalizedProduct":
     """Build a canonical sum-of-products, returned as a NormalizedProduct.
     Flattens nested NormalizedSums, drops zero terms, combines like terms,
-    merges disjoint sum-Reduce intervals, absorbs boundary terms into
-    ParametricSum, extracts common factors, and collapses singletons.
+    merges disjoint sum-Reduce intervals, extracts common factors, and
+    collapses singletons.
     """
     flat = _flatten_sum_terms(terms)
     flat = [t for t in flat if t.const != 0.0]
@@ -1528,7 +1404,6 @@ def make_sum(terms) -> "NormalizedProduct":
 
     flat = _pull_common_outer_reduce(flat)
     flat = _merge_sum_reduces(flat)
-    flat = _absorb_sum_boundaries(flat)
 
     by_factors : dict[FrozenCounter, float] = {}
     for t in flat:
@@ -1562,7 +1437,7 @@ def make_sum(terms) -> "NormalizedProduct":
         ]),
     )
 
-NormalizedFactor = NormalizedTensor | NormalizedExp | NormalizedUnaryOp | NormalizedSum | NormalizedMax | NormalizedRepeat | NormalizedReduce | NormalizedParametricReduce | NormalizedGather | NormalizedScatter
+NormalizedFactor = NormalizedTensor | NormalizedExp | NormalizedUnaryOp | NormalizedSum | NormalizedMax | NormalizedRepeat | NormalizedReduce | NormalizedGather | NormalizedScatter
 # NormalizedTagTree is defined after NormalizedExpr is declared (below).
 
 @dataclass(frozen=True)
@@ -2195,8 +2070,6 @@ def varies_with_dim(e : NormalizedFactor | NormalizedProduct | NormalizedExpr, d
                 or varies_with_dim(idx, dim)
                 or varies_with_dim(base, dim)
             )
-        case NormalizedParametricReduce(_, _, _, _, body):
-            return varies_with_dim(body, dim)
         case NormalizedProduct(_, factors):
             return any(varies_with_dim(f, dim) for f in factors)
         case NormalizedExpr(num, den):
@@ -2280,8 +2153,6 @@ def strip_repeats_from_factor(factor : NormalizedFactor, dim : FullDim) -> Norma
                 idx=strip_repeats_from_expr(idx, dim),
                 base=strip_repeats_from_expr(base, dim),
             ))
-        case NormalizedParametricReduce(_, _, _, _, _):
-            return NormalizedExpr.of(factor)
 
 def _strip_product_keeping_product(product : NormalizedProduct, dim : FullDim) -> NormalizedProduct:
     """Shallow strip that preserves the NormalizedProduct type. Used for sum-children,
@@ -2627,11 +2498,6 @@ def _walk_expr_replacing_factors(
                 if new_source is source and new_idx is idx and new_base is base:
                     return f
                 return NormalizedScatter(new_source, dim_in_dest, new_idx, new_base)
-            case NormalizedParametricReduce(loop_var, lo, hi, op, body):
-                new_body = walk_expr(body)
-                if new_body is body:
-                    return f
-                return NormalizedParametricReduce(loop_var, lo, hi, op, new_body)
             case _:
                 return f
 
@@ -2774,8 +2640,6 @@ def normalize(expr : ExprType) -> NormalizedExpr:
                 interval=(dim_start(dim), dim_end(dim)),
                 child=normalized_child,
             )
-        case ParametricReduce(loop_var, lo, hi, op, body):
-            return make_parametric_reduce(loop_var, lo, hi, op, normalize(body))
         case Gather(source, dim_in_source, idx):
             # Slice info on `dim_in_source` is structural noise — the
             # gather itself reads opaquely along the named axis, and any
@@ -2863,6 +2727,155 @@ def verify_exprs_equivalent(x : ExprType, y : ExprType) -> bool:
         simplify_under_active_loop_scope(normalize(x))
         == simplify_under_active_loop_scope(normalize(y))
     )
+
+_COMMUTATIVE_BINOPS = {"+", "*", "max"}
+
+
+def diff_exprs(a : ExprType, b : ExprType, *, check_equivalent : bool = True) -> "str | None":
+    """
+    Human-readable first structural divergence between two `ExprType`s,
+    or `None` when there's nothing useful to report.
+
+    Motivation: `verify_exprs_equivalent` only returns a bool. When it's
+    `False`, you're left diffing two large `ExprType` printouts by eye.
+    `diff_exprs` walks the two ASTs in parallel and returns the first
+    field-level mismatch with a path, e.g.
+
+        at .lhs.dims[1]: FullDim(name='M', size=8) vs FullDim(name='N', size=4)
+        at .op: '+' vs '*'
+        at .num.factors: 2.0 vs 3.0
+
+    By default (`check_equivalent=True`) it first runs the verifier: if
+    the two exprs ARE equivalent (commutativity, tile-merge, mask-fold,
+    …), it returns `None` — there's no real bug to chase. Only genuinely
+    inequivalent exprs get a structural diff. Pass
+    `check_equivalent=False` to always diff the raw ASTs (e.g. to see how
+    two equivalent-but-differently-spelled forms line up).
+
+    Commutative binary ops (`+`, `*`, `max`) are matched order-
+    insensitively, so `a*b` vs `b*a` doesn't report a spurious `.lhs`/
+    `.rhs` swap. The diff is structural over the *raw* ASTs — it points
+    at the source you wrote, not the normalized IR.
+    """
+    if check_equivalent and verify_exprs_equivalent(a, b):
+        return None
+    return _diff_node(a, b, "")
+
+
+def _fmt(x) -> str:
+    """Concise one-line rendering of a leaf for a diff message."""
+    return repr(x)
+
+
+def _diff_node(a, b, path : str) -> "str | None":
+    here = path or "<root>"
+    if type(a) is not type(b):
+        return f"at {here}: {type(a).__name__} vs {type(b).__name__}"
+
+    match a:
+        case Constant():
+            if a.value != b.value:
+                return f"at {path}.value: {_fmt(a.value)} vs {_fmt(b.value)}"
+            return None
+        case Tensor():
+            if a.name != b.name:
+                return f"at {path}.name: {_fmt(a.name)} vs {_fmt(b.name)}"
+            d = _diff_dims(a.dims, b.dims, path)
+            if d:
+                return d
+            return _diff_tag(a.tag, b.tag, f"{path}.tag")
+        case UnaryOp():
+            if a.op != b.op:
+                return f"at {path}.op: {_fmt(a.op)} vs {_fmt(b.op)}"
+            return _diff_node(a.child, b.child, f"{path}.child")
+        case BinaryOp():
+            if a.op != b.op:
+                return f"at {path}.op: {_fmt(a.op)} vs {_fmt(b.op)}"
+            # Commutative ops: pick the operand pairing with more exact
+            # matches so `a*b` vs `b*a` aligns cleanly.
+            if a.op in _COMMUTATIVE_BINOPS:
+                straight = (a.lhs == b.lhs) + (a.rhs == b.rhs)
+                swapped = (a.lhs == b.rhs) + (a.rhs == b.lhs)
+                if swapped > straight:
+                    return (
+                        _diff_node(a.lhs, b.rhs, f"{path}.lhs~rhs")
+                        or _diff_node(a.rhs, b.lhs, f"{path}.rhs~lhs")
+                    )
+            return (
+                _diff_node(a.lhs, b.lhs, f"{path}.lhs")
+                or _diff_node(a.rhs, b.rhs, f"{path}.rhs")
+            )
+        case Repeat():
+            d = _diff_one_dim(a.dim, b.dim, f"{path}.dim")
+            if d:
+                return d
+            return _diff_node(a.child, b.child, f"{path}.child")
+        case Reduce():
+            if a.op != b.op:
+                return f"at {path}.op: {_fmt(a.op)} vs {_fmt(b.op)}"
+            d = _diff_one_dim(a.dim, b.dim, f"{path}.dim")
+            if d:
+                return d
+            return _diff_node(a.child, b.child, f"{path}.child")
+        case Gather():
+            d = _diff_one_dim(a.dim_in_source, b.dim_in_source, f"{path}.dim_in_source")
+            if d:
+                return d
+            return (
+                _diff_node(a.source, b.source, f"{path}.source")
+                or _diff_node(a.idx, b.idx, f"{path}.idx")
+            )
+        case Scatter():
+            d = _diff_one_dim(a.dim_in_dest, b.dim_in_dest, f"{path}.dim_in_dest")
+            if d:
+                return d
+            return (
+                _diff_node(a.source, b.source, f"{path}.source")
+                or _diff_node(a.idx, b.idx, f"{path}.idx")
+                or _diff_node(a.base, b.base, f"{path}.base")
+            )
+    # Unknown / leaf: fall back to equality.
+    if a != b:
+        return f"at {here}: {_fmt(a)} vs {_fmt(b)}"
+    return None
+
+
+def _diff_dims(a_dims, b_dims, path : str) -> "str | None":
+    if len(a_dims) != len(b_dims):
+        return (
+            f"at {path}.dims: rank {len(a_dims)} vs {len(b_dims)} "
+            f"({_fmt(a_dims)} vs {_fmt(b_dims)})"
+        )
+    for i, (da, db) in enumerate(zip(a_dims, b_dims)):
+        d = _diff_one_dim(da, db, f"{path}.dims[{i}]")
+        if d:
+            return d
+    return None
+
+
+def _diff_one_dim(da, db, path : str) -> "str | None":
+    if da != db:
+        return f"at {path}: {_fmt(da)} vs {_fmt(db)}"
+    return None
+
+
+def _diff_tag(ta, tb, path : str) -> "str | None":
+    if ta is None and tb is None:
+        return None
+    if (ta is None) != (tb is None):
+        return f"at {path}: {'tagged' if ta is not None else 'untagged'} vs {'tagged' if tb is not None else 'untagged'}"
+    if isinstance(ta, TagCond) and isinstance(tb, TagCond):
+        if ta.domain != tb.domain:
+            return f"at {path}.domain: predicates differ ({_fmt(ta.domain)} vs {_fmt(tb.domain)})"
+        return (
+            _diff_tag(ta.if_true, tb.if_true, f"{path}.if_true")
+            or _diff_tag(ta.if_false, tb.if_false, f"{path}.if_false")
+        )
+    if isinstance(ta, TagCond) != isinstance(tb, TagCond):
+        return f"at {path}: {type(ta).__name__} vs {type(tb).__name__}"
+    # Both are ExprType leaves of the tag tree.
+    return _diff_node(ta, tb, path)
+
 
 def verify_dims_equivalent(x : ShapeType, y : ShapeType) -> bool:
     if len(x) != len(y):

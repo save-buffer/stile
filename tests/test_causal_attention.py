@@ -24,6 +24,14 @@ import pytest
 
 import stile.jax as tjax
 from stile import reset_stile, dim
+from stile.type import FullDim
+from stile.indexing import (
+    Domain, AffineConstraint, LoopVariable, runtime_scalar, to_affine,
+    ge, le, lt, domain as mkdomain,
+)
+from stile.verification import (
+    _drop_redundant_natural_bounds, _simplify_mask_domain, tile_dim_ranges,
+)
 
 
 def _softmax_jnp(x, axis=-1):
@@ -208,3 +216,96 @@ def test_causal_attention_tile_walking_full(reset):
     n_tiles = qctx.size // qctx_tile_size
     assert tiles_visited == n_tiles * (n_tiles + 1) // 2
     assert tiles_skipped == n_tiles * (n_tiles - 1) // 2
+
+
+# --- Symbolic per-block causal subsumption (the tile-skip story) -------
+# The verifier-side machinery behind tile-skip causal flash: a per-block
+# walked reduce bound `N < (q_blk+1)*BN` is dropped when the causal
+# `N <= Q` plus the q-block range `Q < (q_blk+1)*BQ` (BQ <= BN) proves it
+# redundant. The end-to-end Triton demo lives in test_typed_triton.py
+# (Spark-only); these pin the domain-level logic locally.
+
+def _causal_domains(BN, BQ, *, nctx=256, qblk_max=4):
+    """Build the (walked, full) reduce domains for per-block causal
+    flash: both share the causal `N <= Q` mask and the q-block range
+    `q_blk*BQ <= Q < (q_blk+1)*BQ`, differing only in the reduce's upper
+    bound on N — walked stops at the diagonal `(q_blk+1)*BN`, full runs
+    the natural `nctx`."""
+    dim("N", nctx); dim("Q", nctx)
+    N = LoopVariable("N"); Q = LoopVariable("Q")
+    qblk = runtime_scalar("q_blk", max_value=qblk_max)
+    qrange = [
+        le(to_affine(qblk) * BQ, Q),
+        lt(Q, to_affine(qblk) * BQ + BQ),
+    ]
+    walked = mkdomain(
+        {N, Q, qblk},
+        [ge(N, 0), le(N, Q), lt(N, to_affine(qblk) * BN + BN)] + qrange,
+    )
+    full = mkdomain(
+        {N, Q, qblk},
+        [ge(N, 0), le(N, Q), lt(N, nctx)] + qrange,
+    )
+    return walked, full
+
+
+def test_causal_subsumption_walked_matches_full_when_bq_eq_bn(reset):
+    """BQ == BN: the walked symbolic bound `N < (q_blk+1)*BN` is
+    redundant (every kept N <= Q < (q_blk+1)*BQ = (q_blk+1)*BN), so the
+    walked and full reduce domains canonicalize to the same thing."""
+    walked, full = _causal_domains(64, 64)
+    Nfd = FullDim("N", 256)
+    assert _drop_redundant_natural_bounds(walked, Nfd) == \
+           _drop_redundant_natural_bounds(full, Nfd)
+
+
+def test_causal_subsumption_walked_matches_full_when_bq_lt_bn(reset):
+    """BQ < BN: still redundant (the slack (q_blk+1)*(BN-BQ) is >= 0)."""
+    walked, full = _causal_domains(128, 64, qblk_max=2)
+    Nfd = FullDim("N", 256)
+    assert _drop_redundant_natural_bounds(walked, Nfd) == \
+           _drop_redundant_natural_bounds(full, Nfd)
+
+
+def test_causal_subsumption_does_not_drop_when_bq_gt_bn(reset):
+    """SOUNDNESS GUARD: BQ > BN means the walked bound is NOT redundant
+    (Q can exceed (q_blk+1)*BN), so it must be retained. Dropping it
+    would make the verifier accept a kernel that under-summed."""
+    walked, _ = _causal_domains(64, 128, qblk_max=2)
+    Nfd = FullDim("N", 256)
+    dropped = _drop_redundant_natural_bounds(walked, Nfd)
+    # The symbolic walked upper survives — domain keeps all 5 constraints.
+    assert [len(c) for c in dropped.disjuncts] == [5]
+
+
+def test_mask_domain_subsumption_with_tile_range(reset):
+    """The same subsumption, but in a mask (TagCond) domain with qctx's
+    q-tile range supplied via the `tile_dim_ranges` context (as the
+    typed-Triton store check does). The walked bound drops, and the
+    now-absent `pid` is recomputed out of `Domain.variables`, so the
+    result equals the clean `{nctx <= qctx}` mask the spec produces."""
+    dim("nctx", 32); dim("qctx", 32)
+    nctx = LoopVariable("nctx"); qctx = LoopVariable("qctx")
+    pid = runtime_scalar("pid_m", max_value=2)
+    causal = AffineConstraint(to_affine(qctx) - to_affine(nctx))           # nctx <= qctx
+    walked = AffineConstraint(to_affine(pid) * 16 - to_affine(nctx) + 15)  # nctx < 16*(pid+1)
+    masked = Domain(frozenset({nctx, qctx, pid}), frozenset({frozenset({causal, walked})}))
+    clean = Domain(frozenset({nctx, qctx}), frozenset({frozenset({causal})}))
+
+    with tile_dim_ranges({"qctx": (to_affine(pid) * 16, to_affine(pid) * 16 + 16)}):
+        out = _simplify_mask_domain(masked)
+    assert out == clean                       # walked dropped, vars recomputed
+    assert pid not in out.variables           # the stale var is gone
+
+
+def test_mask_domain_subsumption_no_drop_without_tile_range(reset):
+    """Without the tile range in context, qctx's upper is unknown, so the
+    walked bound is conservatively *kept* (no unsound drop)."""
+    dim("nctx", 32); dim("qctx", 32)
+    nctx = LoopVariable("nctx"); qctx = LoopVariable("qctx")
+    pid = runtime_scalar("pid_m", max_value=2)
+    causal = AffineConstraint(to_affine(qctx) - to_affine(nctx))
+    walked = AffineConstraint(to_affine(pid) * 16 - to_affine(nctx) + 15)
+    masked = Domain(frozenset({nctx, qctx, pid}), frozenset({frozenset({causal, walked})}))
+    out = _simplify_mask_domain(masked)  # no tile_dim_ranges context
+    assert out == masked                 # nothing dropped
