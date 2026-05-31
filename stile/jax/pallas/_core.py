@@ -30,6 +30,7 @@ except ImportError:
     ) from None
 
 from dataclasses import dataclass
+from typing import Callable
 
 from ...type import (
     Type, ShapeType, DataType, Sliced, dim_size, dim_full_dim, as_int,
@@ -38,7 +39,11 @@ from ...type import (
 from ...indexing import LoopVariable
 from ...specification import parse_spec_into_type
 from ...verification import verify_types_equivalent
-from .._core import TypedJaxArray, loop_var_binding, _g_active_tile_overrides
+from ...reference import run_reference, check_output_against_declaration
+from .._core import (
+    TypedJaxArray, loop_var_binding, _g_active_tile_overrides,
+    dtype_to_datatype,
+)
 
 
 @dataclass
@@ -46,14 +51,19 @@ class OutputSpec:
     """
     Declares the *expected* output of a typed Pallas kernel:
 
-      - `spec`: a stile-spec-language string describing the value the
-        output should hold (e.g. `"2 * N"`).
+      - `spec`: either a stile-spec-language string describing the value
+        the output should hold (e.g. `"2 * N"`), OR a **jax reference
+        function** — a callable over the kernel's typed inputs
+        (positional, in call order) returning the expected
+        `TypedJaxArray` (e.g. `lambda x: x * 2`). A reference is run on
+        the actual call-time inputs to extract its `ExprType`; no spec
+        string needed.
       - `st`: the output's `ShapeType` (the dim signature, possibly
         sliced). Doesn't have to match `spec`'s shape verbatim — slice
         overrides happen via `verify_types_equivalent`.
       - `dt`: the output's dtype.
     """
-    spec : str
+    spec : "str | Callable"
     st : ShapeType
     dt : DataType | None = None
 
@@ -76,13 +86,12 @@ class TypedRef:
 class TypedOutputRef(TypedRef):
     """
     The output ref of a typed Pallas kernel. `.assign(value)` runs the
-    verifier against the kernel's `OutputSpec` and stores; if the
-    `value`'s expression doesn't normalize to the spec's, raises before
-    the store.
+    verifier against the expected `Type` and stores; if the `value`'s
+    expression doesn't normalize to the expected one, raises before the
+    store. The expected `Type` is resolved up front by `typed_pallas_call`
+    (from a spec string or a reference function), so this just compares.
     """
-    def __init__(self, ref, output_spec : OutputSpec):
-        spec_type = parse_spec_into_type(output_spec.spec)
-        type = Type(output_spec.st, spec_type.et, output_spec.dt)
+    def __init__(self, ref, type : Type, output_spec : OutputSpec):
         super().__init__(ref, type)
         self.output_spec = output_spec
 
@@ -93,6 +102,37 @@ class TypedOutputRef(TypedRef):
                 f"Expected: {self.type.et}, actual: {value.type.et}"
             )
         self.ref[...] = value.arr
+
+
+def _resolve_spec_et(out_type : OutputSpec, typed_inputs):
+    """Resolve an `OutputSpec` to the expected output `ExprType`.
+
+    For a spec string, parse it. For a reference function, run it on the
+    call-time inputs (re-wrapped so their stile `Type` carries the real
+    array dtype, making the reference's output dtype checkable) and verify
+    the reference's output ShapeType / dtype against the declaration before
+    returning its ExprType."""
+    if not callable(out_type.spec):
+        return parse_spec_into_type(out_type.spec).et
+    ref_inputs = [
+        TypedJaxArray(
+            ti.arr,
+            Type(ti.type.st, ti.type.et, dtype_to_datatype(ti.arr.dtype)),
+        )
+        for ti in typed_inputs
+    ]
+    outs = run_reference(out_type.spec, ref_inputs)
+    if len(outs) != 1:
+        raise ValueError(
+            "typed_pallas_call: a Pallas reference must return a single "
+            f"typed value (single-output kernel); got {len(outs)}."
+        )
+    ref_type = outs[0].type
+    check_output_against_declaration(
+        ref_type, out_type.st, dtype_to_datatype(out_type.dt),
+        label="typed_pallas_call reference",
+    )
+    return ref_type.et
 
 
 def _block_sliced_dim(parent_dim, block_idx, block_size):
@@ -160,6 +200,11 @@ def typed_pallas_call(
     tiled = grid is not None
 
     def runner(*typed_inputs : TypedJaxArray):
+        # Resolve the expected output ExprType once — from a spec string or
+        # by running the reference on these inputs (which also checks the
+        # reference's output ShapeType / dtype against the declaration).
+        spec_et = _resolve_spec_et(out_type, typed_inputs)
+
         def jax_kernel(*refs):
             input_refs = refs[:len(typed_inputs)]
             output_ref = refs[len(typed_inputs)]
@@ -184,14 +229,13 @@ def typed_pallas_call(
                 # to the tile via override_dims_in_type so per-block
                 # assign certifies the tile, not the global tensor.
                 sliced_out_st = _derive_sliced_st(out_type.st, out_specs, pids)
-                spec_type = parse_spec_into_type(out_type.spec)
-                tile_spec = override_dims_in_type(spec_type, *sliced_out_st)
-                wrapped_output = TypedOutputRef.__new__(TypedOutputRef)
-                wrapped_output.ref = output_ref
-                wrapped_output.type = Type(
-                    sliced_out_st, tile_spec.et, out_type.dt,
+                full_spec_type = Type(out_type.st, spec_et, out_type.dt)
+                tile_spec = override_dims_in_type(full_spec_type, *sliced_out_st)
+                wrapped_output = TypedOutputRef(
+                    output_ref,
+                    Type(sliced_out_st, tile_spec.et, out_type.dt),
+                    out_type,
                 )
-                wrapped_output.output_spec = out_type
                 # The tile context: every Sliced dim that the kernel
                 # body operates on. Inner `tjax.fori_loop(..., invariant=...)`
                 # calls read this stack to restrict their parsed
@@ -211,7 +255,11 @@ def typed_pallas_call(
                     TypedRef(ref, ti.type)
                     for ref, ti in zip(input_refs, typed_inputs)
                 ]
-                wrapped_output = TypedOutputRef(output_ref, out_type)
+                wrapped_output = TypedOutputRef(
+                    output_ref,
+                    Type(out_type.st, spec_et, out_type.dt),
+                    out_type,
+                )
                 kernel_fn(*wrapped_inputs, wrapped_output)
 
         pallas_kwargs = {}
@@ -228,13 +276,12 @@ def typed_pallas_call(
             **pallas_kwargs,
         )(*[ti.arr for ti in typed_inputs])
 
-        # The returned TypedJaxArray's Type uses the spec's ExprType (so
-        # downstream consumers see the spec, not the kernel's internal
-        # expression) and the OutputSpec's ShapeType.
-        spec_type = parse_spec_into_type(out_type.spec)
+        # The returned TypedJaxArray's Type uses the resolved ExprType (so
+        # downstream consumers see the spec / reference, not the kernel's
+        # internal expression) and the OutputSpec's ShapeType.
         return TypedJaxArray(
             result_arr,
-            Type(out_type.st, spec_type.et, out_type.dt),
+            Type(out_type.st, spec_et, out_type.dt),
         )
 
     return runner

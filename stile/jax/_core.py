@@ -45,6 +45,23 @@ from ..numerical import (
 _NO_AA_DEFAULT = object()
 
 
+# jax dtype -> stile DataType (None for dtypes stile doesn't model, so they
+# act as a dtype wildcard during verification). Keyed by `jnp.dtype(...).name`
+# so a `jnp.float32`, an array's `.dtype`, or a numpy dtype all map the same.
+_JAX_DTYPE_NAME_TO_DATATYPE = {
+    "bfloat16": DataType.bfloat16,
+    "float32":  DataType.float32,
+    "float64":  DataType.float64,
+}
+
+def dtype_to_datatype(jax_dtype) -> "DataType | None":
+    """Map a jax/numpy dtype to the stile `DataType` it corresponds to, or
+    `None` if `jax_dtype` is None or stile doesn't model it."""
+    if jax_dtype is None:
+        return None
+    return _JAX_DTYPE_NAME_TO_DATATYPE.get(jnp.dtype(jax_dtype).name)
+
+
 def _aa_of(value) -> "AffineForm | None":
     """Pull the `.aa` off a TypedJaxArray, or wrap a numeric scalar
     as a zero-radius constant form, or return None for anything else

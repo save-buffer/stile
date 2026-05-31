@@ -2885,9 +2885,20 @@ def verify_dims_equivalent(x : ShapeType, y : ShapeType) -> bool:
             return False
     return True
 
+def verify_dtypes_equivalent(x : "DataType | None", y : "DataType | None") -> bool:
+    """Two dtypes match unless both are concrete and differ. `None`
+    acts as a wildcard — a parsed spec or a leaf built without dtype
+    info doesn't constrain the dtype, so it never causes a mismatch."""
+    if x is not None and y is not None:
+        return x == y
+    return True
+
 def verify_types_equivalent(x : Type, y : Type) -> bool:
     dim_types_match = verify_dims_equivalent(x.st, y.st)
     if not dim_types_match:
+        return False
+
+    if not verify_dtypes_equivalent(x.dt, y.dt):
         return False
 
     expr_types_match = verify_exprs_equivalent(x.et, y.et)

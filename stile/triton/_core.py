@@ -38,23 +38,73 @@ from ..verification import (
 from ..indexing import (
     SymbolicInt, to_affine, LoopScope, runtime_scalar_names,
 )
-from ..torch._core import TypedTorchTensor
+from ..torch._core import (
+    TypedTorchTensor, make_symbolic_input, dtype_to_datatype,
+)
+from ..reference import run_reference, check_output_against_declaration
 
 
 @dataclass(frozen=True)
 class _OutputDecl:
     """Internal per-output bundle. Single-output kernels have one of
     these; multi-output kernels have N. `ptr_name` is the kernel-arg
-    name (assigned from `fn_def.args.args[len(inputs) + i]`)."""
+    name (assigned from `fn_def.args.args[len(inputs) + i]`).
+
+    Exactly one of `spec` / `spec_type` carries the expected output: a
+    spec-language string (`spec`, re-parsed where needed) or a
+    pre-resolved `Type` (`spec_type`) — the latter set when the user
+    passed a reference function instead of a spec string. `_output_spec_type`
+    returns whichever applies."""
     ptr_name : str
-    spec : str
+    spec : "str | None"
     shape : "tuple"
     dtype : object
+    spec_type : "Type | None" = None
+
+
+def _output_spec_type(o : "_OutputDecl", rt_names) -> Type:
+    """The expected output `Type` for an output decl — a pre-resolved
+    `spec_type` (reference path) or the spec string re-parsed (string
+    path)."""
+    if o.spec_type is not None:
+        return o.spec_type
+    return parse_spec_into_type(o.spec, loop_vars=rt_names)
+
+
+def _resolve_reference_output(
+    ref_fn, inputs : dict, declared_shape : tuple, declared_dtype,
+    rt_names, label : str,
+) -> Type:
+    """Run a torch reference `ref_fn` on symbolic inputs built from the
+    kernel's `inputs={...}` specs and return the expected output `Type`
+    (the declared shape/dtype carrying the reference's ExprType).
+
+    Symbolic inputs are built in `declared_dtype` so the reference's
+    output dtype is checkable against the declaration. The reference must
+    return a single typed value (per output pointer)."""
+    declared_dt = (
+        dtype_to_datatype(declared_dtype) if declared_dtype is not None else None
+    )
+    typed_inputs = []
+    for ptr_spec in inputs.values():
+        in_type = parse_spec_into_type(ptr_spec, loop_vars=rt_names)
+        typed_inputs.append(
+            make_symbolic_input(Type(in_type.st, in_type.et, declared_dt))
+        )
+    outs = run_reference(ref_fn, typed_inputs)
+    if len(outs) != 1:
+        raise ValueError(
+            f"{label}: a reference passed for a single output pointer must "
+            f"return one typed value; got {len(outs)}."
+        )
+    ref_type = outs[0].type
+    check_output_against_declaration(ref_type, declared_shape, declared_dt, label)
+    return Type(declared_shape, ref_type.et, declared_dt)
 
 
 def jit(
     *,
-    spec : "str | list[str] | tuple[str, ...]",
+    spec : "str | Callable | list | tuple",
     inputs : dict[str, str],
     out_shape : "tuple | list",
     out_dtype : "object | list | tuple" = None,
@@ -81,6 +131,18 @@ def jit(
     in declaration order. The launcher returns a tuple of N
     `TypedTorchTensor`s in the same order.
 
+    Each `spec` entry may instead be a **torch reference function** — a
+    plain callable over typed inputs (positional, in `inputs={...}`
+    declaration order) that returns the expected `TypedTorchTensor`:
+
+        @ttl.jit(spec=lambda X: X * 2, inputs={"X_ptr": "X:N"},
+                 out_shape=(N,), out_dtype=torch.float32)
+
+    The reference is run once at decoration on symbolic inputs to extract
+    its `ExprType` (compared against the kernel body) plus its ShapeType
+    and dtype (compared against `out_shape` / `out_dtype`) — no spec
+    string needed. Strings and references may be mixed per output.
+
     `grid`, when given, runs the store-coverage check immediately at
     decoration rather than waiting for the first launch. This is the
     common case for shape-specialized kernels, where the grid is known
@@ -105,7 +167,7 @@ def jit(
             "@ttl.jit must decorate a plain function definition"
         )
 
-        is_multi = not isinstance(spec, str)
+        is_multi = isinstance(spec, (list, tuple))
         if is_multi:
             specs = list(spec)
             if not (isinstance(out_shape, (list, tuple)) and len(out_shape) == len(specs)):
@@ -136,10 +198,25 @@ def jit(
                 f"after {len(inputs)} input(s); the kernel only has "
                 f"{len(arg_names) - len(inputs)} non-input args."
             )
-        outputs = [
-            _OutputDecl(ptr_name=p, spec=s, shape=sh, dtype=dt)
-            for p, s, sh, dt in zip(out_ptr_names, specs, shapes, dtypes)
-        ]
+        rt_names = runtime_scalar_names()
+        outputs = []
+        for p, s, sh, dt in zip(out_ptr_names, specs, shapes, dtypes):
+            if callable(s):
+                # Reference function: resolve to a concrete expected `Type`
+                # now (its ExprType drives store verification; its shape /
+                # dtype are checked against the declaration).
+                spec_type = _resolve_reference_output(
+                    s, inputs, sh, dt, rt_names,
+                    label=f"@ttl.jit reference for output `{p}`",
+                )
+                outputs.append(_OutputDecl(
+                    ptr_name=p, spec=None, shape=sh, dtype=dt,
+                    spec_type=spec_type,
+                ))
+            else:
+                outputs.append(
+                    _OutputDecl(ptr_name=p, spec=s, shape=sh, dtype=dt)
+                )
 
         # Pre-pass: resolve any f-string predicate/value args inside
         # `ttl.mask(...)` to plain Constants so both the verifier and
@@ -249,7 +326,7 @@ def _verify_kernel(
     out_specs : dict[str, tuple] = {}
     for o in outputs:
         out_specs[o.ptr_name] = (
-            parse_spec_into_type(o.spec, loop_vars=rt_names), o.shape,
+            _output_spec_type(o, rt_names), o.shape,
         )
     # Track which output pointers received a verified store. Anything
     # missing from this set after the walk is a vacuous-pass risk.
@@ -2509,7 +2586,7 @@ class _Launcher:
             dtype = o.dtype or torch.float32
             buf = torch.empty(shape_ints, dtype=dtype, device="cuda")
             out_tensors.append(buf)
-            spec_type = parse_spec_into_type(o.spec, loop_vars=rt_names)
+            spec_type = _output_spec_type(o, rt_names)
             composed_et = (
                 substitute_tensor_in_et(spec_type.et, name_to_replacement)
                 if name_to_replacement else spec_type.et

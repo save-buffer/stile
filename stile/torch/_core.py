@@ -42,6 +42,38 @@ for _name, _attr in [
         _TORCH_DTYPE_MAP[_name] = getattr(torch, _attr)
 
 
+# DataType -> torch.dtype, for building reference symbolic inputs in a
+# declared dtype. Reuses the `_TORCH_DTYPE_MAP` string keys (which match
+# `DataType.value`).
+def _datatype_to_torch(dt : "DataType | None"):
+    if dt is None:
+        return torch.float32
+    return _TORCH_DTYPE_MAP.get(dt.value, torch.float32)
+
+
+# torch.dtype -> stile DataType (None for dtypes stile doesn't model).
+_TORCH_TO_DATATYPE = {
+    torch.bfloat16: DataType.bfloat16,
+    torch.float32:  DataType.float32,
+    torch.float64:  DataType.float64,
+}
+
+def dtype_to_datatype(torch_dtype) -> "DataType | None":
+    """Map a `torch.dtype` to the stile `DataType` it corresponds to, or
+    `None` if stile doesn't model it (so it acts as a dtype wildcard)."""
+    return _TORCH_TO_DATATYPE.get(torch_dtype)
+
+
+def make_symbolic_input(type : Type) -> "TypedTorchTensor":
+    """Build a zero-backed `TypedTorchTensor` for `type` — a symbolic input
+    for running a torch reference function. The array's dtype follows
+    `type.dt` (default float32) so the reference's output dtype is
+    meaningful; the values are irrelevant (we only read the result's type)."""
+    shape = tuple(as_int(dim_size(d)) for d in type.st)
+    arr = torch.zeros(shape, dtype=_datatype_to_torch(type.dt))
+    return TypedTorchTensor(arr, type)
+
+
 def _aa_of(value) -> "AffineForm | None":
     """Pull the `.aa` off a TypedTorchTensor, or wrap a numeric
     scalar as a zero-radius constant form."""
