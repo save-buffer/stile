@@ -72,8 +72,10 @@ NVIDIA_TF32_MATMUL = HardwareNumerics(
     (32, 64, 128),
 ])
 def test_eager_aa_bounds_fp32_matmul(reset, m, n, k):
-    """The eager `.aa` bound on `tjax.einsum(A, B, ...)` dominates the
-    fp32-vs-fp64 measured error, under a `CPU_FP32` hardware model."""
+    """
+    The eager `.aa` bound on `tjax.einsum(A, B, ...)` dominates the
+    fp32-vs-fp64 measured error, under a `CPU_FP32` hardware model.
+    """
     rng = np.random.default_rng(0)
     a_np = rng.standard_normal((m, k)).astype(np.float64)
     b_np = rng.standard_normal((k, n)).astype(np.float64)
@@ -90,7 +92,7 @@ def test_eager_aa_bounds_fp32_matmul(reset, m, n, k):
     # Snapshot the leaf AA forms *before* running the einsum, so the
     # rounding-error bound can later subtract them out (= consider only
     # the per-op rounding noise the einsum introduced).
-    leaf_forms = {"A": A.aa, "B": B.aa}
+    leaf_forms = {"A" : A.aa, "B" : B.aa}
     assert leaf_forms["A"] is not None and leaf_forms["B"] is not None
 
     with numerical_context(hardware=CPU_FP32):
@@ -127,7 +129,8 @@ def test_eager_aa_bounds_fp32_matmul(reset, m, n, k):
 
 @REQUIRES_JAX
 def test_tf32_model_widens_aa_bound(reset):
-    """Swapping the hardware model from CPU_FP32 to NVIDIA_TF32_MATMUL
+    """
+    Swapping the hardware model from CPU_FP32 to NVIDIA_TF32_MATMUL
     must widen the AA rounding bound, since TF32 multiplications carry
     a much larger per-op epsilon than fp32.
 
@@ -158,7 +161,7 @@ def test_tf32_model_widens_aa_bound(reset):
     K = dim("K", k)
     A = tjax.tensor(a32, M, K, name="A")
     B = tjax.tensor(b32, K, N, name="B")
-    leaf_forms = {"A": A.aa, "B": B.aa}
+    leaf_forms = {"A" : A.aa, "B" : B.aa}
 
     with numerical_context(hardware=CPU_FP32):
         C_fp32 = tjax.einsum(A, B, "M K, K N -> M N")

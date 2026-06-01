@@ -73,9 +73,11 @@ def _resolve_te_to_int(x : SymbolicIndex) -> "int | None":
 
 
 def _bound_as_int(x : SymbolicIndex) -> "int | None":
-    """`as_int` plus `tensor_element` resolution. Used by `assign` to
+    """
+    `as_int` plus `tensor_element` resolution. Used by `assign` to
     decide whether a slice bound can be materialized to a Python int
-    for the runtime write."""
+    for the runtime write.
+    """
     v = as_int(x)
     if v is not None:
         return v
@@ -410,14 +412,16 @@ class CoverageTracker:
         intervals : "list[tuple[SymbolicIndex, SymbolicIndex]]",
         full_size : int,
     ) -> None:
-        """Sort-and-sweep coverage check that accepts symbolic
+        """
+        Sort-and-sweep coverage check that accepts symbolic
         `(start, end)` pairs. Pure-int intervals get the original
         cursor sweep; mixed sets are normalized by resolving
         `tensor_element` bounds against declared boundaries, then
         either concretized fully or checked symbolically: adjacent
         intervals must satisfy `prev.end == next.start`
         structurally, and the chain must start at `0` and end at
-        `full_size`."""
+        `full_size`.
+        """
         # Dedupe: repeat assigns with identical bounds (common for dims
         # that aren't tiled — every tile covers the full extent) are fine.
         intervals = list({(s, e): None for s, e in intervals}.keys())

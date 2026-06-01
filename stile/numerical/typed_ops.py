@@ -31,6 +31,8 @@ from .affine import (
     maximum as aa_maximum, affine_unary, round_fp, MACHINE_EPS,
 )
 from .hardware import HardwareNumerics
+from .evaluator import _sum_reduction
+from ..type import dim_name, dim_size, as_int
 
 
 # Map dtype-name strings that backends use to the canonical
@@ -38,10 +40,10 @@ from .hardware import HardwareNumerics
 # 'bfloat16', etc. — already canonical. PyTorch matches. The FP8
 # family has a couple of variant names across libraries.
 _DTYPE_ALIASES = {
-    "float8_e4m3fn": "fp8_e4m3",
-    "float8_e4m3":   "fp8_e4m3",
-    "float8_e5m2":   "fp8_e5m2",
-    "float8_e3m4":   "fp8_e3m4",
+    "float8_e4m3fn" : "fp8_e4m3",
+    "float8_e4m3" :   "fp8_e4m3",
+    "float8_e5m2" :   "fp8_e5m2",
+    "float8_e3m4" :   "fp8_e3m4",
 }
 
 
@@ -79,11 +81,13 @@ def _as_aa(x) -> "AffineForm | None":
 
 
 def _eps_for(out_dtype : "str | None") -> float:
-    """Eps lookup with a fallback: an unknown dtype yields `0.0` (i.e.
+    """
+    Eps lookup with a fallback: an unknown dtype yields `0.0` (i.e.
     no rounding noise gets attached). The AA bound stays sound — the
     pre-rounding form already over-approximates — but is tighter than
     if we'd guessed a default. Callers that need a guaranteed
-    rounding-noise contribution should supply a known dtype."""
+    rounding-noise contribution should supply a known dtype.
+    """
     if out_dtype is None:
         return 0.0
     return MACHINE_EPS[out_dtype]
@@ -189,7 +193,6 @@ def sum_reduction(
         return None
     # Delegate to the evaluator's internal helper — same code path
     # walking ETs uses, so behavior stays consistent.
-    from .evaluator import _sum_reduction
     return _sum_reduction(child_aa, n, hardware)
 
 
@@ -241,7 +244,6 @@ def compose_einsum(
     """
     if x_aa is None or y_aa is None:
         return None
-    from ..type import dim_name, dim_size, as_int
     mul_eps = _matmul_mul_eps(x_dtype, y_dtype, hardware)
     # Parse the einstr to find which dims are contracted (= present in
     # the input sides but not in the output side). Sum-reduction count
@@ -279,5 +281,4 @@ def compose_einsum(
     )
     if contraction_n <= 1:
         return product
-    from .evaluator import _sum_reduction
     return _sum_reduction(product, contraction_n, hardware)

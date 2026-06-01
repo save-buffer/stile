@@ -26,9 +26,11 @@ from stile.verification import verify_exprs_equivalent
 
 
 def _expect_rejection(kernel_call, *args, **kwargs):
-    """Run `kernel_call(*args, **kwargs)` and assert it raises (the
+    """
+    Run `kernel_call(*args, **kwargs)` and assert it raises (the
     verifier rejected it). The two assertion shapes that bubble up are
-    `assert_equivalent`'s `AssertionError` and `assign`'s `ValueError`."""
+    `assert_equivalent`'s `AssertionError` and `assign`'s `ValueError`.
+    """
     with pytest.raises((AssertionError, ValueError)):
         kernel_call(*args, **kwargs)
 
@@ -53,9 +55,11 @@ def test_missing_constant_factor_rejected(reset):
 
 
 def test_double_applied_factor_in_matmul_rejected(reset):
-    """Spec says `2 * (M N, N K -> M K)` but kernel multiplies BOTH
+    """
+    Spec says `2 * (M N, N K -> M K)` but kernel multiplies BOTH
     operands by 2 — yields a 4× result. The classic bug from the README
-    that motivated stile."""
+    that motivated stile.
+    """
     M, N, K = dim("DAM", 8), dim("DAN", 8), dim("DAK", 8)
     a = tjax.random.normal(jax.random.PRNGKey(0), M, N)
     b = tjax.random.normal(jax.random.PRNGKey(1), N, K)
@@ -73,10 +77,12 @@ def test_wrong_binary_op_rejected(reset):
 
 
 def test_subtraction_not_commutative(reset):
-    """At the spec level `N - 1` and `1 - N` must not normalize equal
+    """
+    At the spec level `N - 1` and `1 - N` must not normalize equal
     (sanity-pin from the spec inequivalence suite — kernel-level can't
     distinguish two tensors of the same dim signature, so we keep this
-    pin spec-only)."""
+    pin spec-only).
+    """
     dim("SUN", 8)
     a = parse_spec_into_type("SUN - 1")
     b = parse_spec_into_type("1 - SUN")
@@ -116,8 +122,10 @@ def test_reduction_over_wrong_dim_rejected(reset):
 # ---------------------------------------------------------------------------
 
 def test_einsum_wrong_contracted_dim_rejected(reset):
-    """Matmul spec contracts N. Buggy einsum contracts K instead — gives
-    a totally different result of shape (M, N)."""
+    """
+    Matmul spec contracts N. Buggy einsum contracts K instead — gives
+    a totally different result of shape (M, N).
+    """
     M, N, K = dim("ECM", 8), dim("ECN", 8), dim("ECK", 8)
     a = tjax.random.normal(jax.random.PRNGKey(0), M, N)
     b = tjax.random.normal(jax.random.PRNGKey(1), N, K)
@@ -144,13 +152,15 @@ def test_wrong_slice_bound_rejected(reset):
 
 
 def test_offset_assign_to_wrong_position_rejected(reset):
-    """A kernel that writes a tile to the wrong output position is
+    """
+    A kernel that writes a tile to the wrong output position is
     caught by `TypedResult.done()` — the slice bounds on the output
     are tracked, so a kernel that fills `[4:8]` instead of `[0:8]`
     leaves a gap. Slice info on *input* reads doesn't show up at the
     expression level (two slices of the same dim parse to the same
     leaf tensor), so this kind of bug is caught at the output side via
-    coverage rather than via algebraic equivalence."""
+    coverage rather than via algebraic equivalence.
+    """
     N = dim("OSN", 8)
     a = tjax.random.normal(jax.random.PRNGKey(0), N)
     result = tjax.TypedResult("OSN")
@@ -165,8 +175,10 @@ def test_offset_assign_to_wrong_position_rejected(reset):
 # ---------------------------------------------------------------------------
 
 def test_causal_kernel_without_mask_rejected(reset):
-    """Causal-attention spec, kernel forgets the mask. Unmasked attention
-    must not satisfy the causal spec."""
+    """
+    Causal-attention spec, kernel forgets the mask. Unmasked attention
+    must not satisfy the causal spec.
+    """
     Q, K, D = dim("CKQ", 8), dim("CKK", 8), dim("CKD", 4)
     q = tjax.random.normal(jax.random.PRNGKey(0), Q, D)
     k = tjax.random.normal(jax.random.PRNGKey(1), K, D)
@@ -180,8 +192,10 @@ def test_causal_kernel_without_mask_rejected(reset):
 
 
 def test_causal_predicate_flipped_rejected(reset):
-    """Spec is `K <= Q` (causal); kernel applies `K >= Q` (anti-causal).
-    Distinct triangles, distinct results."""
+    """
+    Spec is `K <= Q` (causal); kernel applies `K >= Q` (anti-causal).
+    Distinct triangles, distinct results.
+    """
     Q, K, D = dim("FPQ", 8), dim("FPK", 8), dim("FPD", 4)
     q = tjax.random.normal(jax.random.PRNGKey(0), Q, D)
     k = tjax.random.normal(jax.random.PRNGKey(1), K, D)
@@ -195,10 +209,12 @@ def test_causal_predicate_flipped_rejected(reset):
 
 
 def test_mask_in_place_of_bias_for_max_rejected(reset):
-    """For a max-reduction, mult-mask gives the wrong answer (max sees
+    """
+    For a max-reduction, mult-mask gives the wrong answer (max sees
     `0` from masked positions). Verifier should reject when the kernel
     uses mult-mask but the spec uses `max[d where P]` (which lowers to
-    bias-form). The two are mathematically distinct."""
+    bias-form). The two are mathematically distinct.
+    """
     Q, K = dim("MBQ", 8), dim("MBK", 8)
     qk = tjax.random.normal(jax.random.PRNGKey(0), Q, K)
     # Buggy: multiplicative mask before max — masked positions become 0.
@@ -214,8 +230,10 @@ def test_mask_in_place_of_bias_for_max_rejected(reset):
 # ---------------------------------------------------------------------------
 
 def test_skipped_tile_coverage_rejected(reset):
-    """`TypedResult.done()` rejects when the kernel only assigned part
-    of the output."""
+    """
+    `TypedResult.done()` rejects when the kernel only assigned part
+    of the output.
+    """
     M = dim("STM", 16)
     a = tjax.random.normal(jax.random.PRNGKey(0), M)
     result = tjax.TypedResult("STM")
@@ -226,9 +244,11 @@ def test_skipped_tile_coverage_rejected(reset):
 
 
 def test_overlapping_tile_coverage_rejected(reset):
-    """`TypedResult.done()` rejects when two assigns overlap on a dim
+    """
+    `TypedResult.done()` rejects when two assigns overlap on a dim
     (one tile written twice). Same-bounds duplicates are deduped, but
-    a partial overlap is a real bug."""
+    a partial overlap is a real bug.
+    """
     M = dim("OTM", 16)
     a = tjax.random.normal(jax.random.PRNGKey(0), M)
     result = tjax.TypedResult("OTM")
@@ -271,7 +291,8 @@ def _flash_kernel(Q, K, V, qctx, nctx, dhead, *,
                   exp_on_rescaling=True,
                   forgot_running_l_rescale=False,
                   nctx_tile_size=None):
-    """A parametric flash-attention kernel. The keyword args toggle each
+    """
+    A parametric flash-attention kernel. The keyword args toggle each
     subtle bug; with all defaults it's the correct kernel.
 
       - `scale_factor`: divisor for the QK^T tile. Correct = `sqrt(dhead.size)`.
@@ -343,17 +364,21 @@ def _fa_setup():
 
 
 def test_flash_attention_correct_baseline(reset):
-    """Sanity baseline: with all flags at their default (correct) values,
+    """
+    Sanity baseline: with all flags at their default (correct) values,
     the kernel verifies. If this fails, one of the buggy tests below
-    might be passing for the wrong reason."""
+    might be passing for the wrong reason.
+    """
     Q, K, V, qctx, nctx, dhead = _fa_setup()
     o = _flash_kernel(Q, K, V, qctx, nctx, dhead)
     o.assert_equivalent(_FA_SPEC)
 
 
 def test_flash_attention_wrong_sqrt_divisor_rejected(reset):
-    """User's suggested bug: divide by `sqrt(dhead - 1)` instead of
-    `sqrt(dhead)`. Spec uses `sqrt(16)`; buggy kernel uses `sqrt(15)`."""
+    """
+    User's suggested bug: divide by `sqrt(dhead - 1)` instead of
+    `sqrt(dhead)`. Spec uses `sqrt(16)`; buggy kernel uses `sqrt(15)`.
+    """
     Q, K, V, qctx, nctx, dhead = _fa_setup()
     o = _flash_kernel(
         Q, K, V, qctx, nctx, dhead,
@@ -363,21 +388,25 @@ def test_flash_attention_wrong_sqrt_divisor_rejected(reset):
 
 
 def test_flash_attention_missing_exp_on_rescaling_rejected(reset):
-    """Common typo: rescaling the running aggregates by a raw difference
+    """
+    Common typo: rescaling the running aggregates by a raw difference
     `(running_max - new_max)` instead of `exp(running_max - new_max)`.
     The kernel produces a totally different value but the structure of
-    the ops looks tantalizingly close."""
+    the ops looks tantalizingly close.
+    """
     Q, K, V, qctx, nctx, dhead = _fa_setup()
     o = _flash_kernel(Q, K, V, qctx, nctx, dhead, exp_on_rescaling=False)
     _expect_rejection(o.assert_equivalent, _FA_SPEC)
 
 
 def test_flash_attention_forgot_running_l_rescale_rejected(reset):
-    """Bug: the running denominator is carried over without applying
+    """
+    Bug: the running denominator is carried over without applying
     the `exp(running_max - new_max)` correction on each tile merge.
     Iteration 1 is identical to the correct kernel (running_l = 0
     initially, so the missing factor doesn't matter); iteration 2+
-    diverges. Run with two `nctx` tiles so the bug actually exercises."""
+    diverges. Run with two `nctx` tiles so the bug actually exercises.
+    """
     Q, K, V, qctx, nctx, dhead = _fa_setup()
     o = _flash_kernel(
         Q, K, V, qctx, nctx, dhead,

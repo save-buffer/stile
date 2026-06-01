@@ -91,8 +91,10 @@ class AffineForm:
         return cls(central=float(central), noise=((symbol, float(coeff)),))
 
     def total_radius(self) -> float:
-        """Sum of |coeff| over all noise symbols. Conservative upper
-        bound on |x - central|."""
+        """
+        Sum of |coeff| over all noise symbols. Conservative upper
+        bound on |x - central|.
+        """
         return sum(abs(c) for _, c in self.noise)
 
     def range(self) -> "tuple[float, float]":
@@ -106,8 +108,10 @@ class AffineForm:
 def _combine(
     a : AffineForm, b : AffineForm, op,
 ) -> dict:
-    """Apply `op(a_coeff, b_coeff)` over the union of `a` and `b`'s
-    noise symbols. Used for `+` (op=`x+y`) and `-` (op=`x-y`)."""
+    """
+    Apply `op(a_coeff, b_coeff)` over the union of `a` and `b`'s
+    noise symbols. Used for `+` (op=`x+y`) and `-` (op=`x-y`).
+    """
     out = {s: c for s, c in a.noise}
     for s, c in b.noise:
         out[s] = op(out.get(s, 0.0), c)
@@ -123,8 +127,10 @@ def add(a : AffineForm, b : AffineForm) -> AffineForm:
 
 
 def sub(a : AffineForm, b : AffineForm) -> AffineForm:
-    """`(a - b) = (a₀-b₀) + Σ (aᵢ-bᵢ)·εᵢ`. So `x - x = 0` exactly:
-    each shared `εᵢ` cancels."""
+    """
+    `(a - b) = (a₀-b₀) + Σ (aᵢ-bᵢ)·εᵢ`. So `x - x = 0` exactly:
+    each shared `εᵢ` cancels.
+    """
     return AffineForm(
         central=a.central - b.central,
         noise=tuple(_combine(a, b, lambda x, y: x - y).items()),
@@ -247,8 +253,10 @@ def sqrt(a : AffineForm) -> AffineForm:
 
 
 def reciprocal(a : AffineForm) -> AffineForm:
-    """`1 / a` via min-range linearization. Requires `a`'s range to
-    not contain zero (otherwise `1/x` is unbounded)."""
+    """
+    `1 / a` via min-range linearization. Requires `a`'s range to
+    not contain zero (otherwise `1/x` is unbounded).
+    """
     lo, hi = a.range()
     if lo <= 0.0 <= hi:
         raise ValueError(
@@ -261,8 +269,10 @@ def reciprocal(a : AffineForm) -> AffineForm:
 
 
 def div(a : AffineForm, b : AffineForm) -> AffineForm:
-    """`a / b` = `a · (1/b)`. Linearization error lives in the
-    `reciprocal` step; `mul` adds the bilinear cross-term."""
+    """
+    `a / b` = `a · (1/b)`. Linearization error lives in the
+    `reciprocal` step; `mul` adds the bilinear cross-term.
+    """
     return mul(a, reciprocal(b))
 
 

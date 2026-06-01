@@ -15,9 +15,11 @@ from stile.indexing import SymbolicInt, to_affine
 # --- type_from_binary_op: scalar / Constant broadcasting ---------------
 
 def test_scalar_constant_broadcasts_against_tensor(reset):
-    """A scalar-shaped operand (`st == ()`) — e.g. a literal `2` — must
+    """
+    A scalar-shaped operand (`st == ()`) — e.g. a literal `2` — must
     broadcast against any tensor shape. Triton-style kernels do `x * 2`,
-    `max(x, 0)` constantly."""
+    `max(x, 0)` constantly.
+    """
     N = dim("N", 8)
     x = Type(st=(N[0:1],), et=Tensor((N,), name="X"))
     two = Type(st=(), et=Constant(2.0))
@@ -36,8 +38,10 @@ def test_scalar_constant_broadcasts_either_side(reset):
 
 
 def test_nonscalar_shape_mismatch_still_rejected(reset):
-    """Two genuinely-different non-scalar shapes still raise — the
-    broadcast only relaxes the scalar case."""
+    """
+    Two genuinely-different non-scalar shapes still raise — the
+    broadcast only relaxes the scalar case.
+    """
     M = dim("M", 4)
     N = dim("N", 8)
     a = Type(st=(M,), et=Tensor((M,), name="A"))
@@ -47,8 +51,10 @@ def test_nonscalar_shape_mismatch_still_rejected(reset):
 
 
 def test_scalar_broadcast_keeps_tensor_dtype(reset):
-    """The dtype-bearing (tensor) side's dtype survives the broadcast;
-    the scalar side is dtype-less."""
+    """
+    The dtype-bearing (tensor) side's dtype survives the broadcast;
+    the scalar side is dtype-less.
+    """
     N = dim("N", 8)
     x = Type(st=(N,), et=Tensor((N,), name="X"), dt=st.DataType.float32)
     two = Type(st=(), et=Constant(2.0))
@@ -80,9 +86,11 @@ def test_sliced_accepts_valid_bound_types(reset):
 
 
 def test_sliced_rejects_foreign_bound_with_clear_error(reset):
-    """A non-SymbolicIndex bound (e.g. a frontend's own tracer object)
+    """
+    A non-SymbolicIndex bound (e.g. a frontend's own tracer object)
     raises at construction, naming the offending bound — rather than
-    blowing up later inside an unrelated `__eq__`."""
+    blowing up later inside an unrelated `__eq__`.
+    """
     N = dim("N", 8)
 
     class FakeTracer:

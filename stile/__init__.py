@@ -9,7 +9,7 @@ from .type import (
     Type, ShapeType, FullDim, Sliced, Tensor, Constant, TagCond,
     BinaryOp, UnaryOp, Repeat, Reduce, Gather, Scatter,
     BinaryOpType, ReduceOpType, ExprType, Dim, SymbolicIndex,
-    g_dim_registry, _reset_tensor_counter,
+    g_dim_registry, _reset_tensor_counter, _g_tensor_counter,
     # ET-builder helpers — same lowerings the spec parser uses.
     exp, sin, cos, sqrt, maximum, minimum, abs, relu,
     einsum, type_from_binary_op, override_dims_in_type,
@@ -91,10 +91,12 @@ def expr_simplifies(
 # (re-binding the module attribute wouldn't work — other modules hold
 # references to the originals).
 def _scope_registries():
-    """The set of process-wide registries that participate in
+    """
+    The set of process-wide registries that participate in
     `scope()` snapshot/restore. Returned as a tuple of containers so
     helpers can iterate (each is a dict or list — mutated in-place;
-    rebinding the module attribute wouldn't reach existing imports)."""
+    rebinding the module attribute wouldn't reach existing imports).
+    """
     return (
         g_dim_registry,
         _active_loop_scopes,
@@ -108,18 +110,16 @@ def _scope_registries():
 
 
 def _snapshot_state() -> dict:
-    from .type import _g_tensor_counter
     return {
-        "registries": [
+        "registries" : [
             dict(r) if isinstance(r, dict) else list(r)
             for r in _scope_registries()
         ],
-        "tensor_counter": _g_tensor_counter[0],
+        "tensor_counter" : _g_tensor_counter[0],
     }
 
 
 def _restore_state(snapshot : dict) -> None:
-    from .type import _g_tensor_counter
     for container, snapped in zip(_scope_registries(), snapshot["registries"]):
         container.clear()
         if isinstance(container, dict):
@@ -130,17 +130,21 @@ def _restore_state(snapshot : dict) -> None:
 
 
 def _clear_state() -> None:
-    """Wipe every registry. Used internally by `reset_stile()` and
-    `scope(clear=True)`."""
+    """
+    Wipe every registry. Used internally by `reset_stile()` and
+    `scope(clear=True)`.
+    """
     for container in _scope_registries():
         container.clear()
     _reset_tensor_counter()
 
 
 def reset_stile() -> None:
-    """Wipe all process-wide stile state. Equivalent to entering a
+    """
+    Wipe all process-wide stile state. Equivalent to entering a
     `scope(clear=True)` block and never exiting; prefer `scope(...)`
-    for tests / library code that wants automatic restoration."""
+    for tests / library code that wants automatic restoration.
+    """
     _clear_state()
 
 

@@ -30,10 +30,12 @@ from stile.type import Constant, Tensor, BinaryOp, UnaryOp, Reduce
 
 
 def _leaf(name : str, central : float, radius : float) -> AffineForm:
-    """Convenience: leaf AffineForm with one noise symbol at the
+    """
+    Convenience: leaf AffineForm with one noise symbol at the
     given central value + radius. Pinned name so tests sharing this
     helper across two ETs share the noise symbol via the leaves dict
-    (the evaluator looks tensors up by name)."""
+    (the evaluator looks tensors up by name).
+    """
     return AffineForm.with_noise(central, fresh_noise(name), radius)
 
 
@@ -42,7 +44,7 @@ def test_leaf_lookup_round_trips(reset):
     N = dim("EvN1", 4)
     x_form = _leaf("X", central=2.0, radius=0.5)
     et = Tensor(dims=(N,), name="X")
-    result = evaluate(et, {"X": x_form})
+    result = evaluate(et, {"X" : x_form})
     assert result.central == 2.0
     assert result.range() == (1.5, 2.5)
 
@@ -61,7 +63,7 @@ def test_binary_op_adds_rounding_noise(reset):
     x_form = _leaf("X", central=1.0, radius=0.1)
     et = BinaryOp(op="+", lhs=Tensor(dims=(N,), name="X"),
                           rhs=Tensor(dims=(N,), name="X"))
-    result = evaluate(et, {"X": x_form})
+    result = evaluate(et, {"X" : x_form})
     # Central: 2 * 1 = 2. Radius before rounding: 2 * 0.1 = 0.2.
     # Rounding adds at most ε · max|2x| = ε · 2.2.
     eps = MACHINE_EPS["float32"]
@@ -83,7 +85,7 @@ def test_operation_order_matters(reset):
     a = _leaf("A", 1.0, 0.1)
     b = _leaf("B", 2.0, 0.1)
     c = _leaf("C", 3.0, 0.1)
-    leaves = {"A": a, "B": b, "C": c}
+    leaves = {"A" : a, "B" : b, "C" : c}
 
     t_a = Tensor(dims=(N,), name="A")
     t_b = Tensor(dims=(N,), name="B")
@@ -110,7 +112,7 @@ def test_exprs_close_shares_leaf_noises(reset):
     N = dim("ShN", 4)
     a = _leaf("A", 1.0, 0.5)
     b = _leaf("B", 2.0, 0.5)
-    leaves = {"A": a, "B": b}
+    leaves = {"A" : a, "B" : b}
 
     t_a = Tensor(dims=(N,), name="A")
     t_b = Tensor(dims=(N,), name="B")
@@ -142,7 +144,7 @@ def test_reduce_sum_sequential_grows_quadratically(reset):
     N = dim("RedN", 10)
     x = _leaf("X", 1.0, 0.0)   # zero radius → all rounding error
     et = Reduce(op="sum", dim=N, child=Tensor(dims=(N,), name="X"))
-    result = evaluate(et, {"X": x}, hardware=WORST_CASE)
+    result = evaluate(et, {"X" : x}, hardware=WORST_CASE)
     # Central = 10 (sum of 10 copies of 1).
     assert math.isclose(result.central, 10.0, rel_tol=1e-9)
     # Radius bound: ε · 1 · 45 plus a final round-fp at the call site.
@@ -152,8 +154,10 @@ def test_reduce_sum_sequential_grows_quadratically(reset):
 
 
 def test_reduce_tree_has_log_depth_error(reset):
-    """Tree reduction's error scales with `N · log₂ N`, much tighter
-    than sequential's `N²/2`."""
+    """
+    Tree reduction's error scales with `N · log₂ N`, much tighter
+    than sequential's `N²/2`.
+    """
     N = dim("RedTN", 1024)
     x = _leaf("X", 1.0, 0.0)
     et = Reduce(op="sum", dim=N, child=Tensor(dims=(N,), name="X"))
@@ -165,8 +169,8 @@ def test_reduce_tree_has_log_depth_error(reset):
         name="tree", reduction_order="tree",
         default_dtype="float32",
     )
-    r_seq = evaluate(et, {"X": x}, hardware=seq_hw)
-    r_tree = evaluate(et, {"X": x}, hardware=tree_hw)
+    r_seq = evaluate(et, {"X" : x}, hardware=seq_hw)
+    r_tree = evaluate(et, {"X" : x}, hardware=tree_hw)
     # Tree should be MUCH tighter at N=1024.
     # Seq: ε · 1 · 1024 · 1023 / 2 ≈ ε · 5.2e5
     # Tree: ε · 1 · 1024 · 10        ≈ ε · 1.0e4
@@ -190,8 +194,8 @@ def test_hardware_model_accumulator_dtype_overrides_default(reset):
         name="bf16-in-fp32-acc", default_dtype="bfloat16",
         accumulator_dtype="float32", reduction_order="sequential",
     )
-    r_bf16 = evaluate(et, {"X": x}, hardware=bf16_in_bf16_acc)
-    r_mixed = evaluate(et, {"X": x}, hardware=bf16_in_fp32_acc)
+    r_bf16 = evaluate(et, {"X" : x}, hardware=bf16_in_bf16_acc)
+    r_mixed = evaluate(et, {"X" : x}, hardware=bf16_in_fp32_acc)
     # bf16 ε ≈ 4e-3, fp32 ε ≈ 6e-8 — accumulator dtype shrinks the
     # reduction-error coefficient by a factor of ~65000.
     assert r_mixed.total_radius() < 1e-3 * r_bf16.total_radius()
@@ -273,7 +277,7 @@ def test_bias_mask_via_exp_short_circuits(reset):
         op="exp",
         child=BinaryOp(op="+", lhs=Tensor(dims=(N,), name="X"), rhs=bias_mask),
     )
-    result = evaluate(et, leaf_forms={"X": x})
+    result = evaluate(et, leaf_forms={"X" : x})
     # Bound: 0 (from ¬P) ∪ exp(x.range()) = [0, exp(1)] ≈ [0, 2.72].
     lo, hi = result.range()
     assert lo <= 0.0 < math.exp(1.0) <= hi
@@ -296,9 +300,11 @@ def test_bare_bias_mask_raises_with_hint(reset):
 
 
 def test_gather_passes_source_aa_through(reset):
-    """`Gather(source, dim, idx)` returns source's AffineForm — any
+    """
+    `Gather(source, dim, idx)` returns source's AffineForm — any
     output cell is a valid source value, and the noise symbols share
-    so two gathers of the same source still cancel correlations."""
+    so two gathers of the same source still cancel correlations.
+    """
     from stile.type import Gather
     N = dim("GatN", 4)
     M = dim("GatM", 4)
@@ -309,7 +315,7 @@ def test_gather_passes_source_aa_through(reset):
         dim_in_source=N,
         idx=Tensor(dims=(M,), name="idx"),
     )
-    result = evaluate(et, {"S": src, "idx": idx_form})
+    result = evaluate(et, {"S" : src, "idx" : idx_form})
     # Should be identical to S's AA form (gather doesn't widen).
     assert result.central == 3.0
     assert result.range() == (2.5, 3.5)

@@ -6,7 +6,8 @@ T = TypeVar("T")
 
 @dataclass(frozen=True)
 class FrozenCounter(Generic[T]):
-    """Immutable, hashable multiset. Zero counts are never stored.
+    """
+    Immutable, hashable multiset. Zero counts are never stored.
 
     Backing store is a frozenset of (key, count) pairs so equality and hashing
     come for free from the dataclass. Construct via `from_iterable`, `from_dict`,

@@ -20,12 +20,14 @@ from stile import dim, reset_stile
 
 
 def test_done_through_symbolic_block_loop(reset):
-    """fori_loop over experts, per iter assigns a slice of X
+    """
+    fori_loop over experts, per iter assigns a slice of X
     bounded by `(offsets[g], offsets[g+1])` to the output buffer.
     `done()` unrolls g over [0, n_experts), keeps the
     `tensor_element` bounds symbolic, sweeps them in order, and
     resolves the boundary lookups (`offsets[0]==0`,
-    `offsets[n_experts]==n_tokens.size`) to confirm full coverage."""
+    `offsets[n_experts]==n_tokens.size`) to confirm full coverage.
+    """
     n_tokens = dim("n_tokens", 16)
     d = dim("d", 4)
     n_offsets = dim("n_offsets", 5)  # n_experts + 1
@@ -34,7 +36,7 @@ def test_done_through_symbolic_block_loop(reset):
     X = tjax.random.normal(jax.random.PRNGKey(0), n_tokens, d, name="X")
     offsets = tjax.runtime_index(
         "offsets", n_offsets, values_in=n_tokens,
-        boundary_values={0: 0, n_experts.size: n_tokens.size},
+        boundary_values={0 : 0, n_experts.size : n_tokens.size},
     )
 
     L = tjax.TypedResult("X:n_tokens d")
@@ -49,10 +51,12 @@ def test_done_through_symbolic_block_loop(reset):
 
 
 def test_done_rejects_block_loop_with_gap(reset):
-    """If the loop covers only the first three blocks (the last
+    """
+    If the loop covers only the first three blocks (the last
     block goes unassigned), `done()` should refuse — the last
     interval's end is `offsets[3]`, which the boundary declarations
-    don't resolve to `n_tokens.size`."""
+    don't resolve to `n_tokens.size`.
+    """
     n_tokens = dim("n_tokens", 16)
     d = dim("d", 4)
     n_offsets = dim("n_offsets", 5)
@@ -61,7 +65,7 @@ def test_done_rejects_block_loop_with_gap(reset):
     X = tjax.random.normal(jax.random.PRNGKey(0), n_tokens, d, name="X")
     offsets = tjax.runtime_index(
         "offsets", n_offsets, values_in=n_tokens,
-        boundary_values={0: 0, n_experts.size: n_tokens.size},
+        boundary_values={0 : 0, n_experts.size : n_tokens.size},
     )
 
     L = tjax.TypedResult("X:n_tokens d")

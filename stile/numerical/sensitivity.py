@@ -29,13 +29,15 @@ _REDUCTION_PREFIXES = ("seq-sum-", "tree-sum-", "hwfused-sum-")
 
 
 def _is_rounding_label(label : str) -> bool:
-    """A noise label is "rounding-like" — i.e. scales with the
+    """
+    A noise label is "rounding-like" — i.e. scales with the
     operating dtype — iff it ends in `-round` (per-op multiplier /
     add / exp / etc. rounding) or starts with a reduction prefix
     (`seq-sum-N`, `tree-sum-N`, `hwfused-sum-N-tileK` — accumulator
     rounding). Linearization-noise labels (`mul-cross`, `*-lin`,
     `max-bound`, mask/scatter bounds) are excluded — those are AA's
-    worst-case conservatism, not floating-point rounding."""
+    worst-case conservatism, not floating-point rounding.
+    """
     if label.endswith("-round"):
         return True
     return any(label.startswith(p) for p in _REDUCTION_PREFIXES)
@@ -61,7 +63,8 @@ class Sensitivity:
 
     @property
     def widening(self) -> float:
-        """`low_bound / ref_bound` over the full non-leaf noise mass.
+        """
+        `low_bound / ref_bound` over the full non-leaf noise mass.
 
         Caveat: includes data-dependent AA linearization noise (e.g.
         `mul-cross` from the AA multiplication primitive, `exp-lin`
@@ -79,7 +82,8 @@ class Sensitivity:
 
     @property
     def rounding_widening(self) -> float:
-        """`low / ref` restricted to *dtype-rounding* noise labels —
+        """
+        `low / ref` restricted to *dtype-rounding* noise labels —
         the labels that genuinely move with precision (`*-round` from
         per-op rounding, `seq-sum-N` / `tree-sum-N` / `hwfused-sum-*`
         from accumulator rounding). Excludes AA-linearization noises
@@ -89,7 +93,8 @@ class Sensitivity:
         This is the right headline number for "how much worse does
         rounding get under this precision swap?" — it cleanly isolates
         the dtype effect from AA's worst-case linearization
-        conservatism."""
+        conservatism.
+        """
         ref_total = 0.0
         low_total = 0.0
         for label, (ref, low, _) in self.per_label.items():
@@ -101,9 +106,11 @@ class Sensitivity:
         return low_total / ref_total
 
     def top(self, n : int = 5) -> "list[tuple[str, float, float, float]]":
-        """Top-`n` labels by widening ratio. Each row is `(label, ref,
+        """
+        Top-`n` labels by widening ratio. Each row is `(label, ref,
         low, ratio)`. Labels with `ref == 0` (the swap introduced a new
-        noise source) sort to the top with infinite ratio."""
+        noise source) sort to the top with infinite ratio.
+        """
         rows = [
             (label, ref, low, ratio)
             for label, (ref, low, ratio) in self.per_label.items()
@@ -112,11 +119,13 @@ class Sensitivity:
         return rows[:n]
 
     def summary(self, n : int = 5) -> str:
-        """Multi-line summary suitable for `print()`. Headline number
+        """
+        Multi-line summary suitable for `print()`. Headline number
         is `rounding_widening` — the dtype-driven part of the bound —
         which is the one that actually moves with precision choice.
         Total widening (including data-dependent linearization noise)
-        and the top-`n` per-label rows follow."""
+        and the top-`n` per-label rows follow.
+        """
         rw = self.rounding_widening
         rw_s = "inf" if rw == float("inf") else f"{rw:.2f}×"
         lines = [
@@ -168,17 +177,21 @@ def _apply_swap(arg, swap : "dict[str, str]"):
 
 
 def _name_of(arg) -> "str | None":
-    """Best-effort: pull `.type.et.name` off the arg. Used to match
-    args against the `swap` dict's keys."""
+    """
+    Best-effort: pull `.type.et.name` off the arg. Used to match
+    args against the `swap` dict's keys.
+    """
     et = getattr(getattr(arg, "type", None), "et", None)
     return getattr(et, "name", None) if et is not None else None
 
 
 def _leaf_ids(args) -> "set[int]":
-    """Collect the noise-symbol IDs from each arg's leaf AA. These are
+    """
+    Collect the noise-symbol IDs from each arg's leaf AA. These are
     the "input range" noises — we exclude them from the rounding-noise
     mass so the widening reflects what the ops contributed, not the
-    inputs themselves."""
+    inputs themselves.
+    """
     ids : set[int] = set()
     for a in args:
         aa = getattr(a, "aa", None)
@@ -190,8 +203,10 @@ def _leaf_ids(args) -> "set[int]":
 
 
 def _per_label_mass(aa, leaf_ids : "set[int]") -> "dict[str, float]":
-    """Group an AA's non-leaf noise terms by label and sum |coeff|
-    within each group."""
+    """
+    Group an AA's non-leaf noise terms by label and sum |coeff|
+    within each group.
+    """
     by_label : dict[str, float] = {}
     if aa is None:
         return by_label

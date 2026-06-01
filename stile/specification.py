@@ -87,10 +87,12 @@ class LexState:
         return None
 
     def maybe_consume_keyword(self, *args) -> str | None:
-        """Like `maybe_consume` but requires a non-identifier boundary
+        """
+        Like `maybe_consume` but requires a non-identifier boundary
         after the match. Use for keywords (`exp`, `sum`, `gather`, …)
         so an identifier like `expert_id` doesn't get partially
-        consumed as `exp` + the rest left dangling."""
+        consumed as `exp` + the rest left dangling.
+        """
         self.consume_whitespace()
         for a in args:
             if self.spec.startswith(a):
@@ -207,8 +209,10 @@ def _normalize_dts_for_binary_op(lhs : ShapeType, rhs : ShapeType) -> ShapeType:
 
 
 def _broadcast_to(et : ExprType, src_st : ShapeType, dst_st : ShapeType) -> ExprType:
-    """Wrap `et` in `Repeat`s so that it matches `dst_st`'s dims. `src_st`
-    must have a subset of `dst_st`'s dim names."""
+    """
+    Wrap `et` in `Repeat`s so that it matches `dst_st`'s dims. `src_st`
+    must have a subset of `dst_st`'s dim names.
+    """
     src_names = {dim_name(d) for d in src_st}
     for d in dst_st:
         if dim_name(d) not in src_names:

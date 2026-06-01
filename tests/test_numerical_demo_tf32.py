@@ -92,7 +92,7 @@ def test_tf32_matmul_aa_bound_dominates_measured(reset, m, n, k):
     # --- AA prediction ---
     a_form = AffineForm.with_noise(0.0, fresh_noise("A"), a_input_radius)
     b_form = AffineForm.with_noise(0.0, fresh_noise("B"), b_input_radius)
-    leaves = {"A": a_form, "B": b_form}
+    leaves = {"A" : a_form, "B" : b_form}
 
     et = Reduce(
         op="sum", dim=K,

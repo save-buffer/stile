@@ -59,12 +59,14 @@ except Exception:
 
 @REQUIRES_JAX
 def test_pallas_reference_scalar_multiply(reset):
-    """The smallest reference: `lambda x: x * 2` stands in for the spec
-    string `"2 * TPN"`. Verifier accepts; runtime matches `2 * x`."""
+    """
+    The smallest reference: `lambda x: x * 2` stands in for the spec
+    string `"2 * TPN"`. Verifier accepts; runtime matches `2 * x`.
+    """
     N = dim("XFN", 8)
     x = tjax.random.normal(jax.random.PRNGKey(0), N)
 
-    def kernel(x_ref: tpl.TypedRef, o_ref: tpl.TypedOutputRef):
+    def kernel(x_ref : tpl.TypedRef, o_ref : tpl.TypedOutputRef):
         o_ref.assign(x_ref.load() * 2)
 
     result = tpl.typed_pallas_call(
@@ -78,8 +80,10 @@ def test_pallas_reference_scalar_multiply(reset):
 
 @REQUIRES_JAX
 def test_pallas_reference_rejects_wrong_value(reset):
-    """Kernel doubles but the reference says triple — the ExprTypes
-    don't normalize equal, so `.assign` rejects before the store."""
+    """
+    Kernel doubles but the reference says triple — the ExprTypes
+    don't normalize equal, so `.assign` rejects before the store.
+    """
     N = dim("XFN2", 8)
     x = tjax.random.normal(jax.random.PRNGKey(0), N)
 
@@ -96,8 +100,10 @@ def test_pallas_reference_rejects_wrong_value(reset):
 
 @REQUIRES_JAX
 def test_pallas_reference_rejects_wrong_dtype(reset):
-    """The reference computes in f32 (inputs are f32) but the output is
-    declared bf16 — the dtype check rejects at resolution time."""
+    """
+    The reference computes in f32 (inputs are f32) but the output is
+    declared bf16 — the dtype check rejects at resolution time.
+    """
     N = dim("XFN3", 8)
     x = tjax.random.normal(jax.random.PRNGKey(0), N)
 
@@ -114,8 +120,10 @@ def test_pallas_reference_rejects_wrong_dtype(reset):
 
 @REQUIRES_JAX
 def test_pallas_reference_rejects_wrong_shape(reset):
-    """The reference reduces the dim away (shape `()`), disagreeing with
-    the declared output shape — the ShapeType check rejects."""
+    """
+    The reference reduces the dim away (shape `()`), disagreeing with
+    the declared output shape — the ShapeType check rejects.
+    """
     N = dim("XFN4", 8)
     x = tjax.random.normal(jax.random.PRNGKey(0), N)
 
@@ -132,8 +140,10 @@ def test_pallas_reference_rejects_wrong_shape(reset):
 
 @REQUIRES_JAX
 def test_pallas_reference_two_inputs_positional(reset):
-    """Two inputs: the reference receives them positionally in call
-    order. `lambda a, b: a + b` stands in for `"a + b"`."""
+    """
+    Two inputs: the reference receives them positionally in call
+    order. `lambda a, b: a + b` stands in for `"a + b"`.
+    """
     N = dim("XFADD", 8)
     a = tjax.random.normal(jax.random.PRNGKey(0), N, name="a")
     b = tjax.random.normal(jax.random.PRNGKey(1), N, name="b")
@@ -151,11 +161,13 @@ def test_pallas_reference_two_inputs_positional(reset):
 
 @REQUIRES_JAX
 def test_pallas_reference_matmul_tiled(reset):
-    """Tiled matmul against a jax reference. The reference runs on the
+    """
+    Tiled matmul against a jax reference. The reference runs on the
     full inputs to produce the full-output ExprType, which is then
     tile-restricted exactly like a parsed spec — so the per-block
     `assign(...)` certifies the tile equals the reference's matmul
-    restricted to that tile."""
+    restricted to that tile.
+    """
     M, N, K = dim("XFM", 16), dim("XFN5", 8), dim("XFK", 16)
     BM, BK = 8, 8
     a = tjax.random.normal(jax.random.PRNGKey(0), M, N, name="a")
@@ -188,19 +200,21 @@ def test_pallas_reference_matmul_tiled(reset):
 @REQUIRES_TRITON
 @REQUIRES_TORCH
 def test_triton_reference_verification(reset):
-    """Verification half only (no GPU): the `@ttl.jit` decorator runs the
+    """
+    Verification half only (no GPU): the `@ttl.jit` decorator runs the
     torch reference `lambda X: X * 2` on symbolic inputs to get the
-    expected ExprType, then checks the kernel body against it."""
+    expected ExprType, then checks the kernel body against it.
+    """
     N = dim("XFTTN", 128)
     BLOCK = 32
 
     @ttl.jit(
         spec=lambda X: X * 2,
-        inputs={"X_ptr": "X:XFTTN"},
+        inputs={"X_ptr" : "X:XFTTN"},
         out_shape=(N,),
         out_dtype=torch.float32,
     )
-    def double(X_ptr, o_ptr, BLOCK: tl.constexpr):
+    def double(X_ptr, o_ptr, BLOCK : tl.constexpr):
         pid = tl.program_id(0)
         X = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
         result = X * 2
@@ -212,19 +226,21 @@ def test_triton_reference_verification(reset):
 @REQUIRES_TRITON
 @REQUIRES_TORCH
 def test_triton_reference_rejects_mismatch(reset):
-    """Kernel stores `X * 3` but the reference says `X * 2` — decoration
-    raises when the stored ExprType doesn't match the reference's."""
+    """
+    Kernel stores `X * 3` but the reference says `X * 2` — decoration
+    raises when the stored ExprType doesn't match the reference's.
+    """
     N = dim("XFTTN2", 128)
     BLOCK = 32
 
     with pytest.raises(AssertionError, match="does not match spec"):
         @ttl.jit(
             spec=lambda X: X * 2,
-            inputs={"X_ptr": "X:XFTTN2"},
+            inputs={"X_ptr" : "X:XFTTN2"},
             out_shape=(N,),
             out_dtype=torch.float32,
         )
-        def bad(X_ptr, o_ptr, BLOCK: tl.constexpr):
+        def bad(X_ptr, o_ptr, BLOCK : tl.constexpr):
             pid = tl.program_id(0)
             X = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
             ttl.store(o_ptr, X * 3, N[pid * BLOCK : (pid + 1) * BLOCK])
@@ -233,20 +249,22 @@ def test_triton_reference_rejects_mismatch(reset):
 @REQUIRES_TRITON
 @REQUIRES_TORCH
 def test_triton_reference_rejects_wrong_shape(reset):
-    """The reference's output shape (a reduction to a scalar over the
+    """
+    The reference's output shape (a reduction to a scalar over the
     block dim) disagrees with the declared `out_shape` — decoration
-    raises from the ShapeType check before touching the kernel body."""
+    raises from the ShapeType check before touching the kernel body.
+    """
     N = dim("XFTTN3", 128)
     BLOCK = 32
 
     with pytest.raises(ValueError, match="shape"):
         @ttl.jit(
             spec=lambda X: X.sum(N),
-            inputs={"X_ptr": "X:XFTTN3"},
+            inputs={"X_ptr" : "X:XFTTN3"},
             out_shape=(N,),
             out_dtype=torch.float32,
         )
-        def bad(X_ptr, o_ptr, BLOCK: tl.constexpr):
+        def bad(X_ptr, o_ptr, BLOCK : tl.constexpr):
             pid = tl.program_id(0)
             X = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
             ttl.store(o_ptr, X * 2, N[pid * BLOCK : (pid + 1) * BLOCK])
@@ -255,18 +273,20 @@ def test_triton_reference_rejects_wrong_shape(reset):
 @REQUIRES_CUDA
 @REQUIRES_TRITON
 def test_triton_reference_scalar_multiply_launch(reset):
-    """Full path on GPU: verify against the torch reference, emit, launch,
-    and numerically check `x * 2`."""
+    """
+    Full path on GPU: verify against the torch reference, emit, launch,
+    and numerically check `x * 2`.
+    """
     N = dim("XFTTN4", 128)
     BLOCK = 32
 
     @ttl.jit(
         spec=lambda X: X * 2,
-        inputs={"X_ptr": "X:XFTTN4"},
+        inputs={"X_ptr" : "X:XFTTN4"},
         out_shape=(N,),
         out_dtype=torch.float32,
     )
-    def double(X_ptr, o_ptr, BLOCK: tl.constexpr):
+    def double(X_ptr, o_ptr, BLOCK : tl.constexpr):
         pid = tl.program_id(0)
         X = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
         result = X * 2
@@ -281,10 +301,12 @@ def test_triton_reference_scalar_multiply_launch(reset):
 @REQUIRES_CUDA
 @REQUIRES_TRITON
 def test_triton_reference_matmul_launch(reset):
-    """Two-input matmul against a torch reference, full GPU launch. The
+    """
+    Two-input matmul against a torch reference, full GPU launch. The
     reference `lambda A, B: tt.einsum(A, B, "M K, K N -> M N")` stands in
     for the spec `"(A:M K, B:K N -> M N)"` and receives the inputs
-    positionally in `inputs={...}` order."""
+    positionally in `inputs={...}` order.
+    """
     M = dim("XFMM", 32)
     N = dim("XFNN", 32)
     K = dim("XFKK", 32)
@@ -294,13 +316,13 @@ def test_triton_reference_matmul_launch(reset):
 
     @ttl.jit(
         spec=lambda A, B: tt.einsum(A, B, "XFMM XFKK, XFKK XFNN -> XFMM XFNN"),
-        inputs={"A_ptr": "A:XFMM XFKK", "B_ptr": "B:XFKK XFNN"},
+        inputs={"A_ptr" : "A:XFMM XFKK", "B_ptr" : "B:XFKK XFNN"},
         out_shape=(M, N),
         out_dtype=torch.float32,
     )
     def matmul(
         A_ptr, B_ptr, C_ptr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        BLOCK_M : tl.constexpr, BLOCK_N : tl.constexpr, BLOCK_K : tl.constexpr,
     ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)

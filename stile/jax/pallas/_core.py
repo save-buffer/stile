@@ -105,13 +105,15 @@ class TypedOutputRef(TypedRef):
 
 
 def _resolve_spec_et(out_type : OutputSpec, typed_inputs):
-    """Resolve an `OutputSpec` to the expected output `ExprType`.
+    """
+    Resolve an `OutputSpec` to the expected output `ExprType`.
 
     For a spec string, parse it. For a reference function, run it on the
     call-time inputs (re-wrapped so their stile `Type` carries the real
     array dtype, making the reference's output dtype checkable) and verify
     the reference's output ShapeType / dtype against the declaration before
-    returning its ExprType."""
+    returning its ExprType.
+    """
     if not callable(out_type.spec):
         return parse_spec_into_type(out_type.spec).et
     ref_inputs = [

@@ -63,8 +63,10 @@ def _build_numpy_args(*, dtype):
 
 
 def test_sensitivity_returns_sensitivity(reset):
-    """Smoke: identity swap (no tensors named in `swap`) is a no-op
-    and yields widening = 1.0."""
+    """
+    Smoke: identity swap (no tensors named in `swap`) is a no-op
+    and yields widening = 1.0.
+    """
     A, B = _build_numpy_args(dtype=np.float32)
     s = sensitivity_analysis(_einsum_kernel_numpy, (A, B), swap={})
     assert isinstance(s, Sensitivity)
@@ -72,14 +74,16 @@ def test_sensitivity_returns_sensitivity(reset):
 
 
 def test_swap_one_input_promotes_back_widening_minimal(reset):
-    """Swapping just `A` to float16 does NOT widen the bound, because
+    """
+    Swapping just `A` to float16 does NOT widen the bound, because
     numpy promotes `fp16 × fp32 → fp32` — the einsum still runs at
     fp32 precision. This is the correct ablation answer: "downgrading
     A alone has no effect under promotion semantics", and the
-    sensitivity analysis correctly surfaces that."""
+    sensitivity analysis correctly surfaces that.
+    """
     A, B = _build_numpy_args(dtype=np.float32)
     s = sensitivity_analysis(
-        _einsum_kernel_numpy, (A, B), swap={"A": "float16"},
+        _einsum_kernel_numpy, (A, B), swap={"A" : "float16"},
     )
     # The bound moves only marginally — driven by the truncation of
     # A's values when cast to fp16, not by op rounding.
@@ -87,12 +91,14 @@ def test_swap_one_input_promotes_back_widening_minimal(reset):
 
 
 def test_swap_both_inputs_widens(reset):
-    """When ALL inputs are downgraded to float16, the einsum's output
+    """
+    When ALL inputs are downgraded to float16, the einsum's output
     dtype follows (fp16), and the `einsum-mul-round` noise widens by
-    ≈ MACHINE_EPS[fp16] / MACHINE_EPS[fp32] ≈ 8192×."""
+    ≈ MACHINE_EPS[fp16] / MACHINE_EPS[fp32] ≈ 8192×.
+    """
     A, B = _build_numpy_args(dtype=np.float32)
     s = sensitivity_analysis(
-        _einsum_kernel_numpy, (A, B), swap={"A": "float16", "B": "float16"},
+        _einsum_kernel_numpy, (A, B), swap={"A" : "float16", "B" : "float16"},
     )
     # Total widening dominated by the data-dependent `mul-cross`
     # (cancels in ratio at ~1.0) plus the dtype-driven `*-round`
@@ -109,26 +115,30 @@ def test_swap_both_inputs_widens(reset):
 
 
 def test_sensitivity_per_label_keys_are_op_round_labels(reset):
-    """The per-label breakdown surfaces the actual `*-round` labels
+    """
+    The per-label breakdown surfaces the actual `*-round` labels
     each op attaches. For a single-einsum kernel under the default
     `WORST_CASE` (sequential) reduction we expect the multiply-round
-    label and the seq-sum-K accumulator label."""
+    label and the seq-sum-K accumulator label.
+    """
     A, B = _build_numpy_args(dtype=np.float32)
     s = sensitivity_analysis(
         _einsum_kernel_numpy, (A, B),
-        swap={"A": "float16", "B": "float16"},
+        swap={"A" : "float16", "B" : "float16"},
     )
     labels = set(s.per_label.keys())
     assert any("mul-round" in l for l in labels), labels
 
 
 def test_sensitivity_summary_renders(reset):
-    """The Sensitivity object has a `summary()` method that produces
-    a multi-line string for terminal printing."""
+    """
+    The Sensitivity object has a `summary()` method that produces
+    a multi-line string for terminal printing.
+    """
     A, B = _build_numpy_args(dtype=np.float32)
     s = sensitivity_analysis(
         _einsum_kernel_numpy, (A, B),
-        swap={"A": "float16", "B": "float16"},
+        swap={"A" : "float16", "B" : "float16"},
     )
     text = s.summary()
     assert "total widening" in text
@@ -137,9 +147,11 @@ def test_sensitivity_summary_renders(reset):
 
 @REQUIRES_JAX
 def test_sensitivity_jax_bf16(reset):
-    """End-to-end JAX path: swapping both `A` and `B` to bfloat16
+    """
+    End-to-end JAX path: swapping both `A` and `B` to bfloat16
     widens the einsum-mul-round noise (the einsum then runs at
-    bfloat16 precision throughout)."""
+    bfloat16 precision throughout).
+    """
     M = dim("M", 4)
     K = dim("K", 8)
     N = dim("N", 4)
@@ -153,7 +165,7 @@ def test_sensitivity_jax_bf16(reset):
         return tjax.einsum(A, B, "M K, K N -> M N")
 
     s = sensitivity_analysis(
-        kernel, (A, B), swap={"A": "bfloat16", "B": "bfloat16"},
+        kernel, (A, B), swap={"A" : "bfloat16", "B" : "bfloat16"},
     )
     assert s.widening > 1.0
 
@@ -174,6 +186,6 @@ def test_sensitivity_torch_bf16(reset):
         return ttorch.einsum(A, B, "M K, K N -> M N")
 
     s = sensitivity_analysis(
-        kernel, (A, B), swap={"A": "bfloat16", "B": "bfloat16"},
+        kernel, (A, B), swap={"A" : "bfloat16", "B" : "bfloat16"},
     )
     assert s.widening > 1.0

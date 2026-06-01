@@ -163,12 +163,14 @@ _active_hardware_stack : "list[HardwareNumerics]" = []
 
 
 def active_hardware() -> HardwareNumerics:
-    """The current `HardwareNumerics` in effect. Reads the top of the
+    """
+    The current `HardwareNumerics` in effect. Reads the top of the
     `numerical_context` stack; falls back to `WORST_CASE` when no
     context is active. Every typed op handler that wants to attach
     eager AA noise reads this — backends ship their own preset and
     push it via `numerical_context(hardware=NVIDIA_TENSOR_CORE_TF32)`
-    or similar."""
+    or similar.
+    """
     if _active_hardware_stack:
         return _active_hardware_stack[-1]
     return WORST_CASE

@@ -26,7 +26,7 @@ import stile.type as t
 from ..type import (
     Type, ShapeType, Tensor, Constant, BinaryOp, UnaryOp, Sliced, TagCond,
     dim_size, dim_full_dim, dim_name, as_int,
-    substitute_tensor_in_et,
+    substitute_tensor_in_et, override_dims_in_type,
 )
 from ..specification import parse_spec_into_type, parse_predicate, LexState
 from ..verification import (
@@ -36,7 +36,7 @@ from ..verification import (
     tile_dim_ranges,
 )
 from ..indexing import (
-    SymbolicInt, to_affine, LoopScope, runtime_scalar_names,
+    SymbolicInt, to_affine, AffineExpr, LoopScope, runtime_scalar_names,
 )
 from ..torch._core import (
     TypedTorchTensor, make_symbolic_input, dtype_to_datatype,
@@ -46,7 +46,8 @@ from ..reference import run_reference, check_output_against_declaration
 
 @dataclass(frozen=True)
 class _OutputDecl:
-    """Internal per-output bundle. Single-output kernels have one of
+    """
+    Internal per-output bundle. Single-output kernels have one of
     these; multi-output kernels have N. `ptr_name` is the kernel-arg
     name (assigned from `fn_def.args.args[len(inputs) + i]`).
 
@@ -54,7 +55,8 @@ class _OutputDecl:
     spec-language string (`spec`, re-parsed where needed) or a
     pre-resolved `Type` (`spec_type`) — the latter set when the user
     passed a reference function instead of a spec string. `_output_spec_type`
-    returns whichever applies."""
+    returns whichever applies.
+    """
     ptr_name : str
     spec : "str | None"
     shape : "tuple"
@@ -63,9 +65,11 @@ class _OutputDecl:
 
 
 def _output_spec_type(o : "_OutputDecl", rt_names) -> Type:
-    """The expected output `Type` for an output decl — a pre-resolved
+    """
+    The expected output `Type` for an output decl — a pre-resolved
     `spec_type` (reference path) or the spec string re-parsed (string
-    path)."""
+    path).
+    """
     if o.spec_type is not None:
         return o.spec_type
     return parse_spec_into_type(o.spec, loop_vars=rt_names)
@@ -75,13 +79,15 @@ def _resolve_reference_output(
     ref_fn, inputs : dict, declared_shape : tuple, declared_dtype,
     rt_names, label : str,
 ) -> Type:
-    """Run a torch reference `ref_fn` on symbolic inputs built from the
+    """
+    Run a torch reference `ref_fn` on symbolic inputs built from the
     kernel's `inputs={...}` specs and return the expected output `Type`
     (the declared shape/dtype carrying the reference's ExprType).
 
     Symbolic inputs are built in `declared_dtype` so the reference's
     output dtype is checkable against the declaration. The reference must
-    return a single typed value (per output pointer)."""
+    return a single typed value (per output pointer).
+    """
     declared_dt = (
         dtype_to_datatype(declared_dtype) if declared_dtype is not None else None
     )
@@ -261,11 +267,13 @@ def jit(
 
 
 def _resolve_decoration_grid(grid, consts : dict) -> tuple:
-    """Resolve a decoration-time `grid=` to a concrete int tuple. A
+    """
+    Resolve a decoration-time `grid=` to a concrete int tuple. A
     callable is invoked with the consts dict (Triton's `grid(meta)`
     convention); a bare int becomes a 1-tuple; every entry is coerced
     to `int` (dim sizes / const arithmetic are concrete at
-    decoration)."""
+    decoration).
+    """
     if callable(grid):
         grid = grid(dict(consts))
     if isinstance(grid, int):
@@ -281,13 +289,15 @@ def _resolve_decoration_grid(grid, consts : dict) -> tuple:
 
 @dataclass(frozen=True)
 class _ProgramIdMarker:
-    """Sentinel returned by `_interpret_expr` for `tl.program_id(N)`.
+    """
+    Sentinel returned by `_interpret_expr` for `tl.program_id(N)`.
     Carries `axis` (the `N` from `tl.program_id(N)`); the surrounding
     `Assign(target=Name, value=ProgramId)` binds the target name as a
     fresh `SymbolicInt` in env so subsequent `target * BLOCK`
     arithmetic resolves symbolically, and the verifier stashes
     `target → axis` in `pid_axes` so the launcher can later
-    substitute the grid range for coverage checking."""
+    substitute the grid range for coverage checking.
+    """
     axis : int
 
 
@@ -375,7 +385,6 @@ def _verify_kernel(
             target = stmt.targets[0].id
             val = _interpret_expr(stmt.value, env, input_types, dim_atoms)
             if isinstance(val, _ProgramIdMarker):
-                from ..indexing import SymbolicInt
                 env[target] = SymbolicInt(name=target)
                 pid_axes[target] = val.axis
             elif val is not None:
@@ -385,7 +394,7 @@ def _verify_kernel(
             rhs = _interpret_expr(stmt.value, env, input_types, dim_atoms)
             if target in env and rhs is not None:
                 op_str = {
-                    ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/",
+                    ast.Add : "+", ast.Sub : "-", ast.Mult : "*", ast.Div : "/",
                 }.get(type(stmt.op))
                 if op_str is not None:
                     env[target] = t.type_from_binary_op(env[target], rhs, op_str)
@@ -484,9 +493,9 @@ def _verify_kernel(
         )
 
     return {
-        "stored_slices": stored_slices,
-        "pid_axes": pid_axes,
-        "loop_var_ranges": loop_var_ranges,
+        "stored_slices" : stored_slices,
+        "pid_axes" : pid_axes,
+        "loop_var_ranges" : loop_var_ranges,
     }
 
 
@@ -521,10 +530,12 @@ def _resolve_store_slices(
 
 
 def _collect_dim_atoms(fn) -> dict:
-    """Build `name -> FullDim` for every closure / referenced global
+    """
+    Build `name -> FullDim` for every closure / referenced global
     that's a stile dim. Used by the AST-to-SymbolicIndex evaluator to
     resolve things like `K[lo:hi]` and `range(0, K, BLOCK_K)`.
-    Closure entries take precedence (function-local shadows the global)."""
+    Closure entries take precedence (function-local shadows the global).
+    """
     out : dict = {}
     closure = fn.__closure__ or ()
     for name, cell in zip(fn.__code__.co_freevars, closure):
@@ -816,7 +827,6 @@ def _verify_for_with_invariant(
         # trick `typed_pallas_call` uses for tile-aware invariants.
         before = env.get(var_name)
         if isinstance(before, Type):
-            from ..type import override_dims_in_type
             tile_overrides = tuple(
                 d for d in before.st if isinstance(d, Sliced)
             )
@@ -999,7 +1009,6 @@ def _restrict_spec_to_tile(spec_type, slices, out_shape, env, dim_atoms):
         overrides.append(Sliced(dim_atom, lo, hi))
     if not overrides:
         return spec_type
-    from ..type import override_dims_in_type
     return override_dims_in_type(spec_type, *overrides)
 
 
@@ -1011,7 +1020,6 @@ def _eval_symindex(node, env, dim_atoms):
     default to a fresh `SymbolicInt(name)` so e.g. `pid_m * BLOCK_M`
     yields `AffineExpr(0, {(pid_m, BLOCK_M)})`.
     """
-    from ..indexing import SymbolicInt, to_affine
     if isinstance(node, ast.Constant) and isinstance(node.value, int):
         return node.value
     if isinstance(node, ast.Name):
@@ -1069,9 +1077,11 @@ def _is_tl_call(node, name : str) -> bool:
 
 
 def _peel_pointer_base(node) -> "str | None":
-    """`out_ptr + offs` → `"out_ptr"`. Recurse through `+` /
+    """
+    `out_ptr + offs` → `"out_ptr"`. Recurse through `+` /
     parenthesizations so we still find the base under a nested
-    expression."""
+    expression.
+    """
     if isinstance(node, ast.Name):
         return node.id
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
@@ -1163,7 +1173,6 @@ def _interpret_expr(node, env, input_types, dim_atoms):
             if lo is None or hi is None:
                 return base
             overrides.append(Sliced(dim_atom, lo, hi))
-        from ..type import override_dims_in_type
         return override_dims_in_type(base, *overrides)
     if _is_tl_call(node, "dot"):
         a_type = _interpret_expr(node.args[0], env, input_types, dim_atoms)
@@ -1349,11 +1358,11 @@ def _interpret_expr(node, env, input_types, dim_atoms):
         try:
             on_val = eval(
                 compile(ast.Expression(body=ast.fix_missing_locations(on_kw.value)), "<ttl.mask>", "eval"),
-                {"__builtins__": __builtins__}, {},
+                {"__builtins__" : __builtins__}, {},
             )
             off_val = eval(
                 compile(ast.Expression(body=ast.fix_missing_locations(off_kw.value)), "<ttl.mask>", "eval"),
-                {"__builtins__": __builtins__}, {},
+                {"__builtins__" : __builtins__}, {},
             )
         except Exception:
             return None
@@ -1397,7 +1406,7 @@ def _interpret_expr(node, env, input_types, dim_atoms):
                     ast.Expression(body=ast.fix_missing_locations(value_kw.value)),
                     "<ttl.full-value>", "eval",
                 ),
-                {"__builtins__": __builtins__},
+                {"__builtins__" : __builtins__},
                 {},
             )
         except Exception:
@@ -1490,7 +1499,7 @@ def _interpret_expr(node, env, input_types, dim_atoms):
         if l is None or r is None:
             return None
         op_str = {
-            ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/",
+            ast.Add : "+", ast.Sub : "-", ast.Mult : "*", ast.Div : "/",
         }.get(type(node.op))
         if op_str is None:
             return None
@@ -1501,8 +1510,10 @@ def _interpret_expr(node, env, input_types, dim_atoms):
 
 
 def _is_broadcast_subscript(node : ast.Subscript) -> bool:
-    """True iff every slice element is either `:` or `None` — i.e.,
-    the subscript is purely a broadcasting / new-axis annotation."""
+    """
+    True iff every slice element is either `:` or `None` — i.e.,
+    the subscript is purely a broadcasting / new-axis annotation.
+    """
     s = node.slice
     elts = s.elts if isinstance(s, ast.Tuple) else [s]
     for e in elts:
@@ -1731,7 +1742,7 @@ class _RewriteTtlCalls(ast.NodeTransformer):
         ast.fix_missing_locations(new_value)
         if not prelude:
             return None
-        new_node = type(node)(**{**node.__dict__, "value": new_value})
+        new_node = type(node)(**{**node.__dict__, "value" : new_value})
         ast.fix_missing_locations(new_node)
         # Run the rewriter again over the lifted assigns so they hit
         # `_rewrite_mask_assign`.
@@ -2112,22 +2123,25 @@ class _RewriteTtlCalls(ast.NodeTransformer):
 
 
 def _as_stmt_list(x) -> "list[ast.stmt]":
-    """Some rewriter paths return a single stmt, others a list of
-    stmts (prelude + final). Normalize for caller flattening."""
+    """
+    Some rewriter paths return a single stmt, others a list of
+    stmts (prelude + final). Normalize for caller flattening.
+    """
     if isinstance(x, list):
         return x
     return [x]
 
 
 _AST_CMP_OPS = {
-    "<": ast.Lt, "<=": ast.LtE,
-    ">": ast.Gt, ">=": ast.GtE,
-    "==": ast.Eq, "!=": ast.NotEq,
+    "<" : ast.Lt, "<=" : ast.LtE,
+    ">" : ast.Gt, ">=" : ast.GtE,
+    "==" : ast.Eq, "!=" : ast.NotEq,
 }
 
 
 def _parse_simple_predicate(s : str) -> "list[list[tuple[_PredTerm, str, _PredTerm]]] | None":
-    """Parse a DNF predicate `<conj> [|| <conj>]*` where each `<conj>`
+    """
+    Parse a DNF predicate `<conj> [|| <conj>]*` where each `<conj>`
     is `<atom> [&& <atom>]*` and each `<atom>` is `<term> <op> <term>`.
     A term is a bare identifier, bare integer, or `<name> ± <int>` /
     `<int> + <name>`. `&&` binds tighter than `||`. The verifier side
@@ -2162,12 +2176,14 @@ def _parse_simple_predicate(s : str) -> "list[list[tuple[_PredTerm, str, _PredTe
 
 @dataclass(frozen=True)
 class _PredTerm:
-    """A predicate atom side: either a bare integer (`name=None`,
+    """
+    A predicate atom side: either a bare integer (`name=None`,
     `offset=k`) or a dim-name with an integer offset (`name=DIM`,
     `offset=k`, meaning `DIM + k`). Anything richer (coefficients,
     arithmetic on both sides, name1 ± name2) is rejected by
     `_parse_pred_term` and falls through to the rewriter's failure
-    path."""
+    path.
+    """
     name : "str | None"
     offset : int
 
@@ -2424,13 +2440,14 @@ def _check_coverage_at_launch(
     the constant-slice footgun (`ttl.store(O, val, M[0:BM])` forgot
     to vary by pid_m), off-by-one grid bounds, and stride mismatches.
     """
-    from ..indexing import to_affine, AffineExpr, SymbolicInt
     consts = {**kernel.consts, **launch_kwargs}
 
     def _resolve(expr, substitutions : dict) -> "int | None":
-        """Resolve an AffineExpr/SymbolicInt/int to a concrete int
+        """
+        Resolve an AffineExpr/SymbolicInt/int to a concrete int
         under `substitutions: SymbolicInt → int`. Returns None if any
-        atom in `expr.terms` isn't substituted and isn't a known dim."""
+        atom in `expr.terms` isn't substituted and isn't a known dim.
+        """
         if isinstance(expr, int):
             return expr
         a = to_affine(expr)
@@ -2447,9 +2464,11 @@ def _check_coverage_at_launch(
         return total
 
     def _enumerate_substitutions(sym_vars : list) -> "list[dict]":
-        """All concrete `{SymbolicInt: int}` substitutions for the
+        """
+        All concrete `{SymbolicInt: int}` substitutions for the
         given symbolic vars under their declared ranges. Handles pids
-        (range `[0, grid[axis])`) and loop vars (`(lo, hi, step)`)."""
+        (range `[0, grid[axis])`) and loop vars (`(lo, hi, step)`).
+        """
         results = [{}]
         for sym in sym_vars:
             name = sym.name
@@ -2468,7 +2487,7 @@ def _check_coverage_at_launch(
                 values = list(range(lo_i, hi_i, step_i))
             else:
                 return []  # unknown var → can't enumerate
-            results = [{**s, sym: v} for s in results for v in values]
+            results = [{**s, sym : v} for s in results for v in values]
         return results
 
     for output in kernel.outputs:
@@ -2533,8 +2552,10 @@ def _check_coverage_at_launch(
 def _union_intervals(
     intervals : "list[tuple[int, int]]",
 ) -> "list[tuple[int, int]]":
-    """Union of half-open `[lo, hi)` intervals over ints. Returns a
-    sorted list of disjoint intervals."""
+    """
+    Union of half-open `[lo, hi)` intervals over ints. Returns a
+    sorted list of disjoint intervals.
+    """
     if not intervals:
         return []
     sorted_iv = sorted(intervals)

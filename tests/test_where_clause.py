@@ -153,9 +153,11 @@ def test_where_equality_predicate(reset):
 # --- mask_tensor: the canonical mask that compares equal to `where P` --
 
 def test_mask_tensor_matches_where_clause(reset):
-    """`value * mask_tensor(dims, domain)` canonicalizes to the same form
+    """
+    `value * mask_tensor(dims, domain)` canonicalizes to the same form
     as the parsed `where`-clause lowering — the recipe a frontend needs
-    to build a mask that compares equal."""
+    to build a mask that compares equal.
+    """
     N = dim("N", 8)
     spec = parse_spec_into_type("X:N where N < 4")
     dom = mkdomain({LoopVariable("N")}, [lt(LoopVariable("N"), 4)])
@@ -169,7 +171,8 @@ def test_mask_tensor_matches_where_clause(reset):
 
 
 def test_mask_tensor_wrong_name_does_not_match(reset):
-    """The `name` is the mask's leaf identity: a mask built with a
+    """
+    The `name` is the mask's leaf identity: a mask built with a
     different name is a distinct leaf and won't compare equal. This is
     the footgun `mask_tensor`'s `name="_mask"` default protects against.
     """

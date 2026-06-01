@@ -22,9 +22,11 @@ from stile.verification import verify_exprs_equivalent
 
 
 def test_scatter_same_idx_structural_equality(reset):
-    """Two `scatter`s with identical source, dim, and idx tensor
+    """
+    Two `scatter`s with identical source, dim, and idx tensor
     produce structurally identical expressions — opaque scatter
-    matches by name."""
+    matches by name.
+    """
     M = dim("M", 8)
     N = dim("N", 32)
     D = dim("D", 4)
@@ -36,9 +38,11 @@ def test_scatter_same_idx_structural_equality(reset):
 
 
 def test_scatter_string_syntax(reset):
-    """The spec parser recognizes `scatter[dim_in_dest](source, idx)`
+    """
+    The spec parser recognizes `scatter[dim_in_dest](source, idx)`
     just like `gather[...]`, and produces the same `Scatter` ExprType
-    a programmatic `.scatter(...)` would."""
+    a programmatic `.scatter(...)` would.
+    """
     M = dim("M", 8)
     N = dim("N", 32)
     D = dim("D", 4)
@@ -52,11 +56,13 @@ def test_scatter_string_syntax(reset):
 
 
 def test_scatter_gather_permutation_round_trip(reset):
-    """When `perm` is declared a permutation,
+    """
+    When `perm` is declared a permutation,
     `scatter(gather(Y, perm), perm) = Y` and the dual identity hold.
     The verifier recognizes the wrapped scatter/gather, checks the
     `permutation` property on the inner index, and unwraps to `Y`
-    directly."""
+    directly.
+    """
     N = dim("N", 16)
     D = dim("D", 4)
     Y = tjax.random.normal(jax.random.PRNGKey(0), N, D, name="Y")
@@ -72,10 +78,12 @@ def test_scatter_gather_permutation_round_trip(reset):
 
 
 def test_scatter_gather_non_permutation_does_not_collapse(reset):
-    """Without the `permutation` property, the verifier doesn't apply
+    """
+    Without the `permutation` property, the verifier doesn't apply
     the round-trip rewrite — the wrapped scatter/gather is *not*
     structurally equal to the inner source. Guards against the
-    rewrite firing accidentally on opaque indices."""
+    rewrite firing accidentally on opaque indices.
+    """
     N = dim("N", 16)
     D = dim("D", 4)
     Y = tjax.random.normal(jax.random.PRNGKey(0), N, D, name="Y")

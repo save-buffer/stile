@@ -9,6 +9,7 @@ import stile.type as t
 from ..type import *
 from ..specification import parse_spec_into_type
 from ..verification import verify_types_equivalent, verify_exprs_equivalent
+from ..indexing import declare_index_properties
 from ..numerical import (
     AffineForm, leaf_aa_from_array, active_hardware,
     compose_binary, compose_unary, compose_einsum,
@@ -27,10 +28,10 @@ _NO_AA_DEFAULT = object()
 # `sensitivity_analysis`. Keys match `MACHINE_EPS` (so the same dtype
 # string round-trips through eps lookup and the cast).
 _TORCH_DTYPE_MAP = {
-    "float64":  torch.float64,
-    "float32":  torch.float32,
-    "float16":  torch.float16,
-    "bfloat16": torch.bfloat16,
+    "float64" :  torch.float64,
+    "float32" :  torch.float32,
+    "float16" :  torch.float16,
+    "bfloat16" : torch.bfloat16,
 }
 # FP8 variants exist on newer torch versions; add them when present so
 # import doesn't break on older installs without them.
@@ -53,30 +54,36 @@ def _datatype_to_torch(dt : "DataType | None"):
 
 # torch.dtype -> stile DataType (None for dtypes stile doesn't model).
 _TORCH_TO_DATATYPE = {
-    torch.bfloat16: DataType.bfloat16,
-    torch.float32:  DataType.float32,
-    torch.float64:  DataType.float64,
+    torch.bfloat16 : DataType.bfloat16,
+    torch.float32 :  DataType.float32,
+    torch.float64 :  DataType.float64,
 }
 
 def dtype_to_datatype(torch_dtype) -> "DataType | None":
-    """Map a `torch.dtype` to the stile `DataType` it corresponds to, or
-    `None` if stile doesn't model it (so it acts as a dtype wildcard)."""
+    """
+    Map a `torch.dtype` to the stile `DataType` it corresponds to, or
+    `None` if stile doesn't model it (so it acts as a dtype wildcard).
+    """
     return _TORCH_TO_DATATYPE.get(torch_dtype)
 
 
 def make_symbolic_input(type : Type) -> "TypedTorchTensor":
-    """Build a zero-backed `TypedTorchTensor` for `type` — a symbolic input
+    """
+    Build a zero-backed `TypedTorchTensor` for `type` — a symbolic input
     for running a torch reference function. The array's dtype follows
     `type.dt` (default float32) so the reference's output dtype is
-    meaningful; the values are irrelevant (we only read the result's type)."""
+    meaningful; the values are irrelevant (we only read the result's type).
+    """
     shape = tuple(as_int(dim_size(d)) for d in type.st)
     arr = torch.zeros(shape, dtype=_datatype_to_torch(type.dt))
     return TypedTorchTensor(arr, type)
 
 
 def _aa_of(value) -> "AffineForm | None":
-    """Pull the `.aa` off a TypedTorchTensor, or wrap a numeric
-    scalar as a zero-radius constant form."""
+    """
+    Pull the `.aa` off a TypedTorchTensor, or wrap a numeric
+    scalar as a zero-radius constant form.
+    """
     if isinstance(value, TypedTorchTensor):
         return value.aa
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -104,10 +111,12 @@ class TypedTorchTensor:
         return self.tensor.data_ptr()
 
     def astype(self, dtype : str) -> "TypedTorchTensor":
-        """Recast the underlying tensor to `dtype` (a `MACHINE_EPS`
+        """
+        Recast the underlying tensor to `dtype` (a `MACHINE_EPS`
         key such as `"bfloat16"` / `"fp8_e4m3"`); used by
         `sensitivity_analysis` to swap a named input's precision
-        without changing shape or stile type."""
+        without changing shape or stile type.
+        """
         torch_dtype = _TORCH_DTYPE_MAP[dtype]
         return TypedTorchTensor(self.tensor.to(torch_dtype), self.type)
 
@@ -375,7 +384,6 @@ def runtime_index(
     Registers algebraic properties (`permutation` / `partition`) with
     the verifier so the surrounding gather/scatter rewrites apply.
     """
-    from ..indexing import declare_index_properties
     props = []
     if permutation:
         props.append("permutation")
@@ -393,8 +401,10 @@ def runtime_index(
 def gather(
     src : TypedTorchTensor, dim : FullDim, idx : TypedTorchTensor,
 ) -> TypedTorchTensor:
-    """Gather `src` along `dim` using `idx` (a 1-D index tensor over
-    `dim`). Mirrors `TypedJaxArray.gather`."""
+    """
+    Gather `src` along `dim` using `idx` (a 1-D index tensor over
+    `dim`). Mirrors `TypedJaxArray.gather`.
+    """
     new_type = src.type.gather(dim, idx.type)
     axis = next(
         i for i, d in enumerate(src.type.st) if dim_name(d) == dim_name(dim)

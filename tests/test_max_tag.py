@@ -63,10 +63,12 @@ def test_max_of_score_plus_bias_equals_explicit_tag(reset):
 
 
 def test_two_tile_max_fuses_with_shared_predicate(reset):
-    """`max(max_{n in [0,4)} (score+bias), max_{n in [4,8)} (score+bias))`
+    """
+    `max(max_{n in [0,4)} (score+bias), max_{n in [4,8)} (score+bias))`
     ≡ `max_{n in [0,8)} (score+bias)`. The bias→tag fold runs per-tile,
     then `make_max`'s reduce-merge unions the intervals while preserving
-    the shared cross-variable predicate."""
+    the shared cross-variable predicate.
+    """
     N = dim("MFN", 8)
     Q = dim("MFQ", 8)
     n = LoopVariable("MFN")
@@ -87,9 +89,11 @@ def test_two_tile_max_fuses_with_shared_predicate(reset):
 
 
 def test_max_drops_neg_inf_child(reset):
-    """`max(a, -inf)` collapses to `a` — pre-existing behavior, pinned
+    """
+    `max(a, -inf)` collapses to `a` — pre-existing behavior, pinned
     here so future regressions in `make_max` are caught alongside the
-    new tagged-fusion work."""
+    new tagged-fusion work.
+    """
     N = dim("MDN", 4)
     a = Tensor(dims=(N,))
     expr = BinaryOp("max", a, Constant(float("-inf")))

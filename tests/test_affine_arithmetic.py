@@ -62,7 +62,7 @@ def test_scale_is_linear(reset):
     x = AffineForm.with_noise(2.0, ex, 1.5)
     y = scale(x, -4.0)
     assert y.central == -8.0
-    assert dict(y.noise) == {ex: -6.0}
+    assert dict(y.noise) == {ex : -6.0}
 
 
 def test_mul_preserves_linear_correlation_adds_cross_term(reset):
@@ -96,7 +96,7 @@ def test_mul_with_constant_has_no_cross_term(reset):
     k = AffineForm.constant(4.0)
     prod = mul(a, k)
     assert prod.central == 12.0
-    assert dict(prod.noise) == {ex: 8.0}
+    assert dict(prod.noise) == {ex : 8.0}
 
 
 def test_exp_linearization_bounds_the_curve(reset):

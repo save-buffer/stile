@@ -33,6 +33,10 @@ from .affine import (
     affine_unary, round_fp, MACHINE_EPS,
 )
 from .hardware import HardwareNumerics, WORST_CASE
+from ..type import (
+    Constant, Tensor, UnaryOp, BinaryOp, Repeat, Reduce,
+    Gather, Scatter, TagCond, dim_size, as_int,
+)
 
 
 def evaluate(
@@ -65,11 +69,6 @@ def evaluate(
 
 
 def _eval(node, leaves, hw : HardwareNumerics, tag_noise_cache : dict) -> AffineForm:
-    from ..type import (
-        Constant, Tensor, UnaryOp, BinaryOp, Repeat, Reduce,
-        Gather, Scatter, TagCond,
-    )
-
     if isinstance(node, Constant):
         return AffineForm.constant(float(node.value))
 
@@ -139,7 +138,6 @@ def _eval(node, leaves, hw : HardwareNumerics, tag_noise_cache : dict) -> Affine
 
     if isinstance(node, Reduce):
         child = _eval(node.child, leaves, hw, tag_noise_cache)
-        from ..type import dim_size, as_int
         n = as_int(dim_size(node.dim))
         if n is None:
             raise NotImplementedError(
@@ -208,7 +206,6 @@ def _eval_tagged_tensor(
     expected to recognize `exp(... + bias_mask)` and route through
     `_eval_exp_of_bias_masked`. A bare encounter raises.
     """
-    from ..type import Constant
     tag = node.tag
     if not (isinstance(tag.if_true, Constant)
             and isinstance(tag.if_false, Constant)):
@@ -239,11 +236,12 @@ def _eval_tagged_tensor(
 
 
 def _is_bias_masked_add(node) -> bool:
-    """True iff `node` is `BinaryOp(+, x, mask)` where `mask` is a
+    """
+    True iff `node` is `BinaryOp(+, x, mask)` where `mask` is a
     Tensor with a bias-form TagCond tag (one branch is ±inf). The
     `exp(...)` handler peeks for this so it can short-circuit the
-    bound — bias masks aren't representable in AA on their own."""
-    from ..type import BinaryOp, Tensor, Constant, TagCond
+    bound — bias masks aren't representable in AA on their own.
+    """
     if not isinstance(node, BinaryOp) or node.op != "+":
         return False
     for side in (node.lhs, node.rhs):
@@ -269,7 +267,6 @@ def _eval_exp_of_bias_masked(
     subsequent uses correlate. The on-branch value is bounded by the
     fully-rounded exp(x); the off-branch is identically zero.
     """
-    from ..type import BinaryOp, Tensor, Constant, TagCond
     # Find x and the mask among the +'s operands.
     if isinstance(add_node.lhs, Tensor) and isinstance(add_node.lhs.tag, TagCond):
         mask, x = add_node.lhs, add_node.rhs
@@ -314,9 +311,11 @@ def _eval_exp_of_bias_masked(
 def _sum_reduction(
     child : AffineForm, n : int, hw : HardwareNumerics,
 ) -> AffineForm:
-    """Sum of N copies of `child` under `hw.reduction_order`. The
+    """
+    Sum of N copies of `child` under `hw.reduction_order`. The
     accumulator runs at `hw.acc_dtype`, which may be wider than the
-    op's input dtype (e.g. bf16 inputs, fp32 accumulator on TPU)."""
+    op's input dtype (e.g. bf16 inputs, fp32 accumulator on TPU).
+    """
     if n <= 0:
         return AffineForm.constant(0.0)
     if n == 1:

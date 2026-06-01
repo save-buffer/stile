@@ -21,8 +21,10 @@ from stile.verification import verify_exprs_equivalent
 
 
 def test_scalar_sum_invariant(reset):
-    """A scalar accumulator: `acc[k+1] = acc[k] + X[k]`. Invariant is
-    `sum over n in [0, k) of X[n]`."""
+    """
+    A scalar accumulator: `acc[k+1] = acc[k] + X[k]`. Invariant is
+    `sum over n in [0, k) of X[n]`.
+    """
     N = dim("N", 16)
     X = tjax.random.normal(jax.random.PRNGKey(0), N, name="X")
 
@@ -54,8 +56,10 @@ def test_invariant_base_case_failure_rejected(reset):
 
 
 def test_invariant_inductive_step_failure_rejected(reset):
-    """If `body(k, invariant[k])` doesn't equal `invariant[k+1]`, the
-    verifier rejects."""
+    """
+    If `body(k, invariant[k])` doesn't equal `invariant[k+1]`, the
+    verifier rejects.
+    """
     N = dim("N", 16)
     X = tjax.random.normal(jax.random.PRNGKey(0), N, name="X")
 
@@ -71,11 +75,13 @@ def test_invariant_inductive_step_failure_rejected(reset):
 
 
 def test_tiled_dot_product_invariant(reset):
-    """Tile-walked cumulative dot product `Σ X[i] * Y[i]`. The body
+    """
+    Tile-walked cumulative dot product `Σ X[i] * Y[i]`. The body
     walks `N` in tiles of `BN` and accumulates one tile's
     `(X[tile] * Y[tile]).sum(N)`. The invariant uses a symbolic upper
     bound `BN * k`, exercising symbolic-interval-merge with non-unit
-    coefficients."""
+    coefficients.
+    """
     N = dim("N", 16)
     BN = 4
     X = tjax.random.normal(jax.random.PRNGKey(0), N, name="X")
@@ -96,10 +102,12 @@ def test_tiled_dot_product_invariant(reset):
 
 
 def test_online_softmax_running_max_invariant(reset):
-    """The simplest online-softmax piece: just track `running_max =
+    """
+    The simplest online-softmax piece: just track `running_max =
     max over n in [0, BN*k) of qk[n]` as a rolled loop. Each iteration
     walks one nctx tile, takes its max, and folds into the running
-    max. Single scalar state, no rescaling — pure max invariant."""
+    max. Single scalar state, no rescaling — pure max invariant.
+    """
     nctx = dim("nctx", 8)
     BN = 4
     qk = tjax.random.normal(jax.random.PRNGKey(0), nctx, name="qk")
@@ -118,14 +126,16 @@ def test_online_softmax_running_max_invariant(reset):
 
 
 def test_online_softmax_aggregates_invariant(reset):
-    """Online softmax's `(running_max, running_l)` running aggregates,
+    """
+    Online softmax's `(running_max, running_l)` running aggregates,
     where `l[k] = sum over n in [0, BN*k) of exp(qk[n] - m[k])` —
     crucially `l[k]` depends on `m[k]`. The body rescales `l[k]` by
     `exp(m[k] - m[k+1])` to re-anchor it on the new max. The verifier
     has to discharge the algebraic identity
     `exp(m[k] - m[k+1]) * Σ exp(qk - m[k]) = Σ exp(qk - m[k+1])`,
     which falls out of `normalize_exp` distributing exp across sums
-    plus fraction cancellation."""
+    plus fraction cancellation.
+    """
     nctx = dim("nctx", 8)
     BN = 4
     qk = tjax.random.normal(jax.random.PRNGKey(0), nctx, name="qk")
@@ -166,8 +176,10 @@ def _softmax_jnp(qk, *, axis=-1):
 
 
 def _causal_attention_jnp(Q, K, V):
-    """Reference causal softmax attention (no scaling). qctx_size ==
-    nctx_size for the local tests; mask is `k_idx <= q_idx`."""
+    """
+    Reference causal softmax attention (no scaling). qctx_size ==
+    nctx_size for the local tests; mask is `k_idx <= q_idx`.
+    """
     qctx_size = Q.shape[0]
     nctx_size = K.shape[0]
     qk = jnp.einsum("qd,nd->qn", Q, K)
@@ -368,7 +380,8 @@ def test_flash_attention_via_invariant_skip_tail(reset):
 
 
 def test_tuple_state_invariant(reset):
-    """Tuple state: track both `sum X[n]` and `sum X[n]^2` simultaneously.
+    """
+    Tuple state: track both `sum X[n]` and `sum X[n]^2` simultaneously.
     Invariant is a tuple of two specs.
 
     Note: the squared accumulator uses `(slice * slice).sum(N)` rather
@@ -376,7 +389,8 @@ def test_tuple_state_invariant(reset):
     only because the slice has a single element; the verifier folds
     the former into a clean `Reduce(sum, [k,k+1), X*X)` that
     tile-merges with the running invariant, while the latter would
-    leave a square-of-a-reduce that doesn't fold."""
+    leave a square-of-a-reduce that doesn't fold.
+    """
     N = dim("N", 8)
     X = tjax.random.normal(jax.random.PRNGKey(0), N, name="X")
 

@@ -16,9 +16,11 @@ from stile import dim, reset_stile
 
 
 def test_scalar_multiply(reset):
-    """The smallest possible typed-pallas kernel: load the input, scale
+    """
+    The smallest possible typed-pallas kernel: load the input, scale
     by 2, store. Spec says `2 * TPN`. Verifier must accept and the
-    runtime must match `2 * x`."""
+    runtime must match `2 * x`.
+    """
     N = dim("TPN", 8)
     x = tjax.random.normal(jax.random.PRNGKey(0), N)
 
@@ -35,8 +37,10 @@ def test_scalar_multiply(reset):
 
 
 def test_scalar_multiply_wrong_factor_rejected(reset):
-    """Spec says `2 * TPN_W` but kernel multiplies by 3 — verifier
-    rejects at `.assign(...)` time, before the store."""
+    """
+    Spec says `2 * TPN_W` but kernel multiplies by 3 — verifier
+    rejects at `.assign(...)` time, before the store.
+    """
     N = dim("TPN_W", 8)
     x = tjax.random.normal(jax.random.PRNGKey(0), N)
 
@@ -52,10 +56,12 @@ def test_scalar_multiply_wrong_factor_rejected(reset):
 
 
 def test_vector_add(reset):
-    """Two distinct same-shape inputs, summed elementwise. The spec
+    """
+    Two distinct same-shape inputs, summed elementwise. The spec
     uses explicit `a:` / `b:` labels so the two tensors are treated as
     distinct leaves; the kernel inputs are constructed with matching
-    `name=` so the spec-side and kernel-side identities align."""
+    `name=` so the spec-side and kernel-side identities align.
+    """
     N = dim("VAN", 16)
     a = tjax.random.normal(jax.random.PRNGKey(0), N, name="a")
     b = tjax.random.normal(jax.random.PRNGKey(1), N, name="b")
@@ -92,10 +98,12 @@ def test_vector_add_with_scaled_operands(reset):
 
 
 def test_matmul(reset):
-    """Non-tiled matmul: spec `(M N, N K -> M K)`. The kernel runs the
+    """
+    Non-tiled matmul: spec `(M N, N K -> M K)`. The kernel runs the
     full einsum inside a single Pallas invocation. Inputs have distinct
     dim signatures (`M N` vs `N K`), so they're separate leaves and
-    the verifier sees a real contraction."""
+    the verifier sees a real contraction.
+    """
     M, N, K = dim("M", 8), dim("N", 8), dim("K", 8)
     a = tjax.random.normal(jax.random.PRNGKey(0), M, N)
     b = tjax.random.normal(jax.random.PRNGKey(1), N, K)
@@ -115,13 +123,15 @@ def test_matmul(reset):
 
 
 def test_matmul_tiled(reset):
-    """Tiled matmul: grid=(M//BM, K//BK), each invocation matmuls one
+    """
+    Tiled matmul: grid=(M//BM, K//BK), each invocation matmuls one
     `(BM, N)` tile of A by one `(N, BK)` tile of B into one `(BM, BK)`
     tile of the output. Stile derives each ref's `Type` from its
     BlockSpec — the M-axis of A and the K-axis of B come back sliced
     by the (symbolic) `program_id`. The per-block `assign(...)`
     certifies that the kernel's tile equals the spec's matmul
-    restricted to the tile."""
+    restricted to the tile.
+    """
     M, N, K = dim("M", 16), dim("N", 8), dim("K", 16)
     BM, BK = 8, 8
     a = tjax.random.normal(jax.random.PRNGKey(0), M, N, name="a")
@@ -148,9 +158,11 @@ def test_matmul_tiled(reset):
 
 
 def test_matmul_tiled_wrong_factor_rejected(reset):
-    """Tiled kernel with the same buggy double-factor as the JAX-level
+    """
+    Tiled kernel with the same buggy double-factor as the JAX-level
     test. Spec says `2 * matmul`; kernel multiplies BOTH operands by
-    2, yielding 4× — verifier rejects per-block."""
+    2, yielding 4× — verifier rejects per-block.
+    """
     M, N, K = dim("M", 16), dim("N", 8), dim("K", 16)
     BM, BK = 8, 8
     a = tjax.random.normal(jax.random.PRNGKey(0), M, N, name="a")
@@ -179,14 +191,16 @@ def test_matmul_tiled_wrong_factor_rejected(reset):
 
 
 def test_flash_attention(reset):
-    """Real flash attention on Pallas: grid parallelizes over qctx
+    """
+    Real flash attention on Pallas: grid parallelizes over qctx
     tiles, the inner Python loop streams over nctx tiles using online
     softmax. The full QK matrix is never materialized; per-iteration
     aggregates are `running_max`, `running_l`, and `o`. The verifier
     merges each iteration's `Reduce(sum/max, dim=Sliced(nctx, ...))`
     into a single full-nctx `Reduce` and proves equivalence to
     `softmax[nctx](...)` via the same online-softmax convergence we
-    have on the JAX backend."""
+    have on the JAX backend.
+    """
     qctx = dim("qctx", 16)
     nctx = dim("nctx", 16)
     dhead = dim("dhead", 16)
@@ -365,13 +379,15 @@ def test_flash_attention_rolled_inner(reset):
 
 
 def test_causal_flash_attention(reset):
-    """Causal flash attention on Pallas: streaming online softmax over
+    """
+    Causal flash attention on Pallas: streaming online softmax over
     nctx tiles with a per-tile bias mask. Same shape as the dense
     streaming case but each tile adds `tjax.mask(...,
     "nctx <= qctx", 0.0, -jnp.inf)` before the softmax. The slice's
     qctx offset is symbolic at trace time (`pl.program_id(0) * BQ`)
     and the nctx tile offset is the Python-loop ictx; both flow
-    through `loop_var_binding` and the dim_start machinery."""
+    through `loop_var_binding` and the dim_start machinery.
+    """
     qctx = dim("qctx", 16)
     nctx = dim("nctx", 16)
     dhead = dim("dhead", 16)
@@ -471,7 +487,8 @@ def test_causal_flash_attention(reset):
 
 
 def test_causal_decode_attention(reset):
-    """Decode-step causal attention: a small number of new query
+    """
+    Decode-step causal attention: a small number of new query
     tokens (`qctx`) attending against a longer K/V cache (`nctx`).
     Each new query at local position `q` corresponds to absolute
     position `q + offset` where `offset = nctx.size - qctx.size`. The
@@ -480,7 +497,8 @@ def test_causal_decode_attention(reset):
     index. We hardcode the offset into the predicate via an f-string —
     the parser's `Affine + int` grammar accepts it directly, so both
     the kernel-side `tjax.mask(...)` and the spec-side OutputSpec see
-    the same constraint with the same literal."""
+    the same constraint with the same literal.
+    """
     qctx = dim("qctx", 8)    # 8 new tokens being decoded
     nctx = dim("nctx", 16)   # 16-token K/V cache (cache + new)
     dhead = dim("dhead", 16)
@@ -539,8 +557,10 @@ def test_causal_decode_attention(reset):
 
 
 def test_matmul_wrong_contracted_dim_rejected(reset):
-    """Spec contracts N (the shared inner dim); kernel writes the
-    wrong einsum string and contracts K instead — verifier rejects."""
+    """
+    Spec contracts N (the shared inner dim); kernel writes the
+    wrong einsum string and contracts K instead — verifier rejects.
+    """
     M, N, K = dim("M", 8), dim("N", 8), dim("K", 8)
     a = tjax.random.normal(jax.random.PRNGKey(0), M, N)
     b = tjax.random.normal(jax.random.PRNGKey(1), N, K)

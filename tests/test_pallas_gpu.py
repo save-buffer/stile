@@ -37,16 +37,20 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def gpu_compiler_params():
-    """Mosaic-GPU CompilerParams — required for `interpret=False` on a
+    """
+    Mosaic-GPU CompilerParams — required for `interpret=False` on a
     CUDA Pallas backend. Imported lazily inside the fixture so the
-    import doesn't fail on Pallas-less hosts at collection time."""
+    import doesn't fail on Pallas-less hosts at collection time.
+    """
     from jax.experimental.pallas import mosaic_gpu as plgpu
     return plgpu.CompilerParams()
 
 
 def test_scalar_multiply_gpu(reset, gpu_compiler_params):
-    """`x * 2` on real CUDA via Mosaic-GPU. Verifier proves the kernel
-    matches `2 * TPN`; runtime executes the lowering on GPU."""
+    """
+    `x * 2` on real CUDA via Mosaic-GPU. Verifier proves the kernel
+    matches `2 * TPN`; runtime executes the lowering on GPU.
+    """
     # Mosaic-GPU's warpgroup transfer requires multiples of 128 bytes
     # (32 float32s); use 128 elements as the smallest comfortable size.
     N = dim("TPN", 128)
@@ -67,8 +71,10 @@ def test_scalar_multiply_gpu(reset, gpu_compiler_params):
 
 
 def test_vector_add_gpu(reset, gpu_compiler_params):
-    """`a + b` on real CUDA, two distinct labeled inputs. Verifier
-    proves the kernel matches `a:VAN + b:VAN`."""
+    """
+    `a + b` on real CUDA, two distinct labeled inputs. Verifier
+    proves the kernel matches `a:VAN + b:VAN`.
+    """
     N = dim("VAN", 128)
     a = tjax.random.normal(jax.random.PRNGKey(0), N, name="a")
     b = tjax.random.normal(jax.random.PRNGKey(1), N, name="b")
@@ -88,10 +94,12 @@ def test_vector_add_gpu(reset, gpu_compiler_params):
 
 
 def test_scalar_multiply_wrong_factor_rejected_gpu(reset, gpu_compiler_params):
-    """Verifier rejects the `*3` kernel for the `2 * TPN` spec — the
+    """
+    Verifier rejects the `*3` kernel for the `2 * TPN` spec — the
     rejection is at trace time, before lowering, so Pallas-GPU never
     even runs. Just confirms soundness machinery doesn't change with
-    the GPU backend."""
+    the GPU backend.
+    """
     N = dim("TPN", 128)
     x = tjax.random.normal(jax.random.PRNGKey(0), N)
 

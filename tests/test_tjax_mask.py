@@ -39,8 +39,10 @@ def test_bias_mask_via_intrinsic(reset):
 
 
 def test_where_sugar_equivalent_to_explicit_mask(reset):
-    """`.where(p)` and `self * tjax.mask(self.type.st, p)` produce the
-    same TypedJaxArray (numerically and structurally)."""
+    """
+    `.where(p)` and `self * tjax.mask(self.type.st, p)` produce the
+    same TypedJaxArray (numerically and structurally).
+    """
     qctx = dim('wqctx', 4)
     nctx = dim('wnctx', 4)
     key = jax.random.PRNGKey(0)
@@ -54,8 +56,10 @@ def test_where_sugar_equivalent_to_explicit_mask(reset):
 
 
 def test_mask_runtime_respects_sliced_shape(reset):
-    """A mask built over a sliced shape evaluates the predicate at the
-    *absolute* dim positions (q_real = q_slice + iqctx), not 0..len."""
+    """
+    A mask built over a sliced shape evaluates the predicate at the
+    *absolute* dim positions (q_real = q_slice + iqctx), not 0..len.
+    """
     qctx = dim('sqctx', 8)
     nctx = dim('snctx', 8)
     iqctx, T = 4, 4
@@ -67,9 +71,11 @@ def test_mask_runtime_respects_sliced_shape(reset):
 
 
 def test_bias_form_equivalent_to_mult_form_under_exp(reset):
-    """End-to-end: `exp(x) * mask(p)` and `exp(x + mask(p, 0, -inf))`
+    """
+    End-to-end: `exp(x) * mask(p)` and `exp(x + mask(p, 0, -inf))`
     normalize to the same expression via the bias→mult convergence
-    landed in task #7."""
+    landed in task #7.
+    """
     qctx = dim('emq', 4)
     nctx = dim('emn', 4)
     key = jax.random.PRNGKey(0)

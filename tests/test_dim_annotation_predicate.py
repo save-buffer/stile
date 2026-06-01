@@ -26,8 +26,10 @@ def _single_factor(expr):
 
 
 def test_sum_dim_annotation_predicate_equivalent_to_where_clause(reset):
-    """`sum[d where P](body)` ≡ `(sum[d](body) where P)` (the older clause
-    form). Both lower to a mult-mask folded into the reduce's domain."""
+    """
+    `sum[d where P](body)` ≡ `(sum[d](body) where P)` (the older clause
+    form). Both lower to a mult-mask folded into the reduce's domain.
+    """
     dim("DAN", 8)
     spec_annot = parse_spec_into_type("sum[DAN where DAN >= 4](DAN) -> ")
     spec_clause = parse_spec_into_type("sum[DAN](DAN where DAN >= 4) -> ")
@@ -35,10 +37,12 @@ def test_sum_dim_annotation_predicate_equivalent_to_where_clause(reset):
 
 
 def test_max_dim_annotation_predicate_uses_bias_form(reset):
-    """`max[d where P](body)` lowers to `max[d](body + Cond(P, 0, -inf))`
+    """
+    `max[d where P](body)` lowers to `max[d](body + Cond(P, 0, -inf))`
     — bias-form is the right encoding for max because masked positions
     must vanish through the max identity (`-inf`), not the sum identity
-    (`0`)."""
+    (`0`).
+    """
     dim("DAMN", 8)
     dim("DAMQ", 8)
     spec = parse_spec_into_type("max[DAMN where DAMN <= DAMQ](DAMN DAMQ) -> DAMQ")
@@ -52,9 +56,11 @@ def test_max_dim_annotation_predicate_uses_bias_form(reset):
 
 
 def test_softmax_dim_annotation_predicate_restricts_iteration(reset):
-    """`softmax[d where P](body)` restricts both numerator and
+    """
+    `softmax[d where P](body)` restricts both numerator and
     denominator to P. Compare against the explicit-formula form to
-    confirm convergence."""
+    confirm convergence.
+    """
     dim("DASMQ", 8)
     dim("DASMK", 8)
     spec_annot = parse_spec_into_type(
@@ -72,8 +78,10 @@ def test_softmax_dim_annotation_predicate_restricts_iteration(reset):
 
 
 def test_dim_annotation_predicate_validates_dim_in_shape(reset):
-    """A predicate referencing a dim not in the body's shape is
-    rejected at parse time."""
+    """
+    A predicate referencing a dim not in the body's shape is
+    rejected at parse time.
+    """
     dim("DAVN", 8)
     dim("DAVM", 4)
     with pytest.raises(ValueError, match="not in the body's shape"):
@@ -81,8 +89,10 @@ def test_dim_annotation_predicate_validates_dim_in_shape(reset):
 
 
 def test_dim_annotation_predicate_with_two_dims(reset):
-    """Predicate over two body dims (the reduction dim and an outer
-    one) — same shape as the causal-attention case."""
+    """
+    Predicate over two body dims (the reduction dim and an outer
+    one) — same shape as the causal-attention case.
+    """
     dim("DAQ", 8)
     dim("DAK", 8)
     spec = parse_spec_into_type("sum[DAK where DAK <= DAQ](DAQ DAK) -> DAQ")
@@ -95,9 +105,11 @@ def test_dim_annotation_predicate_with_two_dims(reset):
 
 
 def test_softmax_predicate_unrelated_to_where_outside(reset):
-    """`softmax[d where P](body)` and `softmax[d](body) where P` mean
+    """
+    `softmax[d where P](body)` and `softmax[d](body) where P` mean
     different things. The first restricts the softmax's iteration; the
-    second multiplies the softmax's *output* by a 0/1 mask."""
+    second multiplies the softmax's *output* by a 0/1 mask.
+    """
     dim("DAUQ", 8)
     dim("DAUK", 8)
     annot = parse_spec_into_type("softmax[DAUK where DAUK <= DAUQ](DAUQ DAUK)")

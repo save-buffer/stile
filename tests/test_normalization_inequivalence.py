@@ -1,4 +1,5 @@
-"""Tests that the normalizer correctly REJECTS non-equivalent expressions.
+"""
+Tests that the normalizer correctly REJECTS non-equivalent expressions.
 
 Positive equivalences are covered in the backend-specific tests. These tests
 guard against the opposite failure mode: canonicalizing too aggressively and
@@ -32,8 +33,10 @@ def test_different_tensors(reset):
 
 
 def test_softmax_temperature_is_nonlinear(reset):
-    """softmax(x/c) is NOT softmax(x)/c — this is the bug we fixed in
-    test_flash_attention's spec."""
+    """
+    softmax(x/c) is NOT softmax(x)/c — this is the bug we fixed in
+    test_flash_attention's spec.
+    """
     dim('N', 8)
     assert_not_equivalent(
         "softmax[N](N / 4)",
@@ -99,31 +102,39 @@ def test_sum_of_repeat_is_not_identity(reset):
 # ---------------------------------------------------------------------------
 
 def test_distinct_labels_do_not_collapse_under_addition(reset):
-    """`x + y` is NOT `2 * x` when `x` and `y` are distinct labeled
+    """
+    `x + y` is NOT `2 * x` when `x` and `y` are distinct labeled
     tensors. The flaw before #16 silently accepted this; the fix makes
-    name part of the leaf identity."""
+    name part of the leaf identity.
+    """
     dim('N', 8)
     assert_not_equivalent("x:N + y:N", "2 * x:N")
 
 
 def test_distinct_labels_are_distinct_leaves(reset):
-    """Two labeled tensors with the same dim signature but different
-    labels are different tensors."""
+    """
+    Two labeled tensors with the same dim signature but different
+    labels are different tensors.
+    """
     dim('N', 8)
     assert_not_equivalent("x:N", "y:N")
 
 
 def test_anonymous_occurrences_do_not_collapse(reset):
-    """Two unlabeled tensor references in the same spec are distinct
+    """
+    Two unlabeled tensor references in the same spec are distinct
     anonymous tensors — an unlabeled `N + N` is NOT `2 * N`. (For
-    sharing, the user must use an explicit label.)"""
+    sharing, the user must use an explicit label.)
+    """
     dim('N', 8)
     assert_not_equivalent("N + N", "2 * N")
 
 
 def test_same_label_is_the_same_leaf(reset):
-    """The contract goes both ways: when the user *does* use the same
-    label, those references *do* collapse. `x + x` ≡ `2 * x`."""
+    """
+    The contract goes both ways: when the user *does* use the same
+    label, those references *do* collapse. `x + x` ≡ `2 * x`.
+    """
     dim('N', 8)
     a = parse_spec_into_type("x:N + x:N")
     b = parse_spec_into_type("2 * x:N")
@@ -171,8 +182,10 @@ def test_diff_exprs_none_for_commutative_reorder(reset):
 
 
 def test_diff_exprs_none_for_equivalent_exprs(reset):
-    """When the verifier says equivalent, diff returns None — nothing to
-    chase."""
+    """
+    When the verifier says equivalent, diff returns None — nothing to
+    chase.
+    """
     dim("N", 4)
     a = parse_spec_into_type("X:N + Y:N")
     b = parse_spec_into_type("Y:N + X:N")
@@ -180,9 +193,11 @@ def test_diff_exprs_none_for_equivalent_exprs(reset):
 
 
 def test_diff_exprs_commutative_aligns_swapped_operands(reset):
-    """With check_equivalent=False, a commutative node still aligns
+    """
+    With check_equivalent=False, a commutative node still aligns
     operands order-insensitively, so the diff points at the genuinely
-    different leaf rather than a phantom lhs/rhs swap."""
+    different leaf rather than a phantom lhs/rhs swap.
+    """
     dim("N", 4)
     # `X * Z` vs `Z * Y`: aligned by the matching `Z`, the real diff is
     # X vs Y, not a swap.

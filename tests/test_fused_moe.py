@@ -19,11 +19,13 @@ from stile.verification import verify_exprs_equivalent
 
 
 def test_fused_moe_single_block(reset):
-    """One per-expert iteration of fused MoE versus the per-token
+    """
+    One per-expert iteration of fused MoE versus the per-token
     spec sliced to that block. The kernel uses `W[g]` (singleton
     slice + reduce); the spec uses `gather(W, eid_sorted)`. Inside
     the block, the gather collapses to `W[g]` via the
-    block-constant rewrite — both forms canonicalize identically."""
+    block-constant rewrite — both forms canonicalize identically.
+    """
     n_tokens = dim("n_tokens", 16)
     d_in = dim("d_in", 4)
     d_out = dim("d_out", 8)
@@ -66,7 +68,8 @@ def test_fused_moe_single_block(reset):
 
 
 def test_fused_moe_typed_result(reset):
-    """The real fused MoE kernel verified end-to-end via TypedResult.
+    """
+    The real fused MoE kernel verified end-to-end via TypedResult.
     Each fori_loop iter computes the per-expert block matmul and
     assigns it to the output buffer via `L.assign(Y_block)`. The
     assigned tile carries `Sliced` block bounds on its type — `assign`
@@ -76,7 +79,8 @@ def test_fused_moe_typed_result(reset):
     tile ETs match. After the loop, `done()` verifies the assigned
     blocks tile the full output dim via the boundary declarations.
     Both halves — per-tile correctness and full-dim coverage — verify
-    the kernel against the per-token spec."""
+    the kernel against the per-token spec.
+    """
     n_tokens = dim("n_tokens", 16)
     d_in = dim("d_in", 4)
     d_out = dim("d_out", 8)
@@ -89,7 +93,7 @@ def test_fused_moe_typed_result(reset):
 
     offsets = tjax.runtime_index(
         "offsets", n_offsets, values_in=n_tokens,
-        boundary_values={0: 0, n_experts.size: n_tokens.size},
+        boundary_values={0 : 0, n_experts.size : n_tokens.size},
     )
     tjax.runtime_index(
         "eid_sorted", n_tokens, values_in=n_experts,
@@ -116,7 +120,8 @@ def test_fused_moe_typed_result(reset):
 
 
 def test_fused_moe_write_block_carry(reset):
-    """The carry-pattern version of fused MoE: the body threads a
+    """
+    The carry-pattern version of fused MoE: the body threads a
     `TypedResult` as the `fori_loop` carry. Each iter computes the
     per-expert block matmul and writes it via `output.write_block(tile)`
     — which delegates to `assign` for per-tile verification (block-
@@ -144,7 +149,7 @@ def test_fused_moe_write_block_carry(reset):
 
     offsets = tjax.runtime_index(
         "offsets", n_offsets, values_in=n_tokens,
-        boundary_values={0: 0, n_experts.size: n_tokens.size},
+        boundary_values={0 : 0, n_experts.size : n_tokens.size},
         arr=offsets_values,
     )
     eid_sorted = tjax.runtime_index(
@@ -221,7 +226,7 @@ def test_fused_moe_top_k(reset):
 
     offsets = tjax.runtime_index(
         "offsets", n_offsets, values_in=n_slots,
-        boundary_values={0: 0, n_experts.size: n_slots.size},
+        boundary_values={0 : 0, n_experts.size : n_slots.size},
         arr=offsets_values,
     )
     tjax.runtime_index(

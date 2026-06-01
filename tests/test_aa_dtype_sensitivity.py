@@ -77,7 +77,7 @@ def test_pointwise_add_eps_follows_output_dtype(reset):
     c32 = a32 + b32
 
     # The non-leaf noise mass on c32.aa = rounding contribution.
-    leaves = {"a32": a32.aa, "b32": b32.aa}
+    leaves = {"a32" : a32.aa, "b32" : b32.aa}
     rounding_fp32 = rounding_error_bound(c32.aa, leaves)
     # |a+b| is constant 1.5, so the rounding noise = 1.5 · eps_fp32.
     assert math.isclose(
@@ -109,10 +109,10 @@ def test_pointwise_add_widens_for_bfloat16(reset):
     c_f32 = a_f32 + b_f32
 
     bound_bf = rounding_error_bound(
-        c_bf.aa, {"a": a_bf.aa, "b": b_bf.aa},
+        c_bf.aa, {"a" : a_bf.aa, "b" : b_bf.aa},
     )
     bound_f32 = rounding_error_bound(
-        c_f32.aa, {"a": a_f32.aa, "b": b_f32.aa},
+        c_f32.aa, {"a" : a_f32.aa, "b" : b_f32.aa},
     )
 
     # bfloat16 eps is 2^-8, fp32 eps is 2^-24 ⇒ the bf16 bound should

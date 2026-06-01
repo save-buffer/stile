@@ -9,7 +9,7 @@ from .indexing import (
     Domain, AffineConstraint, interval_domain, ge, lt, and_domains,
     simplify_domain, active_loop_vars, _active_loop_scopes,
     runtime_scalar_max, index_has_property, paired_index_for_offsets,
-    resolve_symbolic_index,
+    resolve_symbolic_index, SymbolicInt,
 )
 from .frozen_counter import FrozenCounter
 
@@ -347,7 +347,6 @@ def _substitute_in_symint(
     opaque to substitution and `te(offsets, g)` stays untouched even
     when we substitute `g → k` outside of it.
     """
-    from .indexing import SymbolicInt
     if atom.source is None:
         return atom
     tensor_name, position = atom.source
@@ -772,10 +771,12 @@ _active_tile_dim_ranges : "list[dict]" = []
 
 @contextlib.contextmanager
 def tile_dim_ranges(ranges : dict):
-    """Push `{dim_name: (lo, hi)}` tile restrictions for the duration of
+    """
+    Push `{dim_name: (lo, hi)}` tile restrictions for the duration of
     a verification (both sides of the comparison see them). Used by the
     typed-Triton store check to surface the q-tile's range to the
-    symbolic-subsumption pass."""
+    symbolic-subsumption pass.
+    """
     _active_tile_dim_ranges.append(dict(ranges))
     try:
         yield
@@ -784,8 +785,10 @@ def tile_dim_ranges(ranges : dict):
 
 
 def _tile_dim_upper_inclusive(name : str) -> "SymbolicIndex | None":
-    """Inclusive symbolic upper bound for a tile-restricted dim (`hi - 1`
-    of its `[lo, hi)` slice), or None when the dim isn't restricted."""
+    """
+    Inclusive symbolic upper bound for a tile-restricted dim (`hi - 1`
+    of its `[lo, hi)` slice), or None when the dim isn't restricted.
+    """
     for frame in reversed(_active_tile_dim_ranges):
         if name in frame:
             _, hi = frame[name]
@@ -794,9 +797,11 @@ def _tile_dim_upper_inclusive(name : str) -> "SymbolicIndex | None":
 
 
 def _var_upper_inclusive(qvar, constraints) -> "SymbolicIndex | None":
-    """An inclusive upper bound `qvar <= R` (symbolic), drawn from the
+    """
+    An inclusive upper bound `qvar <= R` (symbolic), drawn from the
     conjunction (a `coeff(qvar) == -1` constraint) or, failing that, the
-    active tile-dim restriction. None if neither bounds `qvar` above."""
+    active tile-dim restriction. None if neither bounds `qvar` above.
+    """
     for c in constraints:
         if _loop_var_coeff(c.expr, qvar) == -1:
             return c.expr + to_affine(qvar)  # residue: qvar <= residue
@@ -850,22 +855,26 @@ def _drop_subsumed_symbolic_uppers(constraints : list, candidate_vars) -> list:
 
 
 def _domain_vars_from_disjuncts(disjuncts) -> frozenset:
-    """The variables actually referenced by a set of disjuncts. After
+    """
+    The variables actually referenced by a set of disjuncts. After
     dropping a constraint, the `Domain.variables` set must be recomputed
     from what's left — otherwise a variable that only appeared in the
     dropped constraint (e.g. `pid_m` in a discharged walked bound)
     lingers in `variables` and breaks `Domain` equality against the
-    spec, even though the live constraints already match."""
+    spec, even though the live constraints already match.
+    """
     return frozenset(
         v for conj in disjuncts for c in conj for v, _ in to_affine(c.expr).terms
     )
 
 
 def _simplify_mask_domain(domain : Domain) -> Domain:
-    """Drop subsumed symbolic upper bounds from a mask (`TagCond`)
+    """
+    Drop subsumed symbolic upper bounds from a mask (`TagCond`)
     predicate domain — the mask-domain counterpart of the reduce-domain
     `_drop_redundant_natural_bounds`. Tries every variable in the
-    conjunction as the candidate whose upper might be redundant."""
+    conjunction as the candidate whose upper might be redundant.
+    """
     new_disjuncts = set()
     changed = False
     for conj in domain.disjuncts:
@@ -885,9 +894,11 @@ def _simplify_mask_domain(domain : Domain) -> Domain:
 
 
 def _simplify_tag_domains(tag, walk_expr):
-    """Recursively simplify mask domains in a `NormalizedTagTree`: drop
+    """
+    Recursively simplify mask domains in a `NormalizedTagTree`: drop
     subsumed bounds in each `NormalizedTagCond.domain` and re-walk leaf
-    expressions (which may themselves carry reduces / nested masks)."""
+    expressions (which may themselves carry reduces / nested masks).
+    """
     if isinstance(tag, NormalizedTagCond):
         new_domain = _simplify_mask_domain(tag.domain)
         nt = _simplify_tag_domains(tag.if_true, walk_expr)
@@ -1285,7 +1296,8 @@ def _common_positive_scalar(children) -> "float | None":
 
 
 def make_max(children) -> "NormalizedExpr":
-    """Build a canonical NormalizedMax. Flattens nested maxes, drops -inf terms
+    """
+    Build a canonical NormalizedMax. Flattens nested maxes, drops -inf terms
     (identity for max), distributes max through tagged-tensor branches,
     merges max-Reduce children that share dim and child by unioning their
     intervals, absorbs boundary terms into ParametricMax, dedupes, and
@@ -1389,7 +1401,8 @@ def make_max(children) -> "NormalizedExpr":
 
 
 def make_sum(terms) -> "NormalizedProduct":
-    """Build a canonical sum-of-products, returned as a NormalizedProduct.
+    """
+    Build a canonical sum-of-products, returned as a NormalizedProduct.
     Flattens nested NormalizedSums, drops zero terms, combines like terms,
     merges disjoint sum-Reduce intervals, extracts common factors, and
     collapses singletons.
@@ -1503,7 +1516,8 @@ NormalizedTagTree = NormalizedExpr | NormalizedTagCond
 def _hoist_invariants_from_repeat(
     repeat : NormalizedRepeat,
 ) -> tuple[NormalizedProduct, NormalizedProduct, "NormalizedRepeat | None"]:
-    """Apply `Repeat(D, A_invar * G_vary / (B_invar * H_vary)) =
+    """
+    Apply `Repeat(D, A_invar * G_vary / (B_invar * H_vary)) =
     A_invar / B_invar * Repeat(D, G_vary / H_vary)`. Returns
     (outer numerator product, outer denominator product, simplified repeat or None).
     If the Repeat's varying part is empty, the Repeat dissolves entirely and its
@@ -1546,7 +1560,8 @@ def _hoist_invariants_from_repeat(
     return outer_num_prod, outer_den_prod, NormalizedRepeat(dims, new_child)
 
 def make_expr(num : NormalizedProduct, den : NormalizedProduct) -> NormalizedExpr:
-    """Canonical factory: cancels common factors between numerator and denominator,
+    """
+    Canonical factory: cancels common factors between numerator and denominator,
     hoists Repeat(D, ...)-invariant factors out of Repeats, enforces den.const == 1.0,
     and drops factors from a numerator whose const is 0 (zero annihilates).
     """
@@ -1737,12 +1752,14 @@ def _distribute_binop_through_tag(
 
 
 def _leaf_to_expr(leaf) -> "NormalizedExpr":
-    """A `NormalizedTagTree` leaf is either a `NormalizedExpr` (the
+    """
+    A `NormalizedTagTree` leaf is either a `NormalizedExpr` (the
     plain value at that branch) or a deeper `NormalizedTagCond`. The
     latter only appears when the tag itself is nested. For the
     same-predicate fast path in `_distribute_binop_through_tag`, we
     treat any nested `Cond` leaf by wrapping it back into a tagged
-    tensor and lifting to a `NormalizedExpr`."""
+    tensor and lifting to a `NormalizedExpr`.
+    """
     if isinstance(leaf, NormalizedTagCond):
         return NormalizedExpr.of(NormalizedTensor(
             dims=frozenset(), tag=leaf, name="_mask",
@@ -1841,7 +1858,8 @@ def div(lhs : NormalizedExpr, rhs : NormalizedExpr):
 
 
 def normalize_exp(nchild : NormalizedExpr) -> NormalizedExpr:
-    """Distribute exp across a sum: exp(a + b - c) = exp(a)*exp(b)/exp(c).
+    """
+    Distribute exp across a sum: exp(a + b - c) = exp(a)*exp(b)/exp(c).
     Collapse exp(c) = math.exp(c) for any pure-constant c — covers
     `exp(0) = 1`, `exp(-inf) = 0`, etc. Push exp through a top-level
     tagged tensor so bias-form `Cond(D, 0, -inf)` lands at mask-form
@@ -1910,10 +1928,10 @@ def _push_unary_through_tag_expr(
 
 
 _SCALAR_UNARY_OPS = {
-    "sqrt": math.sqrt,
-    "sin": math.sin,
-    "cos": math.cos,
-    "exp": math.exp,
+    "sqrt" : math.sqrt,
+    "sin" : math.sin,
+    "cos" : math.cos,
+    "exp" : math.exp,
 }
 
 def unary_op(op : UnaryOpType, nchild : NormalizedExpr) -> NormalizedExpr:
@@ -1998,7 +2016,8 @@ def repeat(dims : frozenset[FullDim], x : ExprType) -> NormalizedExpr:
             return NormalizedExpr.of(NormalizedRepeat(dims, child_normalized))
 
 def _tag_varies_with_dim(tag, dim : FullDim) -> bool:
-    """A `NormalizedTagTree` "varies with `dim`" iff its domain
+    """
+    A `NormalizedTagTree` "varies with `dim`" iff its domain
     constraints reference a variable named after `dim`, or either
     branch (recursively) varies with `dim`. Critical for the
     hoisting / Repeat-pushdown rules in `make_expr` /
@@ -2006,7 +2025,8 @@ def _tag_varies_with_dim(tag, dim : FullDim) -> bool:
     `dims=frozenset()` (e.g. `_leaf_to_expr` wrapping a `Cond(P, …)`
     where `P` references a free dim variable) would otherwise be
     reported as dim-invariant and get incorrectly moved outside a
-    Reduce / Repeat over that dim."""
+    Reduce / Repeat over that dim.
+    """
     if isinstance(tag, NormalizedTagCond):
         if any(v.name == dim.name for v in tag.domain.variables):
             return True
@@ -2020,7 +2040,8 @@ def _tag_varies_with_dim(tag, dim : FullDim) -> bool:
 
 
 def varies_with_dim(e : NormalizedFactor | NormalizedProduct | NormalizedExpr, dim : FullDim) -> bool:
-    """True iff the value of `e` changes as you move along `dim`.
+    """
+    True iff the value of `e` changes as you move along `dim`.
 
     Repeat(dim, x) is *constant* along dim (broadcasts a single value) — returns False.
     Reduce(dim, x) eliminates dim, so the result is also constant along dim — returns False.
@@ -2080,7 +2101,8 @@ def partition_by_dim_variance(
     dim : FullDim,
     expr : NormalizedProduct,
 ) -> tuple[FrozenCounter[NormalizedFactor], FrozenCounter[NormalizedFactor]]:
-    """Split a product's factors into (varying, invariant) with respect to `dim`.
+    """
+    Split a product's factors into (varying, invariant) with respect to `dim`.
 
     Varying factors must stay inside a reduce over `dim`; invariant factors can be
     hoisted out.
@@ -2098,7 +2120,8 @@ def partition_by_dim_variance(
 
 
 def strip_repeats_from_factor(factor : NormalizedFactor, dim : FullDim) -> NormalizedExpr:
-    """Recursively eliminate Repeat(dim, ...) wrappers anywhere inside `factor`.
+    """
+    Recursively eliminate Repeat(dim, ...) wrappers anywhere inside `factor`.
 
     Precondition: `factor` is dim-invariant (i.e., `not varies_with_dim(factor, dim)`).
     A `Repeat(dim, inner)` wrapper is redundant once the enclosing context no longer
@@ -2155,8 +2178,10 @@ def strip_repeats_from_factor(factor : NormalizedFactor, dim : FullDim) -> Norma
             ))
 
 def _strip_product_keeping_product(product : NormalizedProduct, dim : FullDim) -> NormalizedProduct:
-    """Shallow strip that preserves the NormalizedProduct type. Used for sum-children,
-    which must remain products."""
+    """
+    Shallow strip that preserves the NormalizedProduct type. Used for sum-children,
+    which must remain products.
+    """
     new_factors : dict[NormalizedFactor, int] = {}
     for factor, count in product.factors.items():
         stripped = strip_repeats_from_factor(factor, dim)
@@ -2169,8 +2194,10 @@ def _strip_product_keeping_product(product : NormalizedProduct, dim : FullDim) -
     return NormalizedProduct(product.const, FrozenCounter.from_dict(new_factors))
 
 def strip_repeats_from_product(product : NormalizedProduct, dim : FullDim) -> NormalizedExpr:
-    """Strip Repeats of `dim` from every factor in `product` and fold the result
-    back into a single NormalizedExpr. Assumes all factors are dim-invariant."""
+    """
+    Strip Repeats of `dim` from every factor in `product` and fold the result
+    back into a single NormalizedExpr. Assumes all factors are dim-invariant.
+    """
     result = NormalizedExpr.of(NormalizedProduct(const=product.const))
     for factor, count in product.factors.items():
         stripped = strip_repeats_from_factor(factor, dim)
@@ -2568,9 +2595,11 @@ def _try_factor_common_gather(
 
 
 def _as_gather_factor(expr : "NormalizedExpr") -> "NormalizedGather | None":
-    """If `expr` is exactly one `NormalizedGather` factor (no const, no
+    """
+    If `expr` is exactly one `NormalizedGather` factor (no const, no
     other factors, no denominator), return it. Used by Scatter's
-    round-trip rewrite to recognize a wrapped Gather."""
+    round-trip rewrite to recognize a wrapped Gather.
+    """
     if (
         expr.num.const != 1.0
         or expr.den.factors
@@ -2594,12 +2623,14 @@ def _as_scatter_factor(expr : "NormalizedExpr") -> "NormalizedScatter | None":
 
 
 def _idx_has_property(norm_idx : "NormalizedExpr", prop : str) -> bool:
-    """True iff `norm_idx` is exactly a bare `NormalizedTensor` whose
+    """
+    True iff `norm_idx` is exactly a bare `NormalizedTensor` whose
     name has been declared with `prop` via `runtime_index(...,
     permutation=True)` or similar. Sliced indices and other
     transformations don't carry the property forward — only the bare
     declared tensor counts (a sliced permutation isn't necessarily a
-    permutation of the whole)."""
+    permutation of the whole).
+    """
     if (
         norm_idx.num.const != 1.0
         or norm_idx.den.factors
@@ -2886,9 +2917,11 @@ def verify_dims_equivalent(x : ShapeType, y : ShapeType) -> bool:
     return True
 
 def verify_dtypes_equivalent(x : "DataType | None", y : "DataType | None") -> bool:
-    """Two dtypes match unless both are concrete and differ. `None`
+    """
+    Two dtypes match unless both are concrete and differ. `None`
     acts as a wildcard — a parsed spec or a leaf built without dtype
-    info doesn't constrain the dtype, so it never causes a mismatch."""
+    info doesn't constrain the dtype, so it never causes a mismatch.
+    """
     if x is not None and y is not None:
         return x == y
     return True

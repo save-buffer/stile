@@ -27,8 +27,10 @@ from stile.verification import verify_exprs_equivalent
 
 
 def test_writeback_base_preserved_structural_equality(reset):
-    """Two writebacks with identical values, dim, idx, and base are
-    structurally equal."""
+    """
+    Two writebacks with identical values, dim, idx, and base are
+    structurally equal.
+    """
     M = dim("M", 8)
     N = dim("N", 32)
     D = dim("D", 4)
@@ -41,7 +43,8 @@ def test_writeback_base_preserved_structural_equality(reset):
 
 
 def test_writeback_differs_from_zero_scatter(reset):
-    """A writeback (base = cache) is NOT equivalent to a plain scatter
+    """
+    A writeback (base = cache) is NOT equivalent to a plain scatter
     (base = 0). The base is part of the scatter's identity — collapsing
     them would be unsound (a plain scatter zeroes the untouched cache).
     """
@@ -57,8 +60,10 @@ def test_writeback_differs_from_zero_scatter(reset):
 
 
 def test_writeback_function_syntax_matches_programmatic(reset):
-    """`scatter[N](V, idx, C)` in the spec language produces the same
-    `Scatter` ET as the programmatic `.scatter(N, idx, base=C)`."""
+    """
+    `scatter[N](V, idx, C)` in the spec language produces the same
+    `Scatter` ET as the programmatic `.scatter(N, idx, base=C)`.
+    """
     M = dim("M", 8)
     N = dim("N", 32)
     D = dim("D", 4)
@@ -73,8 +78,10 @@ def test_writeback_function_syntax_matches_programmatic(reset):
 
 
 def test_writeback_except_syntax_matches_programmatic(reset):
-    """The TLA+-style `C except [N @ idx] = V` lowers to the same
-    `Scatter` ET as the programmatic writeback."""
+    """
+    The TLA+-style `C except [N @ idx] = V` lowers to the same
+    `Scatter` ET as the programmatic writeback.
+    """
     M = dim("M", 8)
     N = dim("N", 32)
     D = dim("D", 4)
@@ -113,10 +120,12 @@ def test_writeback_distinct_base_not_equal(reset):
 
 
 def test_writeback_permutation_round_trip_ignores_base(reset):
-    """`gather(scatter(V, perm, base=anything), perm) = V` when `perm`
+    """
+    `gather(scatter(V, perm, base=anything), perm) = V` when `perm`
     is a permutation: a permutation overwrites every output position,
     so the base never shows through and the round-trip recovers V
-    regardless of base."""
+    regardless of base.
+    """
     N = dim("N", 16)
     D = dim("D", 4)
     V = tjax.random.normal(jax.random.PRNGKey(0), N, D, name="V")
@@ -129,8 +138,10 @@ def test_writeback_permutation_round_trip_ignores_base(reset):
 # --- jax-style `.at[...]` accessor (friendly surface over gather/scatter)
 
 def test_at_set_matches_scatter_writeback(reset):
-    """`cache.at[N, idx].set(vals)` lowers to the same `Scatter` ET as the
-    explicit `vals.scatter(N, idx, base=cache)` writeback."""
+    """
+    `cache.at[N, idx].set(vals)` lowers to the same `Scatter` ET as the
+    explicit `vals.scatter(N, idx, base=cache)` writeback.
+    """
     M = dim("M", 8)
     N = dim("N", 32)
     D = dim("D", 4)
@@ -143,9 +154,11 @@ def test_at_set_matches_scatter_writeback(reset):
 
 
 def test_at_set_matches_except_spec(reset):
-    """`.at[N, idx].set(...)` matches the TLA+-style `except` writeback
+    """
+    `.at[N, idx].set(...)` matches the TLA+-style `except` writeback
     spec — the clean end-to-end check that the ergonomic surface lands
-    the right ET."""
+    the right ET.
+    """
     M = dim("M", 8)
     N = dim("N", 32)
     D = dim("D", 4)
@@ -170,8 +183,10 @@ def test_at_get_matches_gather(reset):
 
 
 def test_at_defaults_to_leading_axis(reset):
-    """`base.at[idx]` (no explicit dim) indexes the leading axis, like
-    jax — `cache.at[idx].set(v)` writes along the first dim."""
+    """
+    `base.at[idx]` (no explicit dim) indexes the leading axis, like
+    jax — `cache.at[idx].set(v)` writes along the first dim.
+    """
     M = dim("M", 8)
     N = dim("N", 32)
     D = dim("D", 4)
@@ -184,8 +199,10 @@ def test_at_defaults_to_leading_axis(reset):
 
 
 def test_at_set_numerically_writes_back(reset):
-    """Runtime check: `.set` keeps the base everywhere except the written
-    positions (jax `.at[idx].set` semantics)."""
+    """
+    Runtime check: `.set` keeps the base everywhere except the written
+    positions (jax `.at[idx].set` semantics).
+    """
     M = dim("M", 4)
     N = dim("N", 16)
     D = dim("D", 4)

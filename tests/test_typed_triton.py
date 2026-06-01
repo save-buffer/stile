@@ -47,7 +47,7 @@ def test_scalar_multiply_verification(reset):
 
     @ttl.jit(
         spec="2 * X:TTN",
-        inputs={"X_ptr": "X:TTN"},
+        inputs={"X_ptr" : "X:TTN"},
         out_shape=(N,),
     )
     def double(X_ptr, o_ptr, BLOCK : tl.constexpr):
@@ -74,7 +74,7 @@ def test_scalar_multiply(reset):
 
     @ttl.jit(
         spec="2 * X:TTN",
-        inputs={"X_ptr": "X:TTN"},
+        inputs={"X_ptr" : "X:TTN"},
         out_shape=(N,),
         out_dtype=torch.float32,
     )
@@ -107,7 +107,7 @@ def test_scalar_multiply_slice_syntax(reset):
 
     @ttl.jit(
         spec="2 * X:TTN",
-        inputs={"X_ptr": "X:TTN"},
+        inputs={"X_ptr" : "X:TTN"},
         out_shape=(N,),
         out_dtype=torch.float32,
     )
@@ -143,7 +143,7 @@ def test_matmul(reset):
 
     @ttl.jit(
         spec="(A:M K, B:K N -> M N)",
-        inputs={"A_ptr": "A:M K", "B_ptr": "B:K N"},
+        inputs={"A_ptr" : "A:M K", "B_ptr" : "B:K N"},
         out_shape=(M, N),
         out_dtype=torch.float32,
     )
@@ -212,10 +212,10 @@ def test_matmul_tiled_k(reset):
 
     @ttl.jit(
         spec="(A:M K, B:K N -> M N)",
-        inputs={"A_ptr": "A:M K", "B_ptr": "B:K N"},
+        inputs={"A_ptr" : "A:M K", "B_ptr" : "B:K N"},
         out_shape=(M, N),
         out_dtype=torch.float32,
-        consts={"BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N, "BLOCK_K": BLOCK_K},
+        consts={"BLOCK_M" : BLOCK_M, "BLOCK_N" : BLOCK_N, "BLOCK_K" : BLOCK_K},
     )
     def matmul(
         A_ptr, B_ptr, C_ptr,
@@ -288,17 +288,17 @@ def test_flash_attention(reset):
     @ttl.jit(
         spec=f"(softmax[nctx]({qk_spec}), V:nctx dhead -> qctx dhead)",
         inputs={
-            "Q_ptr": "Q:qctx dhead",
-            "K_ptr": "K:nctx dhead",
-            "V_ptr": "V:nctx dhead",
+            "Q_ptr" : "Q:qctx dhead",
+            "K_ptr" : "K:nctx dhead",
+            "V_ptr" : "V:nctx dhead",
         },
         out_shape=(qctx, dhead),
         out_dtype=torch.float32,
-        consts={"BQ": BQ, "BN": BN, "BD": BD},
+        consts={"BQ" : BQ, "BN" : BN, "BD" : BD},
     )
     def attn(
         Q_ptr, K_ptr, V_ptr, O_ptr,
-        BQ: tl.constexpr, BN: tl.constexpr, BD: tl.constexpr,
+        BQ : tl.constexpr, BN : tl.constexpr, BD : tl.constexpr,
     ):
         pid_m = tl.program_id(0)
         q = ttl.load(
@@ -314,7 +314,7 @@ def test_flash_attention(reset):
         )
         for ki in ttl.range(
             0, nctx // BN,
-            invariant={"m": m_inv, "l": l_inv, "o": o_inv},
+            invariant={"m" : m_inv, "l" : l_inv, "o" : o_inv},
         ):
             k = ttl.load(
                 K_ptr,
@@ -388,17 +388,17 @@ def test_flash_attention_causal(reset):
             f"V:nctx dhead -> qctx dhead)"
         ),
         inputs={
-            "Q_ptr": "Q:qctx dhead",
-            "K_ptr": "K:nctx dhead",
-            "V_ptr": "V:nctx dhead",
+            "Q_ptr" : "Q:qctx dhead",
+            "K_ptr" : "K:nctx dhead",
+            "V_ptr" : "V:nctx dhead",
         },
         out_shape=(qctx, dhead),
         out_dtype=torch.float32,
-        consts={"BQ": BQ, "BN": BN, "BD": BD},
+        consts={"BQ" : BQ, "BN" : BN, "BD" : BD},
     )
     def attn(
         Q_ptr, K_ptr, V_ptr, O_ptr,
-        BQ: tl.constexpr, BN: tl.constexpr, BD: tl.constexpr,
+        BQ : tl.constexpr, BN : tl.constexpr, BD : tl.constexpr,
     ):
         pid_m = tl.program_id(0)
         q = ttl.load(
@@ -414,7 +414,7 @@ def test_flash_attention_causal(reset):
         )
         for ki in ttl.range(
             0, nctx // BN,
-            invariant={"m": m_inv, "l": l_inv, "o": o_inv},
+            invariant={"m" : m_inv, "l" : l_inv, "o" : o_inv},
         ):
             k = ttl.load(
                 K_ptr,
@@ -515,17 +515,17 @@ def test_flash_attention_causal_tile_skip(reset):
             f"V:nctx dhead -> qctx dhead)"
         ),
         inputs={
-            "Q_ptr": "Q:qctx dhead",
-            "K_ptr": "K:nctx dhead",
-            "V_ptr": "V:nctx dhead",
+            "Q_ptr" : "Q:qctx dhead",
+            "K_ptr" : "K:nctx dhead",
+            "V_ptr" : "V:nctx dhead",
         },
         out_shape=(qctx, dhead),
         out_dtype=torch.float32,
-        consts={"BQ": BQ, "BN": BN, "BD": BD},
+        consts={"BQ" : BQ, "BN" : BN, "BD" : BD},
     )
     def attn(
         Q_ptr, K_ptr, V_ptr, O_ptr,
-        BQ: tl.constexpr, BN: tl.constexpr, BD: tl.constexpr,
+        BQ : tl.constexpr, BN : tl.constexpr, BD : tl.constexpr,
     ):
         pid_m = tl.program_id(0)
         q = ttl.load(
@@ -542,7 +542,7 @@ def test_flash_attention_causal_tile_skip(reset):
         # Tile-skip: walk key blocks 0..pid_m only — stop at the diagonal.
         for ki in ttl.range(
             0, pid_m + 1,
-            invariant={"m": m_inv, "l": l_inv, "o": o_inv},
+            invariant={"m" : m_inv, "l" : l_inv, "o" : o_inv},
         ):
             k = ttl.load(
                 K_ptr,
@@ -641,19 +641,19 @@ def test_rope(reset):
              "gather[dhead](X:n_tokens dhead, rope_perm:dhead) "
              "* sign_mask:dhead * sin_table:n_tokens dhead)",
         inputs={
-            "X_ptr":    "X:n_tokens dhead",
-            "cos_ptr":  "cos_table:n_tokens dhead",
-            "sin_ptr":  "sin_table:n_tokens dhead",
-            "perm_ptr": "rope_perm:dhead",
-            "sign_ptr": "sign_mask:dhead",
+            "X_ptr" :    "X:n_tokens dhead",
+            "cos_ptr" :  "cos_table:n_tokens dhead",
+            "sin_ptr" :  "sin_table:n_tokens dhead",
+            "perm_ptr" : "rope_perm:dhead",
+            "sign_ptr" : "sign_mask:dhead",
         },
         out_shape=(n_tokens, dhead),
         out_dtype=torch.float32,
-        consts={"BS": BS, "D": dhead.size},
+        consts={"BS" : BS, "D" : dhead.size},
     )
     def rope(
         X_ptr, cos_ptr, sin_ptr, perm_ptr, sign_ptr, O_ptr,
-        BS: tl.constexpr, D: tl.constexpr,
+        BS : tl.constexpr, D : tl.constexpr,
     ):
         pid = tl.program_id(0)
         x = ttl.load(
@@ -725,17 +725,17 @@ def test_flash_attention_shifted_causal(reset):
             f"V:nctx dhead -> qctx dhead)"
         ),
         inputs={
-            "Q_ptr": "Q:qctx dhead",
-            "K_ptr": "K:nctx dhead",
-            "V_ptr": "V:nctx dhead",
+            "Q_ptr" : "Q:qctx dhead",
+            "K_ptr" : "K:nctx dhead",
+            "V_ptr" : "V:nctx dhead",
         },
         out_shape=(qctx, dhead),
         out_dtype=torch.float32,
-        consts={"BQ": BQ, "BN": BN, "BD": BD},
+        consts={"BQ" : BQ, "BN" : BN, "BD" : BD},
     )
     def attn(
         Q_ptr, K_ptr, V_ptr, O_ptr,
-        BQ: tl.constexpr, BN: tl.constexpr, BD: tl.constexpr,
+        BQ : tl.constexpr, BN : tl.constexpr, BD : tl.constexpr,
     ):
         pid_m = tl.program_id(0)
         q = ttl.load(
@@ -751,7 +751,7 @@ def test_flash_attention_shifted_causal(reset):
         )
         for ki in ttl.range(
             0, nctx // BN,
-            invariant={"m": m_inv, "l": l_inv, "o": o_inv},
+            invariant={"m" : m_inv, "l" : l_inv, "o" : o_inv},
         ):
             k = ttl.load(
                 K_ptr,
@@ -841,21 +841,21 @@ def test_moe_per_token_dispatch(reset):
         spec="(gather[n_experts](W:n_experts d_in d_out, expert_id:n_tokens), "
              "X:n_tokens d_in -> n_tokens d_out)",
         inputs={
-            "X_ptr":   "X:n_tokens d_in",
-            "W_ptr":   "W:n_experts d_in d_out",
-            "eid_ptr": "expert_id:n_tokens",
+            "X_ptr" :   "X:n_tokens d_in",
+            "W_ptr" :   "W:n_experts d_in d_out",
+            "eid_ptr" : "expert_id:n_tokens",
         },
         out_shape=(n_tokens, d_out),
         out_dtype=torch.float32,
         consts={
-            "BT": BT, "DI": d_in.size,
-            "DO": d_out.size, "NE": n_experts.size,
+            "BT" : BT, "DI" : d_in.size,
+            "DO" : d_out.size, "NE" : n_experts.size,
         },
     )
     def moe(
         X_ptr, W_ptr, eid_ptr, O_ptr,
-        BT: tl.constexpr, DI: tl.constexpr,
-        DO: tl.constexpr, NE: tl.constexpr,
+        BT : tl.constexpr, DI : tl.constexpr,
+        DO : tl.constexpr, NE : tl.constexpr,
     ):
         pid = tl.program_id(0)
         x = ttl.load(
@@ -930,21 +930,21 @@ def test_moe_tiled(reset):
         spec="(gather[n_experts](W:n_experts d_in d_out, expert_id:n_tokens), "
              "X:n_tokens d_in -> n_tokens d_out)",
         inputs={
-            "X_ptr":   "X:n_tokens d_in",
-            "W_ptr":   "W:n_experts d_in d_out",
-            "eid_ptr": "expert_id:n_tokens",
+            "X_ptr" :   "X:n_tokens d_in",
+            "W_ptr" :   "W:n_experts d_in d_out",
+            "eid_ptr" : "expert_id:n_tokens",
         },
         out_shape=(n_tokens, d_out),
         out_dtype=torch.float32,
         consts={
-            "BT": BT, "BD_IN": BD_IN, "BD_OUT": BD_OUT,
-            "NE": n_experts.size,
+            "BT" : BT, "BD_IN" : BD_IN, "BD_OUT" : BD_OUT,
+            "NE" : n_experts.size,
         },
     )
     def moe(
         X_ptr, W_ptr, eid_ptr, O_ptr,
-        BT: tl.constexpr, BD_IN: tl.constexpr,
-        BD_OUT: tl.constexpr, NE: tl.constexpr,
+        BT : tl.constexpr, BD_IN : tl.constexpr,
+        BD_OUT : tl.constexpr, NE : tl.constexpr,
     ):
         pid_t = tl.program_id(0)
         pid_o = tl.program_id(1)
@@ -954,7 +954,7 @@ def test_moe_tiled(reset):
             d_out[pid_o * BD_OUT : (pid_o + 1) * BD_OUT],
         )
         for ki in ttl.range(
-            0, d_in // BD_IN, invariant={"acc": inv},
+            0, d_in // BD_IN, invariant={"acc" : inv},
         ):
             x = ttl.load(
                 X_ptr,
@@ -1009,14 +1009,14 @@ def test_multi_output_relu_maximum_float_const(reset):
             f"relu({SCALE} * X:N)",
             f"maximum({SCALE} * X:N, Y:N)",
         ],
-        inputs={"X_ptr": "X:N", "Y_ptr": "Y:N"},
+        inputs={"X_ptr" : "X:N", "Y_ptr" : "Y:N"},
         out_shape=[(N,), (N,)],
         out_dtype=[torch.float32, torch.float32],
-        consts={"BLOCK": BLOCK, "SCALE": SCALE},
+        consts={"BLOCK" : BLOCK, "SCALE" : SCALE},
     )
     def kernel(
         X_ptr, Y_ptr, OutRelu_ptr, OutMax_ptr,
-        BLOCK: tl.constexpr, SCALE: tl.constexpr,
+        BLOCK : tl.constexpr, SCALE : tl.constexpr,
     ):
         pid = tl.program_id(0)
         x = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
@@ -1056,12 +1056,12 @@ def test_mask_or_predicate(reset):
 
     @ttl.jit(
         spec="X:N where N < 8 || N >= 24",
-        inputs={"X_ptr": "X:N"},
+        inputs={"X_ptr" : "X:N"},
         out_shape=(N,),
         out_dtype=torch.float32,
-        consts={"BLOCK": BLOCK},
+        consts={"BLOCK" : BLOCK},
     )
-    def kernel(X_ptr, O_ptr, BLOCK: tl.constexpr):
+    def kernel(X_ptr, O_ptr, BLOCK : tl.constexpr):
         pid = tl.program_id(0)
         x = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
         mult_mask = ttl.mask(
@@ -1102,13 +1102,13 @@ def test_persistent_grid_strided_loop(reset):
 
     @ttl.jit(
         spec="2 * X:N",
-        inputs={"X_ptr": "X:N"},
+        inputs={"X_ptr" : "X:N"},
         out_shape=(N,),
         out_dtype=torch.float32,
-        consts={"BLOCK": BLOCK, "NUM_TILES": N.size // BLOCK},
+        consts={"BLOCK" : BLOCK, "NUM_TILES" : N.size // BLOCK},
     )
     def kernel(
-        X_ptr, O_ptr, BLOCK: tl.constexpr, NUM_TILES: tl.constexpr,
+        X_ptr, O_ptr, BLOCK : tl.constexpr, NUM_TILES : tl.constexpr,
     ):
         pid = tl.program_id(0)
         num_pid = tl.num_programs(0)
@@ -1144,13 +1144,13 @@ def test_abs_relu_static_range_cdiv(reset):
 
     @ttl.jit(
         spec="abs(X:N)",
-        inputs={"X_ptr": "X:N"},
+        inputs={"X_ptr" : "X:N"},
         out_shape=(N,),
         out_dtype=torch.float32,
-        consts={"BLOCK": BLOCK, "N_SIZE": N.size},
+        consts={"BLOCK" : BLOCK, "N_SIZE" : N.size},
     )
     def kernel(
-        X_ptr, O_ptr, BLOCK: tl.constexpr, N_SIZE: tl.constexpr,
+        X_ptr, O_ptr, BLOCK : tl.constexpr, N_SIZE : tl.constexpr,
     ):
         for tile_id in ttl.static_range(0, tl.cdiv(N_SIZE, BLOCK)):
             x = ttl.load(
@@ -1198,12 +1198,12 @@ def test_l1_normalize_module_level_dims(reset):
 
     @ttl.jit(
         spec="raw:L1_N L1_Bin / sum[L1_Bin](abs(raw:L1_N L1_Bin))",
-        inputs={"R_ptr": "raw:L1_N L1_Bin"},
+        inputs={"R_ptr" : "raw:L1_N L1_Bin"},
         out_shape=(_L1_N, _L1_Bin),
         out_dtype=torch.float32,
-        consts={"BN": BN, "BB": BB},
+        consts={"BN" : BN, "BB" : BB},
     )
-    def kernel(R_ptr, O_ptr, BN: tl.constexpr, BB: tl.constexpr):
+    def kernel(R_ptr, O_ptr, BN : tl.constexpr, BB : tl.constexpr):
         pid = tl.program_id(0)
         raw = ttl.load(R_ptr, _L1_N[pid * BN : (pid + 1) * BN], _L1_Bin[0 : BB])
         abs_sum = tl.sum(tl.abs(raw), axis=1)
@@ -1239,12 +1239,12 @@ def test_kernel_composition(reset):
 
     @ttl.jit(
         spec="relu(X:N)",
-        inputs={"X_ptr": "X:N"},
+        inputs={"X_ptr" : "X:N"},
         out_shape=(N,),
         out_dtype=torch.float32,
-        consts={"BLOCK": BLOCK},
+        consts={"BLOCK" : BLOCK},
     )
-    def relu_kernel(X_ptr, Y_ptr, BLOCK: tl.constexpr):
+    def relu_kernel(X_ptr, Y_ptr, BLOCK : tl.constexpr):
         pid = tl.program_id(0)
         x = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
         ttl.store(
@@ -1254,12 +1254,12 @@ def test_kernel_composition(reset):
 
     @ttl.jit(
         spec="2 * Y:N",
-        inputs={"Y_ptr": "Y:N"},
+        inputs={"Y_ptr" : "Y:N"},
         out_shape=(N,),
         out_dtype=torch.float32,
-        consts={"BLOCK": BLOCK},
+        consts={"BLOCK" : BLOCK},
     )
-    def double_kernel(Y_ptr, Z_ptr, BLOCK: tl.constexpr):
+    def double_kernel(Y_ptr, Z_ptr, BLOCK : tl.constexpr):
         pid = tl.program_id(0)
         y = ttl.load(Y_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
         ttl.store(
@@ -1307,13 +1307,13 @@ def test_static_if_use_bias(reset):
 
         @ttl.jit(
             spec=spec,
-            inputs={"X_ptr": "X:BiasN", "BIAS_ptr": "bias:BiasN"},
+            inputs={"X_ptr" : "X:BiasN", "BIAS_ptr" : "bias:BiasN"},
             out_shape=(N,), out_dtype=torch.float32,
-            consts={"BLOCK": BLOCK, "USE_BIAS": use_bias},
+            consts={"BLOCK" : BLOCK, "USE_BIAS" : use_bias},
         )
         def kernel(
             X_ptr, BIAS_ptr, O_ptr,
-            BLOCK: tl.constexpr, USE_BIAS: tl.constexpr,
+            BLOCK : tl.constexpr, USE_BIAS : tl.constexpr,
         ):
             pid = tl.program_id(0)
             x = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
@@ -1352,12 +1352,12 @@ def test_unstored_output_raises(reset):
     with pytest.raises(ValueError, match="never writes to declared output"):
         @ttl.jit(
             spec="X:UnstoredN",
-            inputs={"X_ptr": "X:UnstoredN"},
+            inputs={"X_ptr" : "X:UnstoredN"},
             out_shape=(N,),
             out_dtype=torch.float32,
-            consts={"BLOCK": 8},
+            consts={"BLOCK" : 8},
         )
-        def kernel(X_ptr, O_ptr, BLOCK: tl.constexpr):
+        def kernel(X_ptr, O_ptr, BLOCK : tl.constexpr):
             # Loads but never stores to O_ptr.
             x = ttl.load(X_ptr, N[0:BLOCK])
             _unused = x + 1
@@ -1376,12 +1376,12 @@ def test_tl_where_raises(reset):
     with pytest.raises(ValueError, match="tl.where is not supported"):
         @ttl.jit(
             spec="X:WhereN",
-            inputs={"X_ptr": "X:WhereN"},
+            inputs={"X_ptr" : "X:WhereN"},
             out_shape=(N,),
             out_dtype=torch.float32,
-            consts={"BLOCK": 8},
+            consts={"BLOCK" : 8},
         )
-        def kernel(X_ptr, O_ptr, BLOCK: tl.constexpr):
+        def kernel(X_ptr, O_ptr, BLOCK : tl.constexpr):
             pid = tl.program_id(0)
             x = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
             # Using `tl.where` triggers the verifier-side raise; the
@@ -1407,12 +1407,12 @@ def test_x_to_carries_dtype(reset):
 
     @ttl.jit(
         spec="X:ToN",
-        inputs={"X_ptr": "X:ToN"},
+        inputs={"X_ptr" : "X:ToN"},
         out_shape=(N,),
         out_dtype=torch.float16,
-        consts={"BLOCK": BLOCK},
+        consts={"BLOCK" : BLOCK},
     )
-    def kernel(X_ptr, O_ptr, BLOCK: tl.constexpr):
+    def kernel(X_ptr, O_ptr, BLOCK : tl.constexpr):
         x = ttl.load(X_ptr, N[0:BLOCK])
         ttl.store(O_ptr, x.to(tl.float16), N[0:BLOCK])
 
@@ -1436,12 +1436,12 @@ def test_symbolic_loop_with_accumulator_requires_invariant(reset):
     with pytest.raises(ValueError, match="symbolic trip count"):
         @ttl.jit(
             spec="2 * X:AccN",
-            inputs={"X_ptr": "X:AccN"},
+            inputs={"X_ptr" : "X:AccN"},
             out_shape=(N,), out_dtype=torch.float32,
-            consts={"BLOCK": BLOCK, "NUM_TILES": N.size // BLOCK},
+            consts={"BLOCK" : BLOCK, "NUM_TILES" : N.size // BLOCK},
         )
         def kernel(
-            X_ptr, O_ptr, BLOCK: tl.constexpr, NUM_TILES: tl.constexpr,
+            X_ptr, O_ptr, BLOCK : tl.constexpr, NUM_TILES : tl.constexpr,
         ):
             pid = tl.program_id(0)
             num_pid = tl.num_programs(0)
@@ -1468,11 +1468,11 @@ def test_non_affine_loop_bound_raises(reset):
     with pytest.raises(ValueError, match="affine-resolvable"):
         @ttl.jit(
             spec="2 * X:AffN",
-            inputs={"X_ptr": "X:AffN"},
+            inputs={"X_ptr" : "X:AffN"},
             out_shape=(N,), out_dtype=torch.float32,
-            consts={"BLOCK": BLOCK},
+            consts={"BLOCK" : BLOCK},
         )
-        def kernel(X_ptr, O_ptr, BLOCK: tl.constexpr):
+        def kernel(X_ptr, O_ptr, BLOCK : tl.constexpr):
             pid = tl.program_id(0)
             # `tl.somethingthatdoesntexist(...)` isn't recognized by
             # the symindex evaluator — should raise affine-resolvable.
@@ -1498,11 +1498,11 @@ def test_coverage_catches_const_slice_footgun(reset):
 
     @ttl.jit(
         spec="2 * X:CovM",
-        inputs={"X_ptr": "X:CovM"},
+        inputs={"X_ptr" : "X:CovM"},
         out_shape=(M,), out_dtype=torch.float32,
-        consts={"BM": BM},
+        consts={"BM" : BM},
     )
-    def kernel(X_ptr, O_ptr, BM: tl.constexpr):
+    def kernel(X_ptr, O_ptr, BM : tl.constexpr):
         # Note: pid is unused — the store writes to a constant slice.
         pid = tl.program_id(0)
         x = ttl.load(X_ptr, M[0:BM])
@@ -1529,11 +1529,11 @@ def test_coverage_passes_for_correct_tiling(reset):
 
     @ttl.jit(
         spec="2 * X:CovM2",
-        inputs={"X_ptr": "X:CovM2"},
+        inputs={"X_ptr" : "X:CovM2"},
         out_shape=(M,), out_dtype=torch.float32,
-        consts={"BM": BM},
+        consts={"BM" : BM},
     )
-    def kernel(X_ptr, O_ptr, BM: tl.constexpr):
+    def kernel(X_ptr, O_ptr, BM : tl.constexpr):
         pid = tl.program_id(0)
         x = ttl.load(X_ptr, M[pid * BM : (pid + 1) * BM])
         ttl.store(O_ptr, x * 2, M[pid * BM : (pid + 1) * BM])
@@ -1557,12 +1557,12 @@ def test_decoration_grid_catches_const_slice_footgun(reset):
     with pytest.raises(ValueError, match="stores cover"):
         @ttl.jit(
             spec="2 * X:DecCovM",
-            inputs={"X_ptr": "X:DecCovM"},
+            inputs={"X_ptr" : "X:DecCovM"},
             out_shape=(M,), out_dtype=torch.float32,
-            consts={"BM": BM},
+            consts={"BM" : BM},
             grid=lambda c: (M.size // c["BM"],),
         )
-        def kernel(X_ptr, O_ptr, BM: tl.constexpr):
+        def kernel(X_ptr, O_ptr, BM : tl.constexpr):
             pid = tl.program_id(0)  # unused — constant-slice store
             x = ttl.load(X_ptr, M[0:BM])
             ttl.store(O_ptr, x * 2, M[0:BM])
@@ -1574,7 +1574,8 @@ def test_decoration_grid_passes_for_correct_tiling(reset):
     """
     A correctly-tiled kernel with a decoration-time `grid=` decorates
     without error, and still launches + computes correctly. Also
-    exercises the plain-tuple `grid=` form (not a callable)."""
+    exercises the plain-tuple `grid=` form (not a callable).
+    """
     M = dim("DecCovM2", 32)
     BM = 8
 
@@ -1583,12 +1584,12 @@ def test_decoration_grid_passes_for_correct_tiling(reset):
 
     @ttl.jit(
         spec="2 * X:DecCovM2",
-        inputs={"X_ptr": "X:DecCovM2"},
+        inputs={"X_ptr" : "X:DecCovM2"},
         out_shape=(M,), out_dtype=torch.float32,
-        consts={"BM": BM},
+        consts={"BM" : BM},
         grid=(M.size // BM,),
     )
-    def kernel(X_ptr, O_ptr, BM: tl.constexpr):
+    def kernel(X_ptr, O_ptr, BM : tl.constexpr):
         pid = tl.program_id(0)
         x = ttl.load(X_ptr, M[pid * BM : (pid + 1) * BM])
         ttl.store(O_ptr, x * 2, M[pid * BM : (pid + 1) * BM])
@@ -1613,12 +1614,12 @@ def test_decoration_grid_catches_off_by_one(reset):
     with pytest.raises(ValueError, match="stores cover"):
         @ttl.jit(
             spec="2 * X:DecCovM3",
-            inputs={"X_ptr": "X:DecCovM3"},
+            inputs={"X_ptr" : "X:DecCovM3"},
             out_shape=(M,), out_dtype=torch.float32,
-            consts={"BM": BM},
+            consts={"BM" : BM},
             grid=(3,),  # should be 4
         )
-        def kernel(X_ptr, O_ptr, BM: tl.constexpr):
+        def kernel(X_ptr, O_ptr, BM : tl.constexpr):
             pid = tl.program_id(0)
             x = ttl.load(X_ptr, M[pid * BM : (pid + 1) * BM])
             ttl.store(O_ptr, x * 2, M[pid * BM : (pid + 1) * BM])
@@ -1636,11 +1637,11 @@ def test_raw_tl_load_raises(reset):
     with pytest.raises(ValueError, match="tl.load is not supported"):
         @ttl.jit(
             spec="X:RawN",
-            inputs={"X_ptr": "X:RawN"},
+            inputs={"X_ptr" : "X:RawN"},
             out_shape=(N,), out_dtype=torch.float32,
-            consts={"BLOCK": 16},
+            consts={"BLOCK" : 16},
         )
-        def kernel(X_ptr, O_ptr, BLOCK: tl.constexpr):
+        def kernel(X_ptr, O_ptr, BLOCK : tl.constexpr):
             pid = tl.program_id(0)
             offs = pid * BLOCK + tl.arange(0, BLOCK)
             x = tl.load(X_ptr + offs, mask=offs < N)
@@ -1655,11 +1656,11 @@ def test_raw_tl_store_raises(reset):
     with pytest.raises(ValueError, match="tl.store is not supported"):
         @ttl.jit(
             spec="X:RawN2",
-            inputs={"X_ptr": "X:RawN2"},
+            inputs={"X_ptr" : "X:RawN2"},
             out_shape=(N,), out_dtype=torch.float32,
-            consts={"BLOCK": 16},
+            consts={"BLOCK" : 16},
         )
-        def kernel(X_ptr, O_ptr, BLOCK: tl.constexpr):
+        def kernel(X_ptr, O_ptr, BLOCK : tl.constexpr):
             pid = tl.program_id(0)
             x = ttl.load(X_ptr, N[pid * BLOCK : (pid + 1) * BLOCK])
             offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -1686,10 +1687,10 @@ def test_matmul_with_invariant(reset):
 
     @ttl.jit(
         spec="(A:M K, B:K N -> M N)",
-        inputs={"A_ptr": "A:M K", "B_ptr": "B:K N"},
+        inputs={"A_ptr" : "A:M K", "B_ptr" : "B:K N"},
         out_shape=(M, N),
         out_dtype=torch.float32,
-        consts={"BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N, "BLOCK_K": BLOCK_K},
+        consts={"BLOCK_M" : BLOCK_M, "BLOCK_N" : BLOCK_N, "BLOCK_K" : BLOCK_K},
     )
     def matmul(
         A_ptr, B_ptr, C_ptr,
@@ -1705,7 +1706,7 @@ def test_matmul_with_invariant(reset):
         for ki in ttl.range(
             0, K // BLOCK_K,
             invariant={
-                "acc": f"sum[K where K < {BLOCK_K} * ki]("
+                "acc" : f"sum[K where K < {BLOCK_K} * ki]("
                        f"A:M K * B:K N)",
             },
         ):

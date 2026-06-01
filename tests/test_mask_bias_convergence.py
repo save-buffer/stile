@@ -58,8 +58,10 @@ def _bias_form(score_tensor, mask_domain):
 
 
 def test_multiplicative_form_distributes_into_tag(reset):
-    """Multiplicative mask: `exp(x) * Cond(D, 1, 0)` collapses to a single
-    tagged tensor whose `if_true = exp(x)` and `if_false = 0`."""
+    """
+    Multiplicative mask: `exp(x) * Cond(D, 1, 0)` collapses to a single
+    tagged tensor whose `if_true = exp(x)` and `if_false = 0`.
+    """
     N = dim("MaskN", 8)
     v = LoopVariable("MaskN")
     score = Tensor(dims=(N,))
@@ -76,11 +78,13 @@ def test_multiplicative_form_distributes_into_tag(reset):
 
 
 def test_bias_form_converges_to_multiplicative(reset):
-    """Mathematically `exp(x + Cond(D, 0, -inf)) == exp(x) * Cond(D, 1, 0)`.
+    """
+    Mathematically `exp(x + Cond(D, 0, -inf)) == exp(x) * Cond(D, 1, 0)`.
     Both forms now land on the same `Cond(D, exp(x), 0)` shape: `+`
     distribution through the tag turns the bias into `Cond(D, x, x-inf)`,
     `make_sum`'s `-inf` absorption folds `x-inf` to `-inf`, and
-    `normalize_exp`'s pure-constant fold turns `exp(-inf)` into `0`."""
+    `normalize_exp`'s pure-constant fold turns `exp(-inf)` into `0`.
+    """
     N = dim("BiasN", 8)
     v = LoopVariable("BiasN")
     score = Tensor(dims=(N,))

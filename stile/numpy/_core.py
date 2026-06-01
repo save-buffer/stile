@@ -17,8 +17,10 @@ _NO_AA_DEFAULT = object()
 
 
 def _aa_of(value) -> "AffineForm | None":
-    """Pull the `.aa` off a TypedNumpyArray, or wrap a numeric scalar
-    as a zero-radius constant form."""
+    """
+    Pull the `.aa` off a TypedNumpyArray, or wrap a numeric scalar
+    as a zero-radius constant form.
+    """
     if isinstance(value, TypedNumpyArray):
         return value.aa
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -41,12 +43,14 @@ class TypedNumpyArray:
         self.aa = aa
 
     def astype(self, dtype : str) -> "TypedNumpyArray":
-        """Recast the underlying array to `dtype` (a `MACHINE_EPS` key
+        """
+        Recast the underlying array to `dtype` (a `MACHINE_EPS` key
         such as `"bfloat16"` / `"float32"`); used by
         `sensitivity_analysis` to swap a named input's precision
         without changing shape or stile type. Note: numpy doesn't
         natively support bfloat16 / fp8 dtypes, so those callers
-        should stay on jax / torch backends."""
+        should stay on jax / torch backends.
+        """
         return TypedNumpyArray(self.arr.astype(dtype), self.type)
 
     def slice(self, dim : FullDim, start : int, end : int) -> "TypedNumpyArray":
@@ -217,7 +221,8 @@ def tensor(
     """
     Wrap `arr` as a typed numpy array with the given dim shape and a
     stile `Tensor(name=...)` ET. Mirrors `tjax.tensor` / `ttorch.tensor`
-    for the numpy host."""
+    for the numpy host.
+    """
     full_dims = tuple(dim_full_dim(d) for d in shape)
     return TypedNumpyArray(
         arr, Type(st=full_dims, et=t.Tensor(dims=full_dims, name=name)),

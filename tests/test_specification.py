@@ -16,8 +16,10 @@ from stile.specification import parse_spec_into_type
 # --- loop variables: honored in `where`, rejected in expression position
 
 def test_loop_var_in_where_clause_works(reset):
-    """Control: a loop var in a `where`-clause slice bound is honored
-    (becomes a SymbolicInt) — the supported path."""
+    """
+    Control: a loop var in a `where`-clause slice bound is honored
+    (becomes a SymbolicInt) — the supported path.
+    """
     dim("N", 16)
     t = parse_spec_into_type("sum[N where N < k](X:N)", loop_vars={"k"})
     # Upper bound is the symbolic k.
@@ -25,8 +27,10 @@ def test_loop_var_in_where_clause_works(reset):
 
 
 def test_loop_var_in_expression_position_raises(reset):
-    """A loop var used as a value in the main expression raises a clear
-    error instead of silently becoming an anonymous tensor."""
+    """
+    A loop var used as a value in the main expression raises a clear
+    error instead of silently becoming an anonymous tensor.
+    """
     dim("N", 16)
     with pytest.raises(ValueError, match="loop variable 'k' used in expression position"):
         parse_spec_into_type("X:N * k", loop_vars={"k"})
@@ -35,16 +39,20 @@ def test_loop_var_in_expression_position_raises(reset):
 
 
 def test_loop_var_in_reduce_body_raises_clearly(reset):
-    """Inside a reduce body, a loop-var value now gets the clear
-    loop-var error rather than a confusing `) expected`."""
+    """
+    Inside a reduce body, a loop-var value now gets the clear
+    loop-var error rather than a confusing `) expected`.
+    """
     dim("N", 16)
     with pytest.raises(ValueError, match="loop variable 'k' used in expression position"):
         parse_spec_into_type("sum[N](k * X:N)", loop_vars={"k"})
 
 
 def test_labeled_tensor_sharing_loop_var_name_still_parses(reset):
-    """A `k:N` labeled tensor is NOT a loop-var-value misuse — the `:`
-    disambiguates, so it still parses as a tensor."""
+    """
+    A `k:N` labeled tensor is NOT a loop-var-value misuse — the `:`
+    disambiguates, so it still parses as a tensor.
+    """
     dim("N", 16)
     # `k:N` is a tensor named k of shape N; the loop-var guard only fires
     # when the name is used bare (no `:dims`).
@@ -55,9 +63,11 @@ def test_labeled_tensor_sharing_loop_var_name_still_parses(reset):
 # --- shaped constants ---------------------------------------------------
 
 def test_zeros_shaped_constant(reset):
-    """`zeros[M N]` is a Constant(0.0) carrying shape (M, N) — the
+    """
+    `zeros[M N]` is a Constant(0.0) carrying shape (M, N) — the
     spellable form of a flash-attention / tiled-matmul accumulator's
-    zero base case."""
+    zero base case.
+    """
     M = dim("M", 8)
     N = dim("N", 4)
     t = parse_spec_into_type("zeros[M N]")
@@ -66,8 +76,10 @@ def test_zeros_shaped_constant(reset):
 
 
 def test_full_shaped_constant(reset):
-    """`full[M N](c)` is a shaped Constant(c), with negative values
-    supported."""
+    """
+    `full[M N](c)` is a shaped Constant(c), with negative values
+    supported.
+    """
     M = dim("M", 8)
     N = dim("N", 4)
     pos = parse_spec_into_type("full[M N](2.5)")
@@ -87,9 +99,11 @@ def test_shaped_constant_composes_in_expression(reset):
 # --- malformed tensor references ----------------------------------------
 
 def test_bare_tensor_name_without_dims_rejected(reset):
-    """`X*X:N` — the first `X` has no shape annotation. Previously this
+    """
+    `X*X:N` — the first `X` has no shape annotation. Previously this
     silently collapsed to a lone anonymous rank-0 tensor (dropping
-    `*X:N`); now it raises, pointing at the fix."""
+    `*X:N`); now it raises, pointing at the fix.
+    """
     dim("N", 4)
     with pytest.raises(ValueError, match="has no shape annotation"):
         parse_spec_into_type("X*X:N")
@@ -103,9 +117,11 @@ def test_squaring_a_tensor_needs_both_operands_spelled(reset):
 
 
 def test_anonymous_shaped_tensor_still_allowed(reset):
-    """A bare *registered dim* used as a shape (no label) is still a
+    """
+    A bare *registered dim* used as a shape (no label) is still a
     legit anonymous tensor — the rejection only fires when nothing was
-    consumed (unknown bare name)."""
+    consumed (unknown bare name).
+    """
     N = dim("N", 4)
     t = parse_spec_into_type("N")
     assert t.st == (N,)

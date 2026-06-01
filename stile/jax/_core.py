@@ -49,23 +49,27 @@ _NO_AA_DEFAULT = object()
 # act as a dtype wildcard during verification). Keyed by `jnp.dtype(...).name`
 # so a `jnp.float32`, an array's `.dtype`, or a numpy dtype all map the same.
 _JAX_DTYPE_NAME_TO_DATATYPE = {
-    "bfloat16": DataType.bfloat16,
-    "float32":  DataType.float32,
-    "float64":  DataType.float64,
+    "bfloat16" : DataType.bfloat16,
+    "float32" :  DataType.float32,
+    "float64" :  DataType.float64,
 }
 
 def dtype_to_datatype(jax_dtype) -> "DataType | None":
-    """Map a jax/numpy dtype to the stile `DataType` it corresponds to, or
-    `None` if `jax_dtype` is None or stile doesn't model it."""
+    """
+    Map a jax/numpy dtype to the stile `DataType` it corresponds to, or
+    `None` if `jax_dtype` is None or stile doesn't model it.
+    """
     if jax_dtype is None:
         return None
     return _JAX_DTYPE_NAME_TO_DATATYPE.get(jnp.dtype(jax_dtype).name)
 
 
 def _aa_of(value) -> "AffineForm | None":
-    """Pull the `.aa` off a TypedJaxArray, or wrap a numeric scalar
+    """
+    Pull the `.aa` off a TypedJaxArray, or wrap a numeric scalar
     as a zero-radius constant form, or return None for anything else
-    (e.g. a raw JAX tracer)."""
+    (e.g. a raw JAX tracer).
+    """
     if isinstance(value, TypedJaxArray):
         return value.aa
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -102,9 +106,11 @@ _g_active_tile_overrides : list = []
 
 
 class loop_var_binding:
-    """Context manager that binds `LoopVariable` names to JAX values for
+    """
+    Context manager that binds `LoopVariable` names to JAX values for
     the duration of the `with` block. Used by `typed_pallas_call` to
-    expose `pl.program_id` to in-kernel mask construction."""
+    expose `pl.program_id` to in-kernel mask construction.
+    """
     def __init__(self, bindings : dict):
         self.bindings = bindings
         self.previous = None
@@ -119,11 +125,13 @@ class loop_var_binding:
 
 
 def _resolve_to_runtime(symbolic, var_resolver):
-    """Convert a `SymbolicIndex` (int / `LoopVariable` / `AffineExpr`)
+    """
+    Convert a `SymbolicIndex` (int / `LoopVariable` / `AffineExpr`)
     to a runtime value — a Python int when fully concrete, a `jnp`
     expression involving the resolver's bound jax-side values otherwise.
     Errors if a `LoopVariable` is encountered that neither the resolver
-    nor the atom's `runtime_value` field covers."""
+    nor the atom's `runtime_value` field covers.
+    """
     s_int = as_int(symbolic)
     if s_int is not None:
         return s_int
@@ -147,9 +155,11 @@ def _resolve_to_runtime(symbolic, var_resolver):
 
 
 class _AtUpdate:
-    """The result of `base.at[dim, idx]` — a jax `.at[]`-style updater
+    """
+    The result of `base.at[dim, idx]` — a jax `.at[]`-style updater
     that lowers to stile's verified `gather` / `scatter`. `dim` is the
-    axis being indexed; `idx` is a 1-d runtime index tensor."""
+    axis being indexed; `idx` is a 1-d runtime index tensor.
+    """
 
     def __init__(self, base : "TypedJaxArray", dim : FullDim, idx : "TypedJaxArray"):
         self._base = base
@@ -161,8 +171,10 @@ class _AtUpdate:
         return self._base.gather(self._dim, self._idx)
 
     def set(self, values : "TypedJaxArray") -> "TypedJaxArray":
-        """`base` with `values` written at `idx` along `dim`, the base
-        kept everywhere else — a writeback scatter (KV-cache update)."""
+        """
+        `base` with `values` written at `idx` along `dim`, the base
+        kept everywhere else — a writeback scatter (KV-cache update).
+        """
         return values.scatter(self._dim, self._idx, base=self._base)
 
     def add(self, values : "TypedJaxArray") -> "TypedJaxArray":
@@ -171,9 +183,11 @@ class _AtUpdate:
 
 
 class _AtIndexer:
-    """`base.at` — subscript with `[idx]` (indexes the leading axis, like
+    """
+    `base.at` — subscript with `[idx]` (indexes the leading axis, like
     jax) or `[dim, idx]` (names the axis explicitly). Returns an
-    `_AtUpdate` carrying `.get()` / `.set(v)` / `.add(v)`."""
+    `_AtUpdate` carrying `.get()` / `.set(v)` / `.add(v)`.
+    """
 
     def __init__(self, base : "TypedJaxArray"):
         self._base = base
@@ -216,11 +230,13 @@ class TypedJaxArray:
     # input types, a verified loop body — whose carry-type is a fixed
     # point — produces matching aux on every iteration.
     def astype(self, dtype : str) -> "TypedJaxArray":
-        """Recast the underlying array to `dtype` (a `MACHINE_EPS`
+        """
+        Recast the underlying array to `dtype` (a `MACHINE_EPS`
         key such as `"bfloat16"` / `"fp8_e4m3"`); used by
         `sensitivity_analysis` to swap a named input's precision
         without changing its shape or stile type. The new typed value
-        gets a fresh leaf AA derived from the cast array's range."""
+        gets a fresh leaf AA derived from the cast array's range.
+        """
         if self.arr is None:
             return TypedJaxArray(None, self.type)
         return TypedJaxArray(self.arr.astype(dtype), self.type)
@@ -417,7 +433,8 @@ class TypedJaxArray:
 
     @property
     def at(self) -> "_AtIndexer":
-        """jax-style indexed-update accessor — the friendly surface over
+        """
+        jax-style indexed-update accessor — the friendly surface over
         `gather` / `scatter` for jax / Pallas users:
 
             cache.at[Seq, write_pos].set(new_kv)   # writeback (keep base)
@@ -592,10 +609,12 @@ def mask(
 
 
 def _coerce_scalar(x):
-    """If x is a scalar jax.Array, convert it to a Python float so it can flow through
+    """
+    If x is a scalar jax.Array, convert it to a Python float so it can flow through
     Constant(...) into the normalized expression as a hashable value.
     Inside Pallas kernels, jax tracers can't `.item()` — fall through
-    and let downstream code see the raw tracer."""
+    and let downstream code see the raw tracer.
+    """
     if isinstance(x, jax.Array) and x.ndim == 0:
         try:
             return x.item()
@@ -680,11 +699,13 @@ def sigmoid(x : TypedJaxArray) -> TypedJaxArray:
 
 
 def sqrt(x):
-    """`tjax.sqrt` — eager on Python scalars, JAX-traced on TypedJaxArrays.
+    """
+    `tjax.sqrt` — eager on Python scalars, JAX-traced on TypedJaxArrays.
     Lets `tjax.sqrt(dhead.size)` (a Python int) return a concrete float
     so it can be used as a divisor inside Pallas kernels (where
     `jnp.sqrt` would produce an abstract tracer that can't be coerced
-    to a Python scalar)."""
+    to a Python scalar).
+    """
     if isinstance(x, (int, float)):
         return math.sqrt(x)
     return _sqrt_typed(x)
@@ -1137,8 +1158,10 @@ def _fori_loop_with_invariant(lower, upper, body_fn, init_val, invariant):
 
 
 def _normalize_state_leaf(leaf):
-    """Normalize a state-leaf value (Python scalar, jax.Array, or
-    TypedJaxArray) for comparison against an invariant at k=0."""
+    """
+    Normalize a state-leaf value (Python scalar, jax.Array, or
+    TypedJaxArray) for comparison against an invariant at k=0.
+    """
     if isinstance(leaf, TypedJaxArray):
         return _normalize(leaf.type.et)
     if isinstance(leaf, (int, float)):

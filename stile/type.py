@@ -157,7 +157,7 @@ def simplify_dim(dim : Dim) -> Dim:
 
 @dataclass(frozen=True)
 class Constant:
-    value: float
+    value : float
 
 
 @dataclass(frozen=True)

@@ -90,9 +90,11 @@ def test_scope_restores_runtime_scalars_and_index_props(reset):
 
 
 def test_verified_as_context_manager_with_hardware(reset):
-    """`with stile.verified(hardware=…):` activates BOTH a fresh scope
+    """
+    `with stile.verified(hardware=…):` activates BOTH a fresh scope
     AND a numerical_context. Inside, `active_hardware()` returns the
-    passed model; outside, it falls back to WORST_CASE."""
+    passed model; outside, it falls back to WORST_CASE.
+    """
     assert active_hardware() is WORST_CASE
     with stile.verified(hardware=NVIDIA_TENSOR_CORE_TF32):
         assert active_hardware() is NVIDIA_TENSOR_CORE_TF32
@@ -131,8 +133,10 @@ def test_verified_passes_args_through_decorator(reset):
 
 
 def test_verified_restores_on_exception(reset):
-    """An exception inside the `with verified(...)` block still
-    restores the numerical context AND the scope."""
+    """
+    An exception inside the `with verified(...)` block still
+    restores the numerical context AND the scope.
+    """
     with pytest.raises(RuntimeError, match="boom"):
         with stile.verified(hardware=NVIDIA_TENSOR_CORE_TF32):
             dim("VExcDim", 4)
