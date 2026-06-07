@@ -5,8 +5,17 @@ except ImportError:
         "PyTorch support requires the torch extra: pip install stile[torch]"
     ) from None
 
+from typing import Any, cast
+
 import stile.type as t
-from ..type import *
+# Explicit imports (no wildcard): the frontend redefines exp/sin/cos/
+# sqrt/maximum/minimum/abs/relu/einsum as typed ops, so star-importing
+# type.py's same-named ET builders would shadow-collide them.
+from ..type import (
+    BinaryOpType, Constant, DataType, Dim, FullDim, Gather, ReduceOpType,
+    Tensor, Type, as_int, dim_contains, dim_end, dim_full_dim, dim_name,
+    dim_size, dim_start, dt, override_dims_in_type, type_from_binary_op,
+)
 from ..specification import parse_spec_into_type
 from ..verification import verify_types_equivalent, verify_exprs_equivalent
 from ..indexing import declare_index_properties
@@ -21,7 +30,7 @@ import einops
 
 # Sentinel: `aa` defaults to "compute from tensor"; explicit `None` opts
 # out. Distinguishes "caller passed None" from "caller didn't pass."
-_NO_AA_DEFAULT = object()
+_NO_AA_DEFAULT = cast(Any, object())
 
 
 # String-name → torch.dtype, for the `astype(dtype_str)` path used by
@@ -74,7 +83,7 @@ def make_symbolic_input(type : Type) -> "TypedTorchTensor":
     `type.dt` (default float32) so the reference's output dtype is
     meaningful; the values are irrelevant (we only read the result's type).
     """
-    shape = tuple(as_int(dim_size(d)) for d in type.st)
+    shape = cast("tuple[int, ...]", tuple(as_int(dim_size(d)) for d in type.st))
     arr = torch.zeros(shape, dtype=_datatype_to_torch(type.dt))
     return TypedTorchTensor(arr, type)
 
@@ -132,7 +141,7 @@ class TypedTorchTensor:
         return TypedTorchTensor(self.tensor[tuple(slice_expr)], new_type)
 
     def repeat(self, dim : Dim) -> "TypedTorchTensor":
-        nrepeats = dim_size(dim)
+        nrepeats = cast(int, dim_size(dim))
         repeated_tensor = self.tensor.unsqueeze(0).repeat(nrepeats, *([1] * self.tensor.dim()))
         new_type = self.type.repeat(dim)
         return TypedTorchTensor(repeated_tensor, new_type)
@@ -227,13 +236,6 @@ def _binary_op_helper(
     lhs = slf.tensor if isinstance(slf, TypedTorchTensor) else slf
     rhs = other.tensor if isinstance(other, TypedTorchTensor) else other
 
-    # For operations that need tensors (like maximum), convert scalars
-    if op == "max":
-        if not isinstance(lhs, torch.Tensor):
-            lhs = torch.tensor(lhs)
-        if not isinstance(rhs, torch.Tensor):
-            rhs = torch.tensor(rhs)
-
     match op:
         case "+":
             new_tensor = lhs + rhs
@@ -244,10 +246,17 @@ def _binary_op_helper(
         case "/":
             new_tensor = lhs / rhs
         case "max":
-            new_tensor = torch.maximum(lhs, rhs)
+            # `torch.maximum` needs tensors — promote any scalar operand.
+            lt = lhs if isinstance(lhs, torch.Tensor) else torch.tensor(lhs)
+            rt = rhs if isinstance(rhs, torch.Tensor) else torch.tensor(rhs)
+            new_tensor = torch.maximum(lt, rt)
         case _:
             raise ValueError(f"Unknown op {op}")
 
+    # At least one operand is always a TypedTorchTensor (the dunders /
+    # unary helpers never call this with two scalars), so the arithmetic
+    # result is a tensor — narrow for the constructor / aa composition.
+    assert isinstance(new_tensor, torch.Tensor)
     new_aa = compose_binary(
         op, _aa_of(slf), _aa_of(other), dtype_name_of(new_tensor),
     )
@@ -328,7 +337,7 @@ def einsum(x : TypedTorchTensor, y : TypedTorchTensor, einstr : str) -> TypedTor
 class TypedResult:
     def __init__(self, spec : str, device : str = "cpu"):
         self.expected_type = parse_spec_into_type(spec)
-        self.shape = tuple(dim_size(d) for d in self.expected_type.st) if self.expected_type.st is not None else tuple()
+        self.shape = cast("tuple[int, ...]", tuple(dim_size(d) for d in self.expected_type.st) if self.expected_type.st is not None else tuple())
         self.tensor = torch.zeros(self.shape, device=device)
 
     def assign(self, result : TypedTorchTensor):
@@ -346,11 +355,11 @@ class TypedResult:
 
 
 def zeros(shape : tuple[FullDim, ...], device : str = "cpu") -> TypedTorchTensor:
-    torch_shape = tuple(dim_size(d) for d in shape)
+    torch_shape = cast("tuple[int, ...]", tuple(dim_size(d) for d in shape))
     tensor = torch.zeros(torch_shape, device=device)
     type = Type(
         st=shape,
-        et=0.0,
+        et=Constant(0.0),
     )
     return TypedTorchTensor(tensor, type)
 
@@ -393,7 +402,7 @@ def runtime_index(
         declare_index_properties(name, *props)
     typ = Type(st=(dim,), et=t.Tensor(dims=(dim,), name=name))
     if arr is None:
-        size = dim_size(dim)
+        size = cast(int, dim_size(dim))
         arr = torch.arange(size, dtype=torch.int32, device=device)
     return TypedTorchTensor(arr, typ)
 

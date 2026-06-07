@@ -1,5 +1,14 @@
+from typing import Any, cast
+
 import stile.type as t
-from ..type import *
+# Explicit imports (no wildcard): the frontend redefines exp/sin/cos/
+# sqrt/maximum/minimum/abs/relu/einsum as typed ops, so star-importing
+# type.py's same-named ET builders would shadow-collide them.
+from ..type import (
+    BinaryOpType, Constant, Dim, FullDim, ReduceOpType, Tensor, Type,
+    dim_contains, dim_end, dim_full_dim, dim_name, dim_size, dim_start,
+    override_dims_in_type, type_from_binary_op,
+)
 from ..specification import parse_spec_into_type
 from ..verification import verify_types_equivalent, verify_exprs_equivalent
 from ..numerical import (
@@ -13,7 +22,7 @@ import einops
 
 
 # Sentinel: `aa` defaults to "compute from arr"; explicit `None` opts out.
-_NO_AA_DEFAULT = object()
+_NO_AA_DEFAULT = cast(Any, object())
 
 
 def _aa_of(value) -> "AffineForm | None":
@@ -152,7 +161,7 @@ def _binary_op_helper(
     slf : TypedNumpyArray | float,
     other : TypedNumpyArray | float,
     op : BinaryOpType,
-) -> TypedNumpyArray | float:
+) -> TypedNumpyArray:
     lhs_type = slf.type if isinstance(slf, TypedNumpyArray) else slf
     rhs_type = other.type if isinstance(other, TypedNumpyArray) else other
     new_type = type_from_binary_op(lhs_type, rhs_type, op)
@@ -173,6 +182,10 @@ def _binary_op_helper(
         case _:
             raise ValueError(f"Unknown op {op}")
 
+    # At least one operand is always a TypedNumpyArray, so the result is
+    # array-like — but numpy ops on 0-d inputs return scalars (np.float64),
+    # which `TypedNumpyArray` stores as-is, so cast rather than assert.
+    new_arr = cast("np.ndarray", new_arr)
     new_aa = compose_binary(
         op, _aa_of(slf), _aa_of(other), dtype_name_of(new_arr),
     )
@@ -244,7 +257,7 @@ def einsum(x : TypedNumpyArray, y : TypedNumpyArray, einstr : str) -> TypedNumpy
 class TypedResult:
     def __init__(self, spec : str):
         self.expected_type = parse_spec_into_type(spec)
-        self.shape = tuple(dim_size(d) for d in self.expected_type.st) if self.expected_type.st is not None else tuple()
+        self.shape = cast("tuple[int, ...]", tuple(dim_size(d) for d in self.expected_type.st) if self.expected_type.st is not None else tuple())
         self.arr = np.zeros(self.shape)
 
     def assign(self, result : TypedNumpyArray):
@@ -252,7 +265,7 @@ class TypedResult:
                 self.expected_type,
                 result.type,
         ):
-            raise ValueError(f"Attempted to assign a tensor that does not match the spec! Expected: {self.expected_expr_type}, actual: {result.expr_type}")
+            raise ValueError(f"Attempted to assign a tensor that does not match the spec! Expected: {self.expected_type}, actual: {result.type}")
 
         slice_expr = []
         for d in result.type.st:
@@ -262,10 +275,10 @@ class TypedResult:
 
 
 def zeros(shape : tuple[FullDim, ...]) -> TypedNumpyArray:
-    np_shape = tuple(dim_size(d) for d in shape)
+    np_shape = cast("tuple[int, ...]", tuple(dim_size(d) for d in shape))
     arr = np.zeros(np_shape)
     type = Type(
         st=shape,
-        et=0.0,
+        et=Constant(0.0),
     )
     return TypedNumpyArray(arr, type)

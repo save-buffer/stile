@@ -23,6 +23,8 @@ This module hosts the pieces those traced backends share:
   to bridge to their framework's array type and write idiom.
 """
 
+from typing import cast
+
 import stile.type as t
 from .type import (
     Type, Sliced, Reduce, dim_size, dim_start, dim_end, dim_name,
@@ -272,8 +274,9 @@ def _unroll_interval(
 
     out : list[tuple[int, int]] = []
     for b in bindings_list:
-        s_val = as_int(_substitute_bindings(start_aff, b))
-        e_val = as_int(_substitute_bindings(end_aff, b))
+        # Bindings substitute every loop var, so the bounds are concrete.
+        s_val = cast(int, as_int(_substitute_bindings(start_aff, b)))
+        e_val = cast(int, as_int(_substitute_bindings(end_aff, b)))
         out.append((s_val, e_val))
     return out
 

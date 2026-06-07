@@ -1,3 +1,5 @@
+from typing import cast
+
 from .type import *
 from .type import _g_tensor_counter
 from .indexing import (
@@ -230,9 +232,9 @@ def _binary_op_with_broadcast(
         lhs_et = _broadcast_to(lhs_et, lhs_st, out_st)
     if out_st != rhs_st and rhs_st != tuple():
         rhs_et = _broadcast_to(rhs_et, rhs_st, out_st)
-    return out_st, BinaryOp(op=op, lhs=lhs_et, rhs=rhs_et)  # ty: ignore
+    return out_st, BinaryOp(op=cast(BinaryOpType, op), lhs=lhs_et, rhs=rhs_et)
 
-def _parse_number(lex : LexState) -> tuple[ShapeType, ExprType]:
+def _parse_number(lex : LexState) -> tuple[ShapeType, Constant]:
     lex.consume_whitespace()
     i = 0
     while i < len(lex.spec) and (lex.spec[i].isdigit() or lex.spec[i] == '.'):
@@ -446,6 +448,7 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
         full_dims = tuple(dim_full_dim(d) for d in shape)
         return full_dims, Constant(float(value))
     if reduction := lex.maybe_consume_keyword("sum", "max"):
+        reduction = cast(ReduceOpType, reduction)
         if lex.maybe_consume('['):
             dim = _parse_dim(lex)
             pred_domain = None
@@ -478,14 +481,14 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
                     )
             reduce_st = tuple(d for d in st if dim_full_dim(d) != dim_full_dim(dim))
             reduce_et = Reduce(
-                reduction, # ty: ignore
+                reduction,
                 reduce_dim,
                 et,
             )
             return reduce_st, reduce_et
         else:
             lex.expect('(')
-            st, et = _parse_contraction(lex, reduction=reduction) # ty: ignore
+            st, et = _parse_contraction(lex, reduction=reduction)
             lex.expect(')')
             return st, et
     elif lex.maybe_consume_keyword("gather"):
@@ -629,7 +632,7 @@ def _parse_factor(lex : LexState) -> tuple[ShapeType, ExprType]:
             return st, BinaryOp(op="/", lhs=Constant(1.0), rhs=denom)
 
         return st, UnaryOp(
-            op=unary_op, # ty: ignore
+            op=cast(UnaryOpType, unary_op),
             child=et,
         )
     else:

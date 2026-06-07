@@ -3,6 +3,7 @@ import contextlib
 import functools
 import math
 from dataclasses import dataclass, field
+from typing import Callable, cast
 
 from .type import *
 from .indexing import (
@@ -360,7 +361,7 @@ def _substitute_loop_var(
     expr : SymbolicIndex,
     loop_var : LoopVariable,
     value : SymbolicIndex,
-) -> SymbolicIndex:
+) -> AffineExpr:
     """Replace `loop_var` with `value` in `expr`; returns canonical AffineExpr."""
     aff = to_affine(expr)
     value_aff = to_affine(value)
@@ -604,7 +605,12 @@ def _substitute_lv_in_factor(
         case NormalizedUnaryOp(op, child):
             return NormalizedUnaryOp(op, substitute_lv_in_expr(child, loop_var, value))
         case NormalizedSum(children):
-            return NormalizedSum(frozenset(
+            # NOTE: `_substitute_lv_in_product` returns a `NormalizedExpr`,
+            # but `NormalizedSum.children` is declared `frozenset[Normalized
+            # Product]`. The normalizer tolerates this (the result is re-
+            # normalized downstream), but the static types disagree — worth
+            # a domain-expert look. Suppressed for now.
+            return NormalizedSum(frozenset(  # ty: ignore[invalid-argument-type]
                 _substitute_lv_in_product(c, loop_var, value) for c in children
             ))
         case NormalizedMax(children):
@@ -1055,14 +1061,14 @@ def _drop_redundant_natural_bounds(
         constraints = _drop_subsumed_symbolic_uppers(constraints, [index])
 
         new_disjuncts.add(frozenset(constraints))
-    new_disjuncts = frozenset(new_disjuncts)
+    disjuncts_frozen = frozenset(new_disjuncts)
     # Recompute the variable set from what survived — a bound that was the
     # sole mention of a variable (e.g. the discharged walked bound's
     # `pid_m`) must not linger in `Domain.variables`, or equality against
     # the spec fails despite matching constraints.
-    new_vars = _domain_vars_from_disjuncts(new_disjuncts)
+    new_vars = _domain_vars_from_disjuncts(disjuncts_frozen)
     variables = domain.variables if new_vars == domain.variables else new_vars
-    return Domain(variables, new_disjuncts)
+    return Domain(variables, disjuncts_frozen)
 
 
 def _split_reduce_domain(
@@ -1718,6 +1724,7 @@ def _distribute_binop_through_tag(
     # mults of the same mask produce arbitrarily deep nested same-P
     # `Cond` trees that don't structurally compare equal to the single
     # `Cond` form.
+    assert lhs_tag is not None and rhs_tag is not None  # both tagged here
     if (
         isinstance(lhs_tag.tag, NormalizedTagCond)
         and isinstance(rhs_tag.tag, NormalizedTagCond)
@@ -2231,11 +2238,14 @@ def _extract_tagged_body(
         return None
     cond = tagged.tag
     identity = 0.0 if op == "sum" else float("-inf")
+    # In this extractor the branches are plain NormalizedExprs (the mask
+    # push-through produces `Cond(D, body, identity)`), not nested conds.
+    if_false = cast("NormalizedExpr", cond.if_false)
     if (
-        _is_pure_const(cond.if_false)
-        and cond.if_false.num.const == identity
+        _is_pure_const(if_false)
+        and if_false.num.const == identity
     ):
-        return cond.if_true, cond.domain
+        return cast("NormalizedExpr", cond.if_true), cond.domain
     return None
 
 
@@ -2405,6 +2415,8 @@ def _detect_block_interval(
     lo_te = _as_tensor_element(lo)
     hi_te = _as_tensor_element(hi)
     if lo_te is None or hi_te is None:
+        return None
+    if lo_te.source is None or hi_te.source is None:
         return None
     lo_tensor, lo_pos = lo_te.source
     hi_tensor, hi_pos = hi_te.source
@@ -2589,6 +2601,7 @@ def _try_factor_common_gather(
         return None
     inner_body = NormalizedExpr.of(NormalizedProduct(const=1.0))
     for f, count in varying_factors.items():
+        assert isinstance(f, NormalizedGather)  # checked in the loop above
         for _ in range(count):
             inner_body = mul(inner_body, f.source)
     return common_dim_in_source, common_idx, inner_body

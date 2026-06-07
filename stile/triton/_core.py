@@ -1,6 +1,6 @@
 try:
-    import triton
-    import triton.language as tl
+    import triton  # ty: ignore[unresolved-import]  # CUDA-only optional dep
+    import triton.language as tl  # ty: ignore[unresolved-import]
     HAS_TRITON = True
 except ImportError:
     triton = None
@@ -11,7 +11,7 @@ try:
     import torch
     HAS_TORCH = True
 except ImportError:
-    torch = None
+    torch = None  # ty: ignore[invalid-assignment]  # optional-dep sentinel
     HAS_TORCH = False
 
 import ast
@@ -21,11 +21,12 @@ import os
 import tempfile
 import textwrap
 from dataclasses import dataclass, field
+from typing import Any, Callable, cast
 
 import stile.type as t
 from ..type import (
-    Type, ShapeType, Tensor, Constant, BinaryOp, UnaryOp, Sliced, TagCond,
-    dim_size, dim_full_dim, dim_name, as_int,
+    Type, ShapeType, Tensor, Constant, BinaryOp, BinaryOpType, UnaryOp,
+    Sliced, TagCond, dim_size, dim_full_dim, dim_name, as_int,
     substitute_tensor_in_et, override_dims_in_type,
 )
 from ..specification import parse_spec_into_type, parse_predicate, LexState
@@ -72,6 +73,7 @@ def _output_spec_type(o : "_OutputDecl", rt_names) -> Type:
     """
     if o.spec_type is not None:
         return o.spec_type
+    assert o.spec is not None  # invariant: spec set when spec_type isn't
     return parse_spec_into_type(o.spec, loop_vars=rt_names)
 
 
@@ -115,7 +117,7 @@ def jit(
     out_shape : "tuple | list",
     out_dtype : "object | list | tuple" = None,
     consts : "dict[str, int | float] | None" = None,
-    grid : "tuple | list | int | callable | None" = None,
+    grid : "tuple | list | int | Callable | None" = None,
 ):
     """
     Decorator producing a typed Triton kernel.
@@ -174,7 +176,7 @@ def jit(
         )
 
         is_multi = isinstance(spec, (list, tuple))
-        if is_multi:
+        if isinstance(spec, (list, tuple)):
             specs = list(spec)
             if not (isinstance(out_shape, (list, tuple)) and len(out_shape) == len(specs)):
                 raise ValueError(
@@ -190,7 +192,7 @@ def jit(
                     )
                 dtypes = list(out_dtype)
             else:
-                dtypes = [out_dtype] * len(specs)
+                dtypes = [out_dtype for _ in specs]
         else:
             specs = [spec]
             shapes = [tuple(out_shape)]
@@ -397,7 +399,10 @@ def _verify_kernel(
                     ast.Add : "+", ast.Sub : "-", ast.Mult : "*", ast.Div : "/",
                 }.get(type(stmt.op))
                 if op_str is not None:
-                    env[target] = t.type_from_binary_op(env[target], rhs, op_str)
+                    env[target] = t.type_from_binary_op(
+                        cast("Type | float", env[target]), rhs,
+                        cast(BinaryOpType, op_str),
+                    )
         elif isinstance(stmt, ast.For):
             _unroll_for(
                 stmt, env, visit, dim_atoms, input_types,
@@ -692,6 +697,8 @@ def _unroll_for(
 
     var = node.target.id
     saved = env.get(var, None)
+    # Concrete bounds here: the any-None case returned above.
+    assert lo_i is not None and hi_i is not None and step_i is not None
     for i in range(lo_i, hi_i, step_i):
         env[var] = i
         for stmt in node.body:
@@ -1505,7 +1512,7 @@ def _interpret_expr(node, env, input_types, dim_atoms):
             return None
         if isinstance(l, Type) and isinstance(r, Type) and l.st != r.st:
             l, r = _broadcast_pair(l, r)
-        return t.type_from_binary_op(l, r, op_str)
+        return t.type_from_binary_op(l, r, cast(BinaryOpType, op_str))
     return None
 
 
@@ -1692,7 +1699,7 @@ class _RewriteTtlCalls(ast.NodeTransformer):
             idx_size if j == axis else size
             for j, (_, size) in enumerate(src_meta)
         ]
-        shape_tuple = ast.Tuple(elts=shape_elts, ctx=ast.Load())
+        shape_tuple = ast.Tuple(elts=cast("list[ast.expr]", shape_elts), ctx=ast.Load())
         bcast_call = ast.Call(
             func=ast.Attribute(value=ast.Name(id="tl"), attr="broadcast_to"),
             args=[bcast_subscript, shape_tuple],
@@ -1727,16 +1734,16 @@ class _RewriteTtlCalls(ast.NodeTransformer):
         class _Lifter(ast.NodeTransformer):
             def __init__(self, outer):
                 self.outer = outer
-            def visit_Call(self, call_node):
-                self.generic_visit(call_node)
-                if _is_ttl_call(call_node, "mask"):
+            def visit_Call(self, node):
+                self.generic_visit(node)
+                if _is_ttl_call(node, "mask"):
                     tmp = f"_ttl_mask_tmp_{self.outer._next_uid()}"
                     prelude.append(ast.Assign(
                         targets=[ast.Name(id=tmp, ctx=ast.Store())],
-                        value=call_node,
+                        value=node,
                     ))
                     return ast.Name(id=tmp, ctx=ast.Load())
-                return call_node
+                return node
 
         new_value = _Lifter(self).visit(value)
         ast.fix_missing_locations(new_value)
@@ -2100,7 +2107,7 @@ class _RewriteTtlCalls(ast.NodeTransformer):
             ob = offs_bcast(i)
             stride = _stride_for_axis(i, all_dim_nodes)
             terms.append(
-                ast.BinOp(left=ob, op=ast.Mult(), right=stride)
+                ast.BinOp(left=ob, op=ast.Mult(), right=cast("ast.expr", stride))
                 if stride is not None else ob
             )
         ptr_offs = terms[0]
@@ -2321,6 +2328,7 @@ def _emit_triton_fn(
         f.write(src_with_imports)
 
     spec = importlib.util.spec_from_file_location(fn_def.name, src_path)
+    assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     # Merge in user globals so dim sizes etc. resolve, but skip the
     # original module's loader/spec metadata — those would confuse
@@ -2362,12 +2370,14 @@ def _emit_triton_fn(
         # `tl.constexpr(...)`. Ints / floats lift cleanly; anything
         # else gets dropped through to its raw value.
         if HAS_TRITON and isinstance(val, (int, float)):
+            assert tl is not None
             val = tl.constexpr(val)
         mod.__dict__[name] = val
     spec.loader.exec_module(mod)
     raw_fn = getattr(mod, fn_def.name)
 
     if HAS_TRITON:
+        assert triton is not None
         return triton.jit(raw_fn)
     return raw_fn
 
@@ -2397,7 +2407,7 @@ class TypedTritonKernel:
     False means it returns a tuple of N `TypedTorchTensor`s in the
     declaration order.
     """
-    triton_fn : object
+    triton_fn : Any
     inputs : dict[str, str]
     outputs : "list[_OutputDecl]"
     consts : dict
@@ -2500,7 +2510,7 @@ def _check_coverage_at_launch(
             # check has already fired by now.)
             continue
         # Per-axis interval-union over all stores × all substitutions.
-        per_axis_intervals : dict[str, list[tuple[int, int]]] = {
+        per_axis_intervals : "dict[str, list[tuple[int, int]]] | None" = {
             d.name: [] for d in output.shape
         }
         for sliced_tuple in all_slices:
@@ -2565,7 +2575,7 @@ def _union_intervals(
             merged[-1][1] = max(merged[-1][1], hi)
         else:
             merged.append([lo, hi])
-    return [tuple(iv) for iv in merged]
+    return [(iv[0], iv[1]) for iv in merged]
 
 
 class _Launcher:
@@ -2603,8 +2613,8 @@ class _Launcher:
         out_tensors = []
         wrapped = []
         for o in self.kernel.outputs:
-            shape_ints = tuple(as_int(dim_size(d)) for d in o.shape)
-            dtype = o.dtype or torch.float32
+            shape_ints = cast("tuple[int, ...]", tuple(as_int(dim_size(d)) for d in o.shape))
+            dtype = cast("torch.dtype", o.dtype or torch.float32)
             buf = torch.empty(shape_ints, dtype=dtype, device="cuda")
             out_tensors.append(buf)
             spec_type = _output_spec_type(o, rt_names)
@@ -2613,7 +2623,7 @@ class _Launcher:
                 if name_to_replacement else spec_type.et
             )
             wrapped.append(TypedTorchTensor(
-                buf, Type(o.shape, composed_et, o.dtype),
+                buf, Type(o.shape, composed_et, dtype_to_datatype(o.dtype)),
             ))
         raw_inputs = tuple(ti.tensor for ti in typed_inputs)
         all_kwargs = dict(self.kernel.consts)

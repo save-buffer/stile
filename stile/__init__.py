@@ -4,6 +4,8 @@
 # registries, the normalizer, etc.) are accessible via the submodules
 # but aren't surfaced here.
 
+from typing import Any, Protocol
+
 # --- Types & ET nodes ---------------------------------------------------
 from .type import (
     Type, ShapeType, FullDim, Sliced, Tensor, Constant, TagCond,
@@ -71,8 +73,13 @@ from .numerical import (
 def dim(name : str, size : int) -> FullDim:
     return FullDim(name, size)
 
+class _HasStileType(Protocol):
+    """A typed array from any frontend (torch/jax/numpy) — anything
+    carrying a stile `.type`."""
+    type : Type
+
 def expr_simplifies(
-    expr : Type,
+    expr : _HasStileType,
     spec : str,
 ) -> bool:
     spec_type = parse_spec_into_type(spec)
@@ -166,8 +173,8 @@ class _Verified:
     def __init__(self, *, hardware=None, clear : bool = False):
         self._hardware = hardware if hardware is not None else _DEFAULT_NUMERICS
         self._clear = clear
-        self._scope_ctx = None
-        self._numerics_ctx = None
+        self._scope_ctx : Any = None
+        self._numerics_ctx : Any = None
 
     def __enter__(self):
         self._scope_ctx = scope(clear=self._clear)
@@ -219,7 +226,7 @@ def verified(fn=None, *, hardware=None, clear : bool = False):
         return _Verified(hardware=hardware, clear=clear)(fn)
     raise TypeError(
         f"verified: positional arg must be a callable to decorate; "
-        f"got {type(fn).__name__}. Did you mean to pass `hardware=` "
+        f"got {fn.__class__.__name__}. Did you mean to pass `hardware=` "
         f"as a keyword? `verified(hardware=...)`."
     )
 

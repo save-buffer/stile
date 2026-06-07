@@ -114,7 +114,7 @@ def _resolve_spec_et(out_type : OutputSpec, typed_inputs):
     the reference's output ShapeType / dtype against the declaration before
     returning its ExprType.
     """
-    if not callable(out_type.spec):
+    if isinstance(out_type.spec, str):
         return parse_spec_into_type(out_type.spec).et
     ref_inputs = [
         TypedJaxArray(
@@ -211,6 +211,8 @@ def typed_pallas_call(
             input_refs = refs[:len(typed_inputs)]
             output_ref = refs[len(typed_inputs)]
             if tiled:
+                # `tiled` implies these were all supplied together.
+                assert grid is not None and in_specs is not None and out_specs is not None
                 pids = tuple(
                     LoopVariable(f"_pid_{i}") for i in range(len(grid))
                 )

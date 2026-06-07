@@ -18,7 +18,7 @@ arithmetic produce `AffineExpr`s: `2 * i + 5`, `i - j`, `-(i)` all work.
 Scalar multiplication requires a compile-time `int`.
 """
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Any, Iterable
 
 
 @dataclass(frozen=True)
@@ -51,7 +51,7 @@ class SymbolicInt:
     """
     name : str
     source : "tuple[str, AffineExpr] | None" = None
-    runtime_value : object = field(default=None, compare=False, hash=False, repr=False)
+    runtime_value : Any = field(default=None, compare=False, hash=False, repr=False)
 
     def __add__(self, other) -> "AffineExpr": return to_affine(self) + other
     def __radd__(self, other) -> "AffineExpr": return to_affine(other) + to_affine(self)

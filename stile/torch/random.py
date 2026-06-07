@@ -5,6 +5,8 @@ except ImportError:
         "PyTorch support requires the torch extra: pip install stile[torch]"
     ) from None
 
+from typing import cast
+
 from ..type import FullDim, Tensor, Type, dim_size
 from ._core import TypedTorchTensor
 
@@ -14,7 +16,7 @@ def randn(
     device : str = "cpu",
     name : str | None = None,
 ) -> TypedTorchTensor:
-    torch_shape = tuple(dim_size(d) for d in shape)
+    torch_shape = cast("tuple[int, ...]", tuple(dim_size(d) for d in shape))
     tensor = torch.randn(torch_shape, device=device)
     type = Type(
         st=shape,

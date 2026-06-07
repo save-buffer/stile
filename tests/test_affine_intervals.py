@@ -5,7 +5,7 @@ concrete/symbolic cases.
 """
 import pytest
 
-from stile.indexing import LoopVariable, interval_domain
+from stile.indexing import LoopVariable, interval_domain, Domain
 from stile.verification import (
     NormalizedReduce, make_reduce,
     NormalizedTensor, NormalizedExpr, NormalizedProduct,

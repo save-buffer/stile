@@ -5,6 +5,8 @@ except ImportError:
         "JAX support requires the jax extra: pip install stile[jax]"
     ) from None
 
+from typing import cast
+
 from ..type import FullDim, Tensor, Type, dim_size
 from ._core import TypedJaxArray
 
@@ -20,7 +22,7 @@ def normal(
     spec uses a `label:dims` reference for this input. Unspecified gets
     a fresh auto-name.
     """
-    jax_shape = tuple(dim_size(d) for d in shape)
+    jax_shape = cast("tuple[int, ...]", tuple(dim_size(d) for d in shape))
     arr = jax.random.normal(key, jax_shape)
     type = Type(
         st=shape,

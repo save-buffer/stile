@@ -491,52 +491,52 @@ class Type:
     
 def type_from_binary_op(slf : Type | float, other : Type | float, op : BinaryOpType) -> Type:
     match slf, other:
-        case Type(), Type():
+        case Type() as s, Type() as o:
             # A scalar-shaped operand (`st == ()`) — a Constant or a
             # fully-reduced value — broadcasts against any tensor shape.
             # This is what lets `x * 2`, `max(x, 0)`, `relu` etc. type
             # without the caller stamping the tensor's shape onto the
             # scalar first.
-            if slf.st == other.st:
-                new_st = slf.st
-            elif slf.st == ():
-                new_st = other.st
-            elif other.st == ():
-                new_st = slf.st
+            if s.st == o.st:
+                new_st = s.st
+            elif s.st == ():
+                new_st = o.st
+            elif o.st == ():
+                new_st = s.st
             else:
                 raise ValueError("Binary operations can only occur between tensors with the same shapes")
             if (
-                slf.dt is not None
-                and other.dt is not None
-                and slf.dt != other.dt
+                s.dt is not None
+                and o.dt is not None
+                and s.dt != o.dt
             ):
                 raise ValueError("Binary operations must occur between tensors of the same type! You may have forgotten an explicit cast.")
 
             new_et = BinaryOp(
                 op=op,
-                lhs=slf.et,
-                rhs=other.et,
+                lhs=s.et,
+                rhs=o.et,
             )
             # Keep whichever operand carries a concrete dtype (the scalar
             # side is typically dtype-less).
-            new_dt = slf.dt if slf.dt is not None else other.dt
+            new_dt = s.dt if s.dt is not None else o.dt
             return Type(new_st, new_et, new_dt)
-        case Type(), x:
-            new_st = slf.st
+        case Type() as s, x:
+            new_st = s.st
             new_et = BinaryOp(
                 op=op,
-                lhs=slf.et,
+                lhs=s.et,
                 rhs=Constant(x),
             )
-            return Type(new_st, new_et, slf.dt)
-        case x, Type():
-            new_st = other.st
+            return Type(new_st, new_et, s.dt)
+        case x, Type() as o:
+            new_st = o.st
             new_et = BinaryOp(
                 op=op,
                 lhs=Constant(x),
-                rhs=other.et,
+                rhs=o.et,
             )
-            return Type(new_st, new_et, other.dt)
+            return Type(new_st, new_et, o.dt)
     assert False
 
 

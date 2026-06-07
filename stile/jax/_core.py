@@ -1,5 +1,6 @@
 try:
     import jax
+    import jax.core
     import jax.numpy as jnp
 except ImportError:
     raise ImportError(
@@ -9,9 +10,18 @@ except ImportError:
 import functools
 import inspect
 import math
+from typing import Any, cast
 
 import stile.type as t
-from ..type import *
+# Explicit imports (no wildcard): the frontend redefines exp/sin/cos/
+# sqrt/maximum/minimum/abs/relu/einsum as typed ops, so star-importing
+# type.py's same-named ET builders would shadow-collide them.
+from ..type import (
+    BinaryOp, BinaryOpType, Constant, DataType, Dim, Domain, ExprType,
+    FullDim, Gather, Reduce, ReduceOpType, Sliced, SymbolicIndex,
+    TagCond, Tensor, Type, as_int, dim_contains, dim_full_dim, dim_name,
+    dim_size, dim_start, dt, override_dims_in_type, type_from_binary_op,
+)
 from ..specification import parse_spec_into_type, parse_predicate, LexState
 from ..verification import (
     verify_types_equivalent, verify_exprs_equivalent, verify_dims_equivalent,
@@ -42,7 +52,7 @@ from ..numerical import (
 # Sentinel: `aa` defaults to "compute from arr"; explicit `None` opts
 # out. Avoids ambiguity between "caller passed None" and "caller
 # didn't pass anything."
-_NO_AA_DEFAULT = object()
+_NO_AA_DEFAULT = cast(Any, object())
 
 
 # jax dtype -> stile DataType (None for dtypes stile doesn't model, so they
@@ -113,7 +123,7 @@ class loop_var_binding:
     """
     def __init__(self, bindings : dict):
         self.bindings = bindings
-        self.previous = None
+        self.previous : dict = {}
     def __enter__(self):
         global _loop_var_resolver
         self.previous = _loop_var_resolver
@@ -356,7 +366,9 @@ class TypedJaxArray:
         block g of an offsets tensor" and apply the block-constant
         rewrite to any `gather` of the paired index in the body.
         """
-        offsets_name = offsets.type.et.name
+        offsets_et = offsets.type.et
+        assert isinstance(offsets_et, Tensor) and offsets_et.name is not None
+        offsets_name = offsets_et.name
         start = tensor_element(offsets_name, to_affine(g))
         end = tensor_element(offsets_name, to_affine(g) + 1)
         new_type = self.type.slice(dim, start, end)
@@ -418,6 +430,7 @@ class TypedJaxArray:
         # Move the scatter axis to position 0 for `at[].set()` semantics.
         moved = jnp.moveaxis(self.arr, axis, 0)
         if base is not None:
+            assert base.arr is not None  # guaranteed by the guard above
             out_moved = jnp.moveaxis(base.arr, axis, 0)
             # Writeback: written positions take the new value outright.
             out_moved = out_moved.at[idx.arr].set(moved)
@@ -626,7 +639,7 @@ def _binary_op_helper(
     slf : TypedJaxArray | float,
     other : TypedJaxArray | float,
     op : BinaryOpType,
-) -> TypedJaxArray | float:
+) -> TypedJaxArray:
     slf = _coerce_scalar(slf)
     other = _coerce_scalar(other)
     lhs_type = slf.type if isinstance(slf, TypedJaxArray) else slf

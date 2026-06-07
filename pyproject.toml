@@ -74,3 +74,6 @@ dev = [
     "build>=1.2.0",
     "twine>=5.0.0",
 ]
+
+[tool.ty.src]
+exclude = ["tests", "examples"]
