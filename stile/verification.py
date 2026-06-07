@@ -565,6 +565,18 @@ def _substitute_lv_in_factor_to_expr(
             return NormalizedExpr.of(
                 NormalizedReduce(dim, op, new_domain, new_child)
             )
+        case NormalizedSum(children):
+            # A sum substitutes term-by-term, re-summed via `add` so the
+            # result is a properly normalized expr. Each substituted term is
+            # a `NormalizedExpr` (and can be a fraction — e.g. a Repeat
+            # hoisting a denominator); building a raw `NormalizedSum` of
+            # those exprs would wedge `NormalizedExpr`s in where
+            # `NormalizedProduct`s belong, so substituting even an *absent*
+            # loop var stopped round-tripping `a + b` to itself.
+            result = NormalizedExpr.of(NormalizedProduct(const=0.0))
+            for c in children:
+                result = add(result, _substitute_lv_in_product(c, loop_var, value))
+            return result
     # All other factor kinds: substitute via the factor-returning helper
     # (no identity-collapse needed) and wrap.
     return NormalizedExpr.of(_substitute_lv_in_factor(factor, loop_var, value))
@@ -604,15 +616,14 @@ def _substitute_lv_in_factor(
             return NormalizedExp(substitute_lv_in_expr(child, loop_var, value))
         case NormalizedUnaryOp(op, child):
             return NormalizedUnaryOp(op, substitute_lv_in_expr(child, loop_var, value))
-        case NormalizedSum(children):
-            # NOTE: `_substitute_lv_in_product` returns a `NormalizedExpr`,
-            # but `NormalizedSum.children` is declared `frozenset[Normalized
-            # Product]`. The normalizer tolerates this (the result is re-
-            # normalized downstream), but the static types disagree — worth
-            # a domain-expert look. Suppressed for now.
-            return NormalizedSum(frozenset(  # ty: ignore[invalid-argument-type]
-                _substitute_lv_in_product(c, loop_var, value) for c in children
-            ))
+        case NormalizedSum(_):
+            # A substituted sum can become a fraction (not a single factor),
+            # so it's handled by `_substitute_lv_in_factor_to_expr` before
+            # this factor-returning helper is ever reached with a Sum.
+            raise AssertionError(
+                "NormalizedSum must be substituted via "
+                "_substitute_lv_in_factor_to_expr, not _substitute_lv_in_factor"
+            )
         case NormalizedMax(children):
             return NormalizedMax(frozenset(
                 substitute_lv_in_expr(c, loop_var, value) for c in children
